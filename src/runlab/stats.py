@@ -65,10 +65,10 @@ class MeasurementAccumulator:
         self.peak_cpu_percent = _maximum(self.peak_cpu_percent, cpu)
         self.peak_memory_bytes = _maximum(self.peak_memory_bytes, memory)
         self.peak_pids = _maximum(self.peak_pids, pids)
-        self.network_rx_bytes = network_rx
-        self.network_tx_bytes = network_tx
-        self.block_read_bytes = block_read
-        self.block_write_bytes = block_write
+        self.network_rx_bytes = _maximum(self.network_rx_bytes, network_rx)
+        self.network_tx_bytes = _maximum(self.network_tx_bytes, network_tx)
+        self.block_read_bytes = _maximum(self.block_read_bytes, block_read)
+        self.block_write_bytes = _maximum(self.block_write_bytes, block_write)
         self.samples += 1
 
     def finish(self, wall_seconds: float) -> Measurements:

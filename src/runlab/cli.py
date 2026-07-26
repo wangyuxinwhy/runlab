@@ -14,6 +14,7 @@ from runlab.bindings import BindingResolver
 from runlab.errors import RunLabError
 from runlab.execution import Runner, RunRequest
 from runlab.experiment import run_experiment
+from runlab.guidance import list_guidance, read_guidance
 from runlab.models import (
     EnvironmentDefinition,
     ExperimentDefinition,
@@ -68,6 +69,12 @@ def environment_check(directory: Path) -> None:
         {
             "name": package.identity.name,
             "digest": package.identity.digest,
+            "output_protocol": package.definition.output_protocol,
+            "logs": (
+                None
+                if package.definition.logs is None
+                else package.definition.logs.model_dump(mode="json")
+            ),
             "credentials": [
                 item.model_dump(mode="json") for item in package.definition.credentials
             ],
@@ -144,7 +151,10 @@ def run() -> None:
     type=click.Path(path_type=Path, file_okay=False),
     envvar="RUNLAB_CREDENTIALS",
     show_envvar=True,
-    help="Private directory containing credential entries by declared name.",
+    help=(
+        "Private entries by declared name. Defaults to "
+        "$XDG_CONFIG_HOME/runlab/credentials or ~/.config/runlab/credentials."
+    ),
 )
 def run_start(
     **values: object,
@@ -220,7 +230,10 @@ def experiment_check(directory: Path) -> None:
     type=click.Path(path_type=Path, file_okay=False),
     envvar="RUNLAB_CREDENTIALS",
     show_envvar=True,
-    help="Private directory containing credential entries by declared name.",
+    help=(
+        "Private entries by declared name. Defaults to "
+        "$XDG_CONFIG_HOME/runlab/credentials or ~/.config/runlab/credentials."
+    ),
 )
 def experiment_run(
     directory: Path,
@@ -253,6 +266,26 @@ def experiment_run(
         for item in record.runs
     ):
         raise click.exceptions.Exit(1)
+
+
+@cli.group(cls=NaturalOrderGroup)
+def guidance() -> None:
+    """Read version-matched guidance distributed with RunLab."""
+
+
+@guidance.command("list")
+def guidance_list() -> None:
+    """List embedded guidance documents."""
+
+    _emit({"guidance": list_guidance()})
+
+
+@guidance.command("show")
+@click.argument("name", type=click.Choice(["environment"]))
+def guidance_show(name: str) -> None:
+    """Return one embedded guidance document."""
+
+    _emit({"name": name, "content": read_guidance(name)})
 
 
 @cli.group(cls=NaturalOrderGroup)

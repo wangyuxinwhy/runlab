@@ -67,9 +67,13 @@ def test_environment_accepts_selected_build_input(tmp_path: Path) -> None:
     assert package.definition.build_inputs[0].include == ("pyproject.toml", "src")
 
 
-def test_codex_environment_requires_native_logs(tmp_path: Path) -> None:
+@pytest.mark.parametrize("protocol", ["codex-jsonl", "claude-stream-json"])
+def test_structured_environment_requires_native_logs(
+    tmp_path: Path,
+    protocol: str,
+) -> None:
     (tmp_path / "Dockerfile").write_text("FROM scratch\n")
-    (tmp_path / "environment.json").write_text('{"output_protocol":"codex-jsonl"}')
+    (tmp_path / "environment.json").write_text(f'{{"output_protocol":"{protocol}"}}')
 
     with pytest.raises(DefinitionError, match="must declare native logs"):
         load_environment(tmp_path)

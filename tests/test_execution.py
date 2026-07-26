@@ -6,7 +6,7 @@ from typing import override
 
 import pytest
 
-from runlab.bindings import BindingResolver
+from runlab.bindings import BindingResolver, default_credential_directory
 from runlab.docker import DockerEngine
 from runlab.errors import DefinitionError
 from runlab.execution import (
@@ -216,6 +216,57 @@ def test_credential_uses_explicit_private_directory(
         "target": "/run/credentials/lark-cli",
     }
     assert str(credentials) not in str(bindings.credentials)
+
+
+def test_credential_uses_default_xdg_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment_root = tmp_path / "environment"
+    environment_root.mkdir()
+    (environment_root / "Dockerfile").write_text("FROM scratch\n")
+    (environment_root / "environment.json").write_text(
+        """
+        {
+          "credentials": [
+            {
+              "name": "claude",
+              "kind": "file",
+              "target": "/run/credentials/claude/setup-token"
+            }
+          ]
+        }
+        """
+    )
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    (task_root / "task.md").write_text("Do the work.\n")
+    config_home = tmp_path / "config"
+    credentials = config_home / "runlab" / "credentials"
+    credentials.mkdir(parents=True, mode=0o700)
+    credential = credentials / "claude"
+    credential.write_text("private")
+    credential.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+
+    bindings = BindingResolver().resolve(
+        load_environment(environment_root),
+        load_task(task_root),
+    )
+
+    assert bindings.credential_mounts[0].source == credential
+
+
+def test_default_credential_directory_falls_back_to_user_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert default_credential_directory() == (
+        tmp_path / ".config" / "runlab" / "credentials"
+    )
 
 
 def test_missing_credential_reports_opaque_slot_name(tmp_path: Path) -> None:

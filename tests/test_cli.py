@@ -14,6 +14,7 @@ def test_help_exposes_noun_verb_control_surface() -> None:
     assert "task" in result.output
     assert "run" in result.output
     assert "experiment" in result.output
+    assert "guidance" in result.output
     assert "schema" in result.output
 
 
@@ -62,6 +63,8 @@ def test_environment_check_describes_credential_slots(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     value = json.loads(result.output)
+    assert value["output_protocol"] == "opaque"
+    assert value["logs"] is None
     assert value["credentials"] == [
         {
             "name": "claude",
@@ -69,6 +72,27 @@ def test_environment_check_describes_credential_slots(tmp_path: Path) -> None:
             "target": "/run/credentials/claude/setup-token",
         }
     ]
+
+
+def test_environment_check_describes_runtime_log_contract(tmp_path: Path) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
+    (tmp_path / "environment.json").write_text(
+        """
+        {
+          "output_protocol": "claude-stream-json",
+          "logs": {
+            "target": "/home/node/.claude/projects"
+          }
+        }
+        """
+    )
+
+    result = CliRunner().invoke(cli, ["environment", "check", str(tmp_path)])
+
+    assert result.exit_code == 0
+    value = json.loads(result.output)
+    assert value["output_protocol"] == "claude-stream-json"
+    assert value["logs"] == {"target": "/home/node/.claude/projects"}
 
 
 def test_run_and_experiment_help_expose_one_credentials_directory() -> None:
@@ -83,3 +107,24 @@ def test_run_and_experiment_help_expose_one_credentials_directory() -> None:
     assert "--credentials DIRECTORY" in experiment_help.output
     assert "RUNLAB_CREDENTIALS" in run_help.output
     assert "RUNLAB_CREDENTIALS" in experiment_help.output
+
+
+def test_embedded_environment_guidance_is_machine_readable() -> None:
+    runner = CliRunner()
+
+    listed = runner.invoke(cli, ["guidance", "list"])
+    shown = runner.invoke(cli, ["guidance", "show", "environment"])
+
+    assert listed.exit_code == 0
+    assert json.loads(listed.output)["guidance"] == [
+        {
+            "name": "environment",
+            "summary": (
+                "Author an Agent runtime Environment and declare its RunLab contracts."
+            ),
+        }
+    ]
+    assert shown.exit_code == 0
+    value = json.loads(shown.output)
+    assert value["name"] == "environment"
+    assert value["content"].startswith("# Authoring a RunLab Environment\n")

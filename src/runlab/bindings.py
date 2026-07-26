@@ -41,7 +41,11 @@ class ResolvedBindings:
 
 class BindingResolver:
     def __init__(self, credential_directory: Path | None = None) -> None:
-        self._credential_directory = credential_directory
+        self._credential_directory = (
+            default_credential_directory()
+            if credential_directory is None
+            else credential_directory
+        )
         self._digests: dict[
             Path,
             tuple[str, Literal["file", "directory"]],
@@ -189,6 +193,12 @@ def _input_source(name: str) -> Path:
         msg = f"required input environment variable is not set: {name}"
         raise DefinitionError(msg)
     return Path(raw_source).expanduser().resolve(strict=True)
+
+
+def default_credential_directory() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(config_home) if config_home else Path("~/.config")
+    return base.expanduser() / "runlab" / "credentials"
 
 
 def _credential_source(

@@ -9,7 +9,6 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
 
 from runlab.bindings import BindingResolver, HostBuildInput, HostMount
 from runlab.docker import DockerEngine
@@ -20,6 +19,7 @@ from runlab.models import (
     ContainerResult,
     Logs,
     Measurements,
+    OutputProtocol,
     ProcessResult,
     RunOutcome,
     RunPolicy,
@@ -81,7 +81,7 @@ class ContainerProcess:
     measurements_path: Path
     timeout_seconds: int
     started_monotonic: float
-    output_protocol: Literal["opaque", "codex-jsonl"]
+    output_protocol: OutputProtocol
 
 
 @dataclass(frozen=True, slots=True)

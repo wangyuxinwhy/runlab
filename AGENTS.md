@@ -4,6 +4,7 @@
 
 - Respond to maintainers in Chinese unless they request another language.
 - Public documentation, CLI text, protocol fields, and source text are English. Experiment inputs preserve their original language.
+- Soft-wrap all Markdown prose. Never hard-wrap documentation.
 
 ## Python
 

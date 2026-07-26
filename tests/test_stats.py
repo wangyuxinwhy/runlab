@@ -7,7 +7,7 @@ def test_docker_size_units() -> None:
     assert parse_pair("10kB / 2MB") == (10_000, 2_000_000)
 
 
-def test_accumulator_keeps_peaks_and_latest_network() -> None:
+def test_accumulator_keeps_peaks_and_maximum_cumulative_io() -> None:
     accumulator = MeasurementAccumulator()
     accumulator.add(
         {
@@ -27,6 +27,15 @@ def test_accumulator_keeps_peaks_and_latest_network() -> None:
             "BlockIO": "7kB / 8kB",
         }
     )
+    accumulator.add(
+        {
+            "CPUPerc": "0%",
+            "MemUsage": "0B / 0B",
+            "PIDs": "0",
+            "NetIO": "0B / 0B",
+            "BlockIO": "0B / 0B",
+        }
+    )
 
     result = accumulator.finish(2.0)
     assert result.peak_cpu_percent == 1.5
@@ -35,4 +44,4 @@ def test_accumulator_keeps_peaks_and_latest_network() -> None:
     assert result.network_rx_bytes == 3000
     assert result.block_read_bytes == 7000
     assert result.block_write_bytes == 8000
-    assert result.samples == 2
+    assert result.samples == 3
