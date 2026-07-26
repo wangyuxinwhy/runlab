@@ -24,9 +24,10 @@ async def run_experiment(
     if jobs <= 0:
         msg = "jobs must be greater than zero"
         raise DefinitionError(msg)
+    runner = runner or Runner()
+    runner.preflight_credentials(package.environments)
     output_root = output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    runner = runner or Runner()
     experiment_id = new_id("experiment")
     created_at = datetime.now(UTC)
     semaphore = asyncio.Semaphore(jobs)

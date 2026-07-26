@@ -78,7 +78,12 @@ class DockerEngine:
             raise
 
     async def create(self, arguments: list[str]) -> str:
-        return (await self.run("create", *arguments)).strip()
+        private_values = _mount_sources(arguments)
+        try:
+            return (await self.run("create", *arguments)).strip()
+        except ExecutionError as error:
+            detail = _redact(str(error), private_values)
+            raise ExecutionError(detail) from error
 
     async def stop(self, container: str) -> None:
         await self.run("stop", "--time", "2", container)
@@ -130,3 +135,22 @@ def _build_lock(tag: str) -> AsyncFileLock:
     directory.mkdir(parents=True, exist_ok=True)
     name = hashlib.sha256(tag.encode()).hexdigest()
     return AsyncFileLock(directory / f"{name}.lock")
+
+
+def _mount_sources(arguments: list[str]) -> tuple[str, ...]:
+    sources: list[str] = []
+    for argument in arguments:
+        if not argument.startswith("type=bind,source="):
+            continue
+        source, separator, _remainder = argument.removeprefix(
+            "type=bind,source="
+        ).partition(",target=")
+        if separator:
+            sources.append(source)
+    return tuple(sources)
+
+
+def _redact(value: str, private_values: tuple[str, ...]) -> str:
+    for private in private_values:
+        value = value.replace(private, "<private-host-path>")
+    return value

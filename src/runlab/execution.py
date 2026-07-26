@@ -4,13 +4,14 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from runlab.bindings import HostBuildInput, HostMount, InputResolver
+from runlab.bindings import BindingResolver, HostBuildInput, HostMount
 from runlab.docker import DockerEngine
 from runlab.errors import ExecutionError, RunLabError
 from runlab.identity import digest_values, new_id
@@ -101,10 +102,17 @@ class Runner:
     def __init__(
         self,
         engine: DockerEngine | None = None,
-        resolver: InputResolver | None = None,
+        resolver: BindingResolver | None = None,
     ) -> None:
         self.engine = engine or DockerEngine()
-        self.resolver = resolver or InputResolver()
+        self.resolver = resolver or BindingResolver()
+
+    def preflight_credentials(
+        self,
+        environments: Iterable[EnvironmentPackage],
+        /,
+    ) -> None:
+        self.resolver.preflight_credentials(environments)
 
     async def run(self, request: RunRequest) -> tuple[RunRecord, Path]:
         """Execute one Run and always preserve a record after acceptance."""

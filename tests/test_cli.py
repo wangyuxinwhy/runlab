@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -39,3 +40,46 @@ def test_experiment_check_reports_matrix_size(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert result.output == ('{"name":"matrix","environments":1,"tasks":1,"runs":1}\n')
+
+
+def test_environment_check_describes_credential_slots(tmp_path: Path) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
+    (tmp_path / "environment.json").write_text(
+        """
+        {
+          "credentials": [
+            {
+              "name": "claude",
+              "kind": "file",
+              "target": "/run/credentials/claude/setup-token"
+            }
+          ]
+        }
+        """
+    )
+
+    result = CliRunner().invoke(cli, ["environment", "check", str(tmp_path)])
+
+    assert result.exit_code == 0
+    value = json.loads(result.output)
+    assert value["credentials"] == [
+        {
+            "name": "claude",
+            "kind": "file",
+            "target": "/run/credentials/claude/setup-token",
+        }
+    ]
+
+
+def test_run_and_experiment_help_expose_one_credentials_directory() -> None:
+    runner = CliRunner()
+
+    run_help = runner.invoke(cli, ["run", "start", "--help"])
+    experiment_help = runner.invoke(cli, ["experiment", "run", "--help"])
+
+    assert run_help.exit_code == 0
+    assert experiment_help.exit_code == 0
+    assert "--credentials DIRECTORY" in run_help.output
+    assert "--credentials DIRECTORY" in experiment_help.output
+    assert "RUNLAB_CREDENTIALS" in run_help.output
+    assert "RUNLAB_CREDENTIALS" in experiment_help.output

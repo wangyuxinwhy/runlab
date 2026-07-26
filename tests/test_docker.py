@@ -4,7 +4,10 @@ import asyncio
 from collections import defaultdict
 from pathlib import Path
 
+import pytest
+
 from runlab.docker import DockerEngine
+from runlab.errors import ExecutionError
 
 
 class ImageEngine(DockerEngine):
@@ -35,3 +38,32 @@ async def test_concurrent_image_requests_share_one_build(tmp_path: Path) -> None
 
     assert results == ["sha256:image"] * 3
     assert engine.builds == 1
+
+
+class FailingCreateEngine(DockerEngine):
+    def __init__(self) -> None:
+        pass
+
+    async def run(self, *arguments: str, cwd: Path | None = None) -> str:
+        del arguments, cwd
+        msg = "Docker operation failed: mount source /private/credential failed"
+        raise ExecutionError(msg)
+
+
+async def test_create_error_redacts_private_mount_sources() -> None:
+    engine = FailingCreateEngine()
+
+    with pytest.raises(ExecutionError) as caught:
+        await engine.create(
+            [
+                "--mount",
+                (
+                    "type=bind,source=/private/credential,"
+                    "target=/run/credentials/runtime,readonly"
+                ),
+                "image",
+            ]
+        )
+
+    assert "/private/credential" not in str(caught.value)
+    assert "<private-host-path>" in str(caught.value)

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -37,8 +39,9 @@ class ResolvedBindings:
     credentials: list[ResolvedCredential]
 
 
-class InputResolver:
-    def __init__(self) -> None:
+class BindingResolver:
+    def __init__(self, credential_directory: Path | None = None) -> None:
+        self._credential_directory = credential_directory
         self._digests: dict[
             Path,
             tuple[str, Literal["file", "directory"]],
@@ -96,13 +99,26 @@ class InputResolver:
 
         credential_mounts: list[HostMount] = []
         credentials: list[ResolvedCredential] = []
+        credential_names: set[str] = set()
         for request in environment.definition.credentials:
+            if request.name in credential_names:
+                msg = f"duplicate credential name: {request.name}"
+                raise DefinitionError(msg)
             _claim_mount_target(request.target, seen_targets)
-            source = _credential_source(request.name)
+            source = _credential_source(
+                self._credential_directory,
+                request.name,
+                request.kind,
+            )
             credential_mounts.append(HostMount(source=source, target=request.target))
             credentials.append(
-                ResolvedCredential(name=request.name, target=request.target)
+                ResolvedCredential(
+                    name=request.name,
+                    kind=request.kind,
+                    target=request.target,
+                )
             )
+            credential_names.add(request.name)
         return ResolvedBindings(
             input_mounts=input_mounts,
             inputs=inputs,
@@ -111,6 +127,26 @@ class InputResolver:
             credential_mounts=credential_mounts,
             credentials=credentials,
         )
+
+    def preflight_credentials(
+        self,
+        environments: Iterable[EnvironmentPackage],
+        /,
+    ) -> None:
+        """Resolve every credential before an Experiment accepts any Run."""
+
+        checked: set[tuple[str, Literal["file", "directory"]]] = set()
+        for environment in environments:
+            for request in environment.definition.credentials:
+                requirement = (request.name, request.kind)
+                if requirement in checked:
+                    continue
+                _credential_source(
+                    self._credential_directory,
+                    request.name,
+                    request.kind,
+                )
+                checked.add(requirement)
 
     def _identify(
         self,
@@ -155,28 +191,52 @@ def _input_source(name: str) -> Path:
     return Path(raw_source).expanduser().resolve(strict=True)
 
 
-def _credential_source(name: str) -> Path:
-    if name == "codex":
-        codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-        source = (codex_home / "auth.json").resolve(strict=True)
-        if not source.is_file():
-            msg = "Codex credential is not a regular file"
-            raise DefinitionError(msg)
-        return source
-    if name == "lark":
-        raw_source = os.environ.get("RUNLAB_LARK_CREDENTIAL_DIR")
-        if not raw_source:
-            msg = (
-                "required Lark credential bundle is not set: RUNLAB_LARK_CREDENTIAL_DIR"
-            )
-            raise DefinitionError(msg)
-        source = Path(raw_source).expanduser().resolve(strict=True)
-        if not source.is_dir():
-            msg = "Lark credential is not a directory"
-            raise DefinitionError(msg)
-        return source
-    msg = f"unsupported credential provider: {name}"
-    raise DefinitionError(msg)
+def _credential_source(
+    directory: Path | None,
+    name: str,
+    kind: Literal["file", "directory"],
+) -> Path:
+    root = _private_credential_root(directory, name)
+    try:
+        source = (root / name).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        msg = f"credential '{name}' is missing; expected {kind} entry"
+        raise DefinitionError(msg) from error
+    if kind == "file" and not source.is_file():
+        msg = f"credential '{name}' must be a regular file"
+        raise DefinitionError(msg)
+    if kind == "directory" and not source.is_dir():
+        msg = f"credential '{name}' must be a directory"
+        raise DefinitionError(msg)
+    _require_private_permissions(source, f"credential '{name}'")
+    return source
+
+
+def _private_credential_root(directory: Path | None, name: str) -> Path:
+    if directory is None:
+        msg = f"credentials directory is required for credential '{name}'"
+        raise DefinitionError(msg)
+    try:
+        root = directory.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        msg = "credentials directory does not exist"
+        raise DefinitionError(msg) from error
+    if not root.is_dir():
+        msg = "credentials path must be a directory"
+        raise DefinitionError(msg)
+    _require_private_permissions(root, "credentials directory")
+    return root
+
+
+def _require_private_permissions(path: Path, label: str) -> None:
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as error:
+        msg = f"could not inspect {label}"
+        raise DefinitionError(msg) from error
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        msg = f"{label} must not be accessible by group or others"
+        raise DefinitionError(msg)
 
 
 def _environment_source(name: str) -> Path:

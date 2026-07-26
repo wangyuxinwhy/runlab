@@ -10,6 +10,7 @@ import click
 from pydantic import BaseModel
 
 from runlab import __version__
+from runlab.bindings import BindingResolver
 from runlab.errors import RunLabError
 from runlab.execution import Runner, RunRequest
 from runlab.experiment import run_experiment
@@ -67,7 +68,9 @@ def environment_check(directory: Path) -> None:
         {
             "name": package.identity.name,
             "digest": package.identity.digest,
-            "credentials": [item.name for item in package.definition.credentials],
+            "credentials": [
+                item.model_dump(mode="json") for item in package.definition.credentials
+            ],
             "build_inputs": [item.name for item in package.definition.build_inputs],
             "inputs": [item.name for item in package.definition.inputs],
         }
@@ -135,6 +138,14 @@ def run() -> None:
     default="default",
     show_default=True,
 )
+@click.option(
+    "--credentials",
+    "credential_directory",
+    type=click.Path(path_type=Path, file_okay=False),
+    envvar="RUNLAB_CREDENTIALS",
+    show_envvar=True,
+    help="Private directory containing credential entries by declared name.",
+)
 def run_start(
     **values: object,
 ) -> None:
@@ -143,6 +154,7 @@ def run_start(
     environment_directory = cast("Path", values["environment_directory"])
     task_directory = cast("Path", values["task_directory"])
     output = cast("Path", values["output"])
+    credential_directory = cast("Path | None", values["credential_directory"])
     environment_package = load_environment(environment_directory)
     task_package = load_task(task_directory)
     policy = RunPolicy(
@@ -152,7 +164,7 @@ def run_start(
         network=cast("Literal['default', 'none']", values["network"]),
     )
     record, record_path = asyncio.run(
-        Runner().run(
+        Runner(resolver=BindingResolver(credential_directory)).run(
             RunRequest(
                 environment=environment_package,
                 task=task_package,
@@ -202,11 +214,27 @@ def experiment_check(directory: Path) -> None:
     show_default=True,
 )
 @click.option("--jobs", type=click.IntRange(min=1), default=1, show_default=True)
-def experiment_run(directory: Path, output: Path, jobs: int) -> None:
+@click.option(
+    "--credentials",
+    "credential_directory",
+    type=click.Path(path_type=Path, file_okay=False),
+    envvar="RUNLAB_CREDENTIALS",
+    show_envvar=True,
+    help="Private directory containing credential entries by declared name.",
+)
+def experiment_run(
+    directory: Path,
+    output: Path,
+    jobs: int,
+    credential_directory: Path | None,
+) -> None:
     """Execute the full matrix in Experiment DIRECTORY."""
 
     package = load_experiment(directory)
-    record, record_path = asyncio.run(run_experiment(package, output, jobs))
+    runner = Runner(resolver=BindingResolver(credential_directory))
+    record, record_path = asyncio.run(
+        run_experiment(package, output, jobs, runner=runner)
+    )
     counts = {
         outcome.value: sum(item.outcome == outcome for item in record.runs)
         for outcome in RunOutcome

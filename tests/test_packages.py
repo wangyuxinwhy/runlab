@@ -75,14 +75,22 @@ def test_codex_environment_requires_native_logs(tmp_path: Path) -> None:
         load_environment(tmp_path)
 
 
-def test_environment_credential_targets_follow_provider(tmp_path: Path) -> None:
+def test_environment_accepts_opaque_credential_slots(tmp_path: Path) -> None:
     (tmp_path / "Dockerfile").write_text("FROM scratch\n")
     (tmp_path / "environment.json").write_text(
         """
         {
           "credentials": [
-            {"name": "codex"},
-            {"name": "lark"}
+            {
+              "name": "pi",
+              "kind": "file",
+              "target": "/run/credentials/pi/auth.json"
+            },
+            {
+              "name": "lark",
+              "kind": "directory",
+              "target": "/run/credentials/lark-cli"
+            }
           ]
         }
         """
@@ -90,5 +98,25 @@ def test_environment_credential_targets_follow_provider(tmp_path: Path) -> None:
 
     package = load_environment(tmp_path)
 
-    assert package.definition.credentials[0].target == "/root/.codex/auth.json"
+    assert package.definition.credentials[0].name == "pi"
+    assert package.definition.credentials[0].kind == "file"
+    assert package.definition.credentials[0].target == "/run/credentials/pi/auth.json"
+    assert package.definition.credentials[1].kind == "directory"
     assert package.definition.credentials[1].target == "/run/credentials/lark-cli"
+
+
+def test_environment_rejects_duplicate_credential_slots(tmp_path: Path) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
+    (tmp_path / "environment.json").write_text(
+        """
+        {
+          "credentials": [
+            {"name": "runtime", "kind": "file", "target": "/first"},
+            {"name": "runtime", "kind": "file", "target": "/second"}
+          ]
+        }
+        """
+    )
+
+    with pytest.raises(DefinitionError, match="credential names must be unique"):
+        load_environment(tmp_path)

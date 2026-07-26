@@ -6,7 +6,7 @@ from typing import override
 
 import pytest
 
-from runlab.bindings import InputResolver
+from runlab.bindings import BindingResolver
 from runlab.docker import DockerEngine
 from runlab.errors import DefinitionError
 from runlab.execution import (
@@ -22,7 +22,7 @@ from runlab.models import (
     RunOutcome,
     RunPolicy,
 )
-from runlab.packages import load_environment, load_task
+from runlab.packages import EnvironmentPackage, load_environment, load_task
 
 
 class CancellationEngine(DockerEngine):
@@ -133,7 +133,7 @@ async def test_run_retains_only_record_artifacts_and_logs(tmp_path: Path) -> Non
         )
     )
 
-    assert record.schema_version == 2
+    assert record.schema_version == 3
     assert record.outcome is RunOutcome.SUCCEEDED
     assert [item.path for item in record.artifacts.files] == ["artifacts/report.md"]
     assert record.logs.runtime == "logs/runtime"
@@ -176,30 +176,161 @@ async def test_success_without_artifact_becomes_collection_failure(
     assert record.artifacts.error == "no artifact files were produced"
 
 
-def test_lark_credential_uses_explicit_private_bundle(
+def test_credential_uses_explicit_private_directory(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     environment_root = tmp_path / "environment"
     environment_root.mkdir()
     (environment_root / "Dockerfile").write_text("FROM scratch\n")
     (environment_root / "environment.json").write_text(
-        '{"credentials":[{"name":"lark"}]}'
+        """
+        {
+          "credentials": [
+            {
+              "name": "lark",
+              "kind": "directory",
+              "target": "/run/credentials/lark-cli"
+            }
+          ]
+        }
+        """
     )
     task_root = tmp_path / "task"
     task_root.mkdir()
     (task_root / "task.md").write_text("Do the work.\n")
-    credential = tmp_path / "credential"
-    credential.mkdir()
-    monkeypatch.setenv("RUNLAB_LARK_CREDENTIAL_DIR", str(credential))
+    credentials = tmp_path / "credentials"
+    credentials.mkdir(mode=0o700)
+    credential = credentials / "lark"
+    credential.mkdir(mode=0o700)
 
-    bindings = InputResolver().resolve(
+    bindings = BindingResolver(credentials).resolve(
         load_environment(environment_root),
         load_task(task_root),
     )
 
     assert bindings.credential_mounts[0].source == credential
     assert bindings.credential_mounts[0].target == "/run/credentials/lark-cli"
+    assert bindings.credentials[0].model_dump() == {
+        "name": "lark",
+        "kind": "directory",
+        "target": "/run/credentials/lark-cli",
+    }
+    assert str(credentials) not in str(bindings.credentials)
+
+
+def test_missing_credential_reports_opaque_slot_name(tmp_path: Path) -> None:
+    environment_root = tmp_path / "environment"
+    environment_root.mkdir()
+    (environment_root / "Dockerfile").write_text("FROM scratch\n")
+    (environment_root / "environment.json").write_text(
+        """
+        {
+          "credentials": [
+            {
+              "name": "pi",
+              "kind": "file",
+              "target": "/run/credentials/pi/auth.json"
+            }
+          ]
+        }
+        """
+    )
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    (task_root / "task.md").write_text("Do the work.\n")
+    credentials = tmp_path / "credentials"
+    credentials.mkdir(mode=0o700)
+
+    with pytest.raises(
+        DefinitionError,
+        match="credential 'pi' is missing; expected file entry",
+    ):
+        BindingResolver(credentials).resolve(
+            load_environment(environment_root),
+            load_task(task_root),
+        )
+
+
+def test_credential_kind_and_private_permissions_are_enforced(
+    tmp_path: Path,
+) -> None:
+    environment_root = tmp_path / "environment"
+    environment_root.mkdir()
+    (environment_root / "Dockerfile").write_text("FROM scratch\n")
+    (environment_root / "environment.json").write_text(
+        """
+        {
+          "credentials": [
+            {
+              "name": "claude",
+              "kind": "file",
+              "target": "/run/credentials/claude/setup-token"
+            }
+          ]
+        }
+        """
+    )
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    (task_root / "task.md").write_text("Do the work.\n")
+    credentials = tmp_path / "credentials"
+    credentials.mkdir(mode=0o700)
+    credential = credentials / "claude"
+    credential.mkdir(mode=0o700)
+    resolver = BindingResolver(credentials)
+
+    with pytest.raises(DefinitionError, match="must be a regular file"):
+        resolver.resolve(
+            load_environment(environment_root),
+            load_task(task_root),
+        )
+
+    credential.rmdir()
+    credential.write_text("private")
+    credential.chmod(0o644)
+    with pytest.raises(
+        DefinitionError,
+        match="must not be accessible by group or others",
+    ):
+        resolver.resolve(
+            load_environment(environment_root),
+            load_task(task_root),
+        )
+
+
+def test_credential_preflight_checks_every_environment_before_runs(
+    tmp_path: Path,
+) -> None:
+    environments: list[EnvironmentPackage] = []
+    for name in ("pi", "claude"):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "Dockerfile").write_text("FROM scratch\n")
+        (root / "environment.json").write_text(
+            f"""
+            {{
+              "credentials": [
+                {{
+                  "name": "{name}",
+                  "kind": "file",
+                  "target": "/run/credentials/{name}"
+                }}
+              ]
+            }}
+            """
+        )
+        environments.append(load_environment(root))
+    credentials = tmp_path / "credentials"
+    credentials.mkdir(mode=0o700)
+    pi = credentials / "pi"
+    pi.write_text("private")
+    pi.chmod(0o600)
+
+    with pytest.raises(
+        DefinitionError,
+        match="credential 'claude' is missing; expected file entry",
+    ):
+        BindingResolver(credentials).preflight_credentials(environments)
 
 
 def test_input_cannot_overlap_artifact_mount(tmp_path: Path) -> None:
@@ -224,7 +355,7 @@ def test_input_cannot_overlap_artifact_mount(tmp_path: Path) -> None:
     )
 
     with pytest.raises(DefinitionError, match="overlapping container mount target"):
-        InputResolver().resolve(
+        BindingResolver().resolve(
             load_environment(environment_root),
             load_task(task_root),
         )

@@ -34,7 +34,11 @@ target:
     "target": "/root/.codex/sessions"
   },
   "credentials": [
-    {"name": "codex"}
+    {
+      "name": "codex",
+      "kind": "file",
+      "target": "/root/.codex/auth.json"
+    }
   ]
 }
 ```
@@ -70,6 +74,51 @@ experiment/
 RunLab executes every Environment × Task pair with bounded concurrency.
 Selection, repeats, ordering, adaptive scheduling, and judging stay in Agent
 scripts composed from `runlab run start`.
+
+## Credential protocol
+
+An Environment declares opaque credential slots. RunLab does not know how to
+log in to a provider or discover its host configuration:
+
+```json
+{
+  "credentials": [
+    {
+      "name": "runtime",
+      "kind": "file",
+      "target": "/run/credentials/runtime"
+    }
+  ]
+}
+```
+
+The caller materializes a private directory whose entries match the declared
+names:
+
+```text
+credentials/
+├── codex       # file
+├── pi          # file
+├── claude      # file
+└── lark/       # directory
+```
+
+Pass the directory explicitly or through `RUNLAB_CREDENTIALS`:
+
+```bash
+runlab experiment run ./experiment --credentials /private/credentials
+```
+
+RunLab validates entry kinds and private permissions before accepting a Run,
+then bind-mounts each entry read-only at its Environment-owned target. A runtime
+entrypoint may copy a credential into ephemeral writable configuration or read a
+token file into its own process environment.
+
+RunLab itself never writes credential source paths, contents, or digests into a
+public record, logs, artifacts, workspaces, or images. The logical name, kind,
+and container target remain in `run.json` as execution facts. An Environment is
+trusted with credentials it requests; read-only transport cannot prevent a
+malicious runtime from printing or exfiltrating a credential.
 
 ## Retained Run protocol
 

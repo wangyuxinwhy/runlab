@@ -17,20 +17,12 @@ class ProtocolModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
-class CodexCredentialRequest(ProtocolModel):
-    name: Literal["codex"]
-    target: AbsoluteContainerPath = "/root/.codex/auth.json"
+class CredentialRequest(ProtocolModel):
+    """Declare one opaque credential slot consumed by an Environment."""
 
-
-class LarkCredentialRequest(ProtocolModel):
-    name: Literal["lark"]
-    target: AbsoluteContainerPath = "/run/credentials/lark-cli"
-
-
-type CredentialRequest = Annotated[
-    CodexCredentialRequest | LarkCredentialRequest,
-    Field(discriminator="name"),
-]
+    name: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]*$")]
+    kind: Literal["file", "directory"]
+    target: AbsoluteContainerPath
 
 
 class InputRequest(ProtocolModel):
@@ -68,9 +60,13 @@ class EnvironmentDefinition(ProtocolModel):
     metadata: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def _require_codex_native_logs(self) -> EnvironmentDefinition:
+    def _validate_environment_contract(self) -> EnvironmentDefinition:
         if self.output_protocol == "codex-jsonl" and self.logs is None:
             msg = "codex-jsonl Environments must declare native logs"
+            raise ValueError(msg)
+        credential_names = [item.name for item in self.credentials]
+        if len(credential_names) != len(set(credential_names)):
+            msg = "Environment credential names must be unique"
             raise ValueError(msg)
         return self
 
@@ -111,6 +107,7 @@ class ResolvedCredential(ProtocolModel):
     """Host credential paths and contents never enter the public record."""
 
     name: str
+    kind: Literal["file", "directory"]
     target: AbsoluteContainerPath
 
 
@@ -210,7 +207,7 @@ class Logs(ProtocolModel):
 
 
 class RunRecord(ProtocolModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     run_id: str
     outcome: RunOutcome
     created_at: datetime
