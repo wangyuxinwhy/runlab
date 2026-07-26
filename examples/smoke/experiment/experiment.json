@@ -1,0 +1,5 @@
+{
+  "name": "smoke",
+  "timeout_seconds": 30,
+  "network": "none"
+}

@@ -1,0 +1,13 @@
+.DS_Store
+.complexipy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.runlab/
+__pycache__/
+*.pyc
+build/
+dist/
+runs/
+corpora/
+experiments/

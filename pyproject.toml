@@ -1,0 +1,76 @@
+[project]
+name = "runlab"
+version = "0.1.0.dev0"
+description = "Run reproducible Agent experiments from an Environment and a Task"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "RunLab contributors" }]
+dependencies = [
+  "click>=8.2,<9",
+  "filelock>=3.20,<4",
+  "pydantic>=2.12,<3",
+]
+
+[project.scripts]
+runlab = "runlab.cli:main"
+
+[dependency-groups]
+dev = [
+  "basedpyright>=1.39.9",
+  "complexipy>=6.0.0",
+  "poethepoet>=0.47.1",
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.3,<2",
+  "ruff>=0.15.20",
+]
+
+[build-system]
+requires = ["uv-build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.poe.tasks]
+check = [
+  { cmd = "ruff format src tests" },
+  { cmd = "ruff check src tests" },
+  { cmd = "basedpyright" },
+  { cmd = "pytest -q" },
+  { cmd = "complexipy src tests --max-complexity-allowed 15" },
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+src = ["src", "tests"]
+extend-exclude = ["experiments", "runs"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "ASYNC240",
+  "COM812",
+  "CPY001",
+  "D",
+  "TC001",
+  "TC002",
+  "TC003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004", "S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.basedpyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.14"
+include = ["src", "tests"]
+exclude = [".venv", "__pycache__"]
