@@ -79,6 +79,7 @@ class ContainerProcess:
     stdout_path: Path
     stderr_path: Path
     measurements_path: Path
+    runtime_logs_path: Path | None
     timeout_seconds: int
     started_monotonic: float
     output_protocol: OutputProtocol
@@ -256,6 +257,7 @@ class Runner:
                     stdout_path=accepted.storage.stdout,
                     stderr_path=accepted.storage.stderr,
                     measurements_path=accepted.storage.measurements,
+                    runtime_logs_path=accepted.storage.runtime_logs,
                     timeout_seconds=accepted.request.policy.timeout_seconds,
                     started_monotonic=started_monotonic,
                     output_protocol=environment.definition.output_protocol,
@@ -353,6 +355,7 @@ class Runner:
         measurements = accumulator.finish(wall_seconds)
         usage, usage_error = collect_model_usage(
             request.stdout_path,
+            request.runtime_logs_path,
             request.output_protocol,
         )
         measurements = measurements.model_copy(

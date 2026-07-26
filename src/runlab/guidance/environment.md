@@ -83,15 +83,16 @@ RunLab always retains process stdout, process stderr, the Task instruction, and 
 
 ## Output Protocol and Model Usage
 
-`output_protocol` tells RunLab how to derive normalized model usage from the retained stdout log:
+`output_protocol` tells RunLab how to derive normalized model usage from retained runtime facts:
 
-| Value                | Runtime stdout contract                      |
-| -------------------- | -------------------------------------------- |
-| `opaque`             | Preserve stdout without deriving model usage |
-| `codex-jsonl`        | Parse Codex JSONL `turn.completed` events    |
-| `claude-stream-json` | Parse the terminal Claude stream JSON result |
+| Value                 | Usage source contract                                      |
+| --------------------- | ---------------------------------------------------------- |
+| `opaque`              | Preserve logs without deriving model usage                 |
+| `codex-jsonl`         | Parse Codex JSONL `turn.completed` events from stdout       |
+| `claude-stream-json`  | Parse the terminal Claude stream JSON result from stdout    |
+| `pi-session-jsonl`    | Sum assistant usage increments from native Pi session JSONL |
 
-A structured output protocol requires `logs.target`, because RunLab preserves the native runtime session as the primary audit record. Protocol adapters only derive deterministic facts. They do not judge output quality.
+A usage-aware protocol requires `logs.target`, because RunLab preserves the native runtime session as the primary audit record. Protocol adapters only derive deterministic facts. They do not judge output quality.
 
 ## Credentials
 

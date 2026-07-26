@@ -37,7 +37,7 @@ The image entrypoint reads `task.md` from stdin and runs the Agent in `/workspac
 }
 ```
 
-RunLab mounts that target at `logs/runtime/`. For Codex, the Environment must not use `--ephemeral`, because that disables the native session record. `output_protocol` may be `opaque`, `codex-jsonl`, or `claude-stream-json`.
+RunLab mounts that target at `logs/runtime/`. For Codex, the Environment must not use `--ephemeral`, because that disables the native session record. `output_protocol` may be `opaque`, `codex-jsonl`, `claude-stream-json`, or `pi-session-jsonl`.
 
 A Task contains the task-owned inputs:
 

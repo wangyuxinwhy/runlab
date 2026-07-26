@@ -11,7 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 type Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 type AbsoluteContainerPath = Annotated[str, Field(pattern=r"^/")]
 type PositiveSeconds = Annotated[int, Field(gt=0)]
-type OutputProtocol = Literal["opaque", "codex-jsonl", "claude-stream-json"]
+type OutputProtocol = Literal[
+    "opaque",
+    "codex-jsonl",
+    "claude-stream-json",
+    "pi-session-jsonl",
+]
 
 
 class ProtocolModel(BaseModel):
@@ -63,7 +68,7 @@ class EnvironmentDefinition(ProtocolModel):
     @model_validator(mode="after")
     def _validate_environment_contract(self) -> EnvironmentDefinition:
         if self.output_protocol != "opaque" and self.logs is None:
-            msg = "structured output Environments must declare native logs"
+            msg = "usage-aware Environments must declare native logs"
             raise ValueError(msg)
         credential_names = [item.name for item in self.credentials]
         if len(credential_names) != len(set(credential_names)):

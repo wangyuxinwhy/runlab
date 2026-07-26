@@ -27,16 +27,43 @@ class _ClaudeResult(BaseModel):
     ]
 
 
+class _PiModelUsage(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    input_tokens: Annotated[int, Field(alias="input")]
+    cached_input_tokens: Annotated[int, Field(alias="cacheRead")]
+    cache_write_input_tokens: Annotated[int, Field(alias="cacheWrite")]
+    output_tokens: Annotated[int, Field(alias="output")]
+    reasoning_output_tokens: Annotated[int, Field(alias="reasoning")] = 0
+
+
+class _PiMessage(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    role: str
+    usage: _PiModelUsage | None = None
+
+
+class _PiEvent(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    type: str
+    message: _PiMessage | None = None
+
+
 def collect_model_usage(
-    path: Path,
+    stdout_path: Path,
+    runtime_logs_path: Path | None,
     protocol: OutputProtocol,
     /,
 ) -> tuple[ModelUsage | None, str | None]:
     if protocol == "opaque":
         return None, None
     if protocol == "codex-jsonl":
-        return _collect_codex_usage(path)
-    return _collect_claude_usage(path)
+        return _collect_codex_usage(stdout_path)
+    if protocol == "claude-stream-json":
+        return _collect_claude_usage(stdout_path)
+    return _collect_pi_usage(runtime_logs_path)
 
 
 def _collect_codex_usage(path: Path) -> tuple[ModelUsage | None, str | None]:
@@ -82,6 +109,54 @@ def _collect_claude_usage(path: Path) -> tuple[ModelUsage | None, str | None]:
             ),
         )
     return usage, None
+
+
+def _collect_pi_usage(path: Path | None) -> tuple[ModelUsage | None, str | None]:
+    if path is None:
+        return None, "pi-session-jsonl requires native logs"
+    usage = _empty_usage()
+    found = False
+    try:
+        for log in sorted(path.rglob("*.jsonl")):
+            for increment in _read_pi_usage(log):
+                usage = _add_usage(usage, increment)
+                found = True
+    except OSError, json.JSONDecodeError, ValueError, ValidationError:
+        return None, "pi-session-jsonl usage could not be parsed"
+    if not found:
+        return None, "pi-session-jsonl did not contain assistant usage"
+    return usage, None
+
+
+def _read_pi_usage(path: Path, /) -> list[ModelUsage]:
+    if path.is_symlink():
+        msg = "Pi session log must be a regular file"
+        raise ValueError(msg)
+    usage: list[ModelUsage] = []
+    with path.open() as stream:
+        for line in stream:
+            event = _PiEvent.model_validate_json(line)
+            increment = _pi_assistant_usage(event)
+            if increment is not None:
+                usage.append(increment)
+    return usage
+
+
+def _pi_assistant_usage(event: _PiEvent, /) -> ModelUsage | None:
+    message = event.message
+    if event.type != "message" or message is None or message.role != "assistant":
+        return None
+    usage = message.usage
+    if usage is None:
+        msg = "Pi assistant message did not contain usage"
+        raise ValueError(msg)
+    return ModelUsage(
+        input_tokens=usage.input_tokens,
+        cached_input_tokens=usage.cached_input_tokens,
+        cache_write_input_tokens=usage.cache_write_input_tokens,
+        output_tokens=usage.output_tokens,
+        reasoning_output_tokens=usage.reasoning_output_tokens,
+    )
 
 
 def _empty_usage() -> ModelUsage:

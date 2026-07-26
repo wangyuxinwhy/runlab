@@ -67,8 +67,11 @@ def test_environment_accepts_selected_build_input(tmp_path: Path) -> None:
     assert package.definition.build_inputs[0].include == ("pyproject.toml", "src")
 
 
-@pytest.mark.parametrize("protocol", ["codex-jsonl", "claude-stream-json"])
-def test_structured_environment_requires_native_logs(
+@pytest.mark.parametrize(
+    "protocol",
+    ["codex-jsonl", "claude-stream-json", "pi-session-jsonl"],
+)
+def test_usage_aware_environment_requires_native_logs(
     tmp_path: Path,
     protocol: str,
 ) -> None:
