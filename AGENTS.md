@@ -38,9 +38,12 @@
 
 ## Documentation
 
-- Reference documents under [src/runlab/docs/reference](src/runlab/docs/reference) are the source of truth for mechanisms, derived from the implementation. Their primary readers are agents, so they are written in English, their relative links stay inside the reference layer, and a change touching `src/` must leave them consistent in the same change.
-- A document carries only the main line of its stated topic. Side-path content such as one-time setup or another document's mechanism is linked, not inlined.
+- All documentation lives in one tree under [src/runlab/docs](src/runlab/docs), organized as tutorial, how-to, reference, and explanation. The tree serves both the VitePress site and `runlab docs`, so a relative link between two documents resolves identically in either. `docs/` holds only `.vitepress`, which keeps site build output out of the Python package.
+- `runlab docs` serves reference and explanation only. Reference states mechanisms an Agent must not guess at; explanation states the constraints behind them. Tutorials and how-to guides are deliberately withheld: one-time setup and human workflows cost an Agent context without changing what it can do.
+- Reference and explanation are the source of truth for mechanisms and their rationale, derived from the implementation. A change touching `src/` must leave them consistent in the same change, and their relative links stay within those two layers so the shipped pair remains self-contained.
+- A document carries only the main line of its stated topic. Side-path content such as one-time setup or another document's mechanism is linked, not inlined, and a tutorial leads with the action rather than with installation.
 - Prose carries no removable content: a repeated statement, a filler transition, a content-free summary, and over-explanation of the obvious are deleted. Emphasis must carry distinguishing information, and numbering is used only when the number is the content.
+- Verify the site with `pnpm build`; it fails on dead links, which is what keeps cross-layer references honest.
 
 ## Verification
 

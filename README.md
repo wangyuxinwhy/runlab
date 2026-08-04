@@ -49,15 +49,23 @@ Declarations are copied in rather than referenced, because a digest proves that 
 
 ## Documentation
 
-The reference layer ships with the CLI, so guidance always matches the installed version:
+The documentation site is organized as tutorial, how-to, reference, and explanation:
+
+```bash
+pnpm install && pnpm dev
+```
+
+Start with **Your first Run** to get an Agent executing, **Your first ablation** to see what the layering buys, and **Why the layers exist** for the reasoning behind the design.
+
+Reference and explanation also ship inside the package, so guidance always matches the installed version:
 
 ```bash
 uv run runlab docs list
-uv run runlab docs get principles
+uv run runlab docs get explanation/principles
 uv run runlab schema show run-record
 ```
 
-Start with `principles` for the guarantees and invariants, `model` for declarations, identity, and locks, `architecture` for package layering, and `cli` for the command tree.
+Tutorials and how-to guides are deliberately not served there — one-time setup costs an Agent context without changing what it can do.
 
 ## Development
 

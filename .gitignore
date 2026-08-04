@@ -10,3 +10,6 @@ dist/
 runs/
 corpora/
 experiments/
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/

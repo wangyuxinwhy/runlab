@@ -23,11 +23,23 @@ def test_docs_serve_the_bundled_reference_layer() -> None:
 
     assert listing.returncode == 0
     topics = json.loads(listing.stdout)["topics"]
-    assert {"principles", "model", "architecture", "cli"} <= set(topics)
+    assert {
+        "explanation/principles",
+        "reference/model",
+        "reference/architecture",
+        "reference/cli",
+    } <= set(topics)
 
-    content = run_cli("docs", "get", "principles")
+    content = run_cli("docs", "get", "explanation/principles")
     assert content.returncode == 0
     assert "Base + Overlay + Task -> Run" in json.loads(content.stdout)["content"]
+
+
+def test_tutorials_are_not_served_to_agents() -> None:
+    """Setup steps cost an Agent context without changing what it can do."""
+    topics = json.loads(run_cli("docs", "list").stdout)["topics"]
+
+    assert not [item for item in topics if item.startswith(("tutorial/", "how-to/"))]
 
 
 def test_an_unknown_topic_fails_with_a_diagnostic() -> None:
@@ -106,3 +118,17 @@ def test_stdout_stays_one_compact_json_object(tmp_path: Path) -> None:
     assert result.stdout.count("\n") == 1
     assert ", " not in result.stdout
     assert json.loads(result.stdout)["empty"] is True
+
+
+def test_every_shipped_layer_document_is_reachable() -> None:
+    """A document added to a shipped layer must be served, not silently absent."""
+    package_docs = Path(__file__).parents[1] / "src" / "runlab" / "docs"
+    on_disk = {
+        f"{layer}/{path.stem}"
+        for layer in ("reference", "explanation")
+        for path in (package_docs / layer).glob("*.md")
+    }
+
+    served = set(json.loads(run_cli("docs", "list").stdout)["topics"])
+
+    assert served == on_disk

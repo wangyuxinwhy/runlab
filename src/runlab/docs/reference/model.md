@@ -1,6 +1,6 @@
 # Model
 
-RunLab has three declaration kinds, two identity layers, and one terminal record. The layering exists so that a variable under study lands in exactly one place, which is what makes a difference between two Runs attributable. [Principles](principles.md) states why; this document states what.
+RunLab has three declaration kinds, two identity layers, and one terminal record. The layering exists so that a variable under study lands in exactly one place, which is what makes a difference between two Runs attributable. [Why the layers exist](../explanation/why-layers.md) states why; this document states what.
 
 ## Declaration Layers
 

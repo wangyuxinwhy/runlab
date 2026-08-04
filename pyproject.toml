@@ -1,7 +1,7 @@
 [project]
 name = "runlab"
-version = "0.1.0.dev0"
-description = "Run reproducible Agent experiments from an Environment and a Task"
+version = "0.2.0.dev0"
+description = "Record reproducible Agent execution facts from Base + Overlay + Task"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"
