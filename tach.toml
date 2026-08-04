@@ -1,0 +1,76 @@
+exclude = [
+    "**/*__pycache__",
+    ".venv",
+    "tests",
+    "docs",
+]
+source_roots = ["src"]
+forbid_circular_dependencies = true
+ignore_type_checking_imports = true
+
+# The architecture is an hourglass. core is the protocol waist at the bottom,
+# engine is the composition waist above, and concept domains spread flat
+# between them with zero cross-domain edges. A domain owns one concept and
+# never learns another domain's particulars; engine sequences them through
+# their public interfaces without re-implementing any of them.
+
+[[modules]]
+path = "runlab"
+depends_on = ["runlab.cli"]
+
+[[modules]]
+path = "runlab.core"
+depends_on = []
+
+# Core's upward surface is a declared contract: a new core module is not
+# importable until it is listed here, so admitting vocabulary into the shared
+# protocol stays a reviewed decision rather than a side effect of file
+# placement.
+[[interfaces]]
+expose = [
+    "digest(\\..*)?",
+    "errors(\\..*)?",
+    "identity(\\..*)?",
+    "models(\\..*)?",
+]
+from = ["runlab.core"]
+
+[[modules]]
+path = "runlab.declarations"
+depends_on = ["runlab.core"]
+
+[[modules]]
+path = "runlab.realization"
+depends_on = ["runlab.core"]
+
+[[modules]]
+path = "runlab.container"
+depends_on = ["runlab.core"]
+
+[[modules]]
+path = "runlab.usage"
+depends_on = ["runlab.core"]
+
+[[modules]]
+path = "runlab.record"
+depends_on = ["runlab.core"]
+
+[[modules]]
+path = "runlab.engine"
+depends_on = [
+    "runlab.container",
+    "runlab.core",
+    "runlab.declarations",
+    "runlab.realization",
+    "runlab.record",
+    "runlab.usage",
+]
+
+[[modules]]
+path = "runlab.cli"
+depends_on = [
+    "runlab.core",
+    "runlab.declarations",
+    "runlab.engine",
+    "runlab.realization",
+]

@@ -1,0 +1,9 @@
+{
+  "name": "pi",
+  "output_protocol": "pi-session-jsonl",
+  "logs": { "target": "/root/.pi/agent/sessions" },
+  "credentials": [
+    { "name": "deepseek", "kind": "file", "target": "/run/credentials/deepseek" }
+  ],
+  "metadata": { "runtime": "pi", "pi_version": "0.83.0" }
+}

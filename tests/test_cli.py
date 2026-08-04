@@ -1,130 +1,108 @@
+"""The CLI is verified as an installed process, which is how agents call it."""
+
 import json
+import subprocess
+import sys
 from pathlib import Path
 
-from click.testing import CliRunner
 
-from runlab.cli import cli
-
-
-def test_help_exposes_noun_verb_control_surface() -> None:
-    result = CliRunner().invoke(cli, ["--help"])
-
-    assert result.exit_code == 0
-    assert "environment" in result.output
-    assert "task" in result.output
-    assert "run" in result.output
-    assert "experiment" in result.output
-    assert "guidance" in result.output
-    assert "schema" in result.output
+def run_cli(
+    *arguments: str, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "runlab", *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=cwd,
+    )
 
 
-def test_task_check_is_compact_json(tmp_path: Path) -> None:
-    (tmp_path / "task.md").write_text("Do the work.")
+def test_docs_serve_the_bundled_reference_layer() -> None:
+    listing = run_cli("docs", "list")
 
-    result = CliRunner().invoke(cli, ["task", "check", str(tmp_path)])
+    assert listing.returncode == 0
+    topics = json.loads(listing.stdout)["topics"]
+    assert {"principles", "model", "architecture", "cli"} <= set(topics)
 
-    assert result.exit_code == 0
-    assert "\n" not in result.output.rstrip("\n")
-    assert '"name":"' in result.output
-
-
-def test_experiment_check_reports_matrix_size(tmp_path: Path) -> None:
-    (tmp_path / "experiment.json").write_text('{"name":"matrix"}')
-    environment = tmp_path / "environments" / "agent"
-    environment.mkdir(parents=True)
-    (environment / "Dockerfile").write_text("FROM scratch\n")
-    task = tmp_path / "tasks" / "work"
-    task.mkdir(parents=True)
-    (task / "task.md").write_text("Do the work.")
-
-    result = CliRunner().invoke(cli, ["experiment", "check", str(tmp_path)])
-
-    assert result.exit_code == 0
-    assert result.output == ('{"name":"matrix","environments":1,"tasks":1,"runs":1}\n')
+    content = run_cli("docs", "get", "principles")
+    assert content.returncode == 0
+    assert "Base + Overlay + Task -> Run" in json.loads(content.stdout)["content"]
 
 
-def test_environment_check_describes_credential_slots(tmp_path: Path) -> None:
-    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
-    (tmp_path / "environment.json").write_text(
-        """
-        {
-          "credentials": [
+def test_an_unknown_topic_fails_with_a_diagnostic() -> None:
+    result = run_cli("docs", "get", "absent")
+
+    assert result.returncode == 1
+    assert "unknown documentation topic" in result.stderr
+    assert result.stdout == ""
+
+
+def test_schema_names_cover_every_public_model() -> None:
+    result = run_cli("schema", "list")
+
+    assert json.loads(result.stdout)["schemas"] == [
+        "base",
+        "overlay",
+        "task",
+        "lock",
+        "run-record",
+    ]
+
+
+def test_base_check_reports_declaration_identity(tmp_path: Path) -> None:
+    root = tmp_path / "pi"
+    root.mkdir()
+    (root / "Dockerfile").write_text("FROM scratch\n")
+    (root / "base.json").write_text(
+        json.dumps(
             {
-              "name": "claude",
-              "kind": "file",
-              "target": "/run/credentials/claude/setup-token"
+                "output_protocol": "pi-session-jsonl",
+                "logs": {"target": "/root/.pi/sessions"},
             }
-          ]
-        }
-        """
+        )
     )
 
-    result = CliRunner().invoke(cli, ["environment", "check", str(tmp_path)])
+    result = run_cli("base", "check", str(root))
 
-    assert result.exit_code == 0
-    value = json.loads(result.output)
-    assert value["output_protocol"] == "opaque"
-    assert value["logs"] is None
-    assert value["credentials"] == [
-        {
-            "name": "claude",
-            "kind": "file",
-            "target": "/run/credentials/claude/setup-token",
-        }
-    ]
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["name"] == "pi"
+    assert payload["declaration"].startswith("sha256:")
+    assert payload["output_protocol"] == "pi-session-jsonl"
+    assert payload["locked"] is False
 
 
-def test_environment_check_describes_runtime_log_contract(tmp_path: Path) -> None:
-    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
-    (tmp_path / "environment.json").write_text(
-        """
-        {
-          "output_protocol": "claude-stream-json",
-          "logs": {
-            "target": "/home/node/.claude/projects"
-          }
-        }
-        """
-    )
+def test_task_check_reports_the_instruction_digest(tmp_path: Path) -> None:
+    root = tmp_path / "analyze"
+    root.mkdir()
+    (root / "task.md").write_text("Write /artifacts/answer.md.\n")
 
-    result = CliRunner().invoke(cli, ["environment", "check", str(tmp_path)])
+    result = run_cli("task", "check", str(root))
 
-    assert result.exit_code == 0
-    value = json.loads(result.output)
-    assert value["output_protocol"] == "claude-stream-json"
-    assert value["logs"] == {"target": "/home/node/.claude/projects"}
+    payload = json.loads(result.stdout)
+    assert payload["instruction"].startswith("sha256:")
+    assert payload["workspace"] is False
 
 
-def test_run_and_experiment_help_expose_one_credentials_directory() -> None:
-    runner = CliRunner()
+def test_an_invalid_declaration_fails_without_stdout(tmp_path: Path) -> None:
+    root = tmp_path / "broken"
+    root.mkdir()
 
-    run_help = runner.invoke(cli, ["run", "start", "--help"])
-    experiment_help = runner.invoke(cli, ["experiment", "run", "--help"])
+    result = run_cli("task", "check", str(root))
 
-    assert run_help.exit_code == 0
-    assert experiment_help.exit_code == 0
-    assert "--credentials DIRECTORY" in run_help.output
-    assert "--credentials DIRECTORY" in experiment_help.output
-    assert "RUNLAB_CREDENTIALS" in run_help.output
-    assert "RUNLAB_CREDENTIALS" in experiment_help.output
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "required file is missing" in result.stderr
 
 
-def test_embedded_environment_guidance_is_machine_readable() -> None:
-    runner = CliRunner()
+def test_stdout_stays_one_compact_json_object(tmp_path: Path) -> None:
+    root = tmp_path / "empty-overlay"
+    root.mkdir()
+    (root / "overlay.json").write_text("{}")
 
-    listed = runner.invoke(cli, ["guidance", "list"])
-    shown = runner.invoke(cli, ["guidance", "show", "environment"])
+    result = run_cli("overlay", "check", str(root))
 
-    assert listed.exit_code == 0
-    assert json.loads(listed.output)["guidance"] == [
-        {
-            "name": "environment",
-            "summary": (
-                "Author an Agent runtime Environment and declare its RunLab contracts."
-            ),
-        }
-    ]
-    assert shown.exit_code == 0
-    value = json.loads(shown.output)
-    assert value["name"] == "environment"
-    assert value["content"].startswith("# Authoring a RunLab Environment\n")
+    assert result.stdout.count("\n") == 1
+    assert ", " not in result.stdout
+    assert json.loads(result.stdout)["empty"] is True

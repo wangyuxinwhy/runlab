@@ -1,147 +1,68 @@
 # RunLab
 
-RunLab records reproducible Agent execution facts. Its fixed operation is:
+RunLab records reproducible Agent execution facts through one fixed operation:
 
 ```text
-Environment + Task -> Run
+Base + Overlay + Task -> Run
 ```
 
-An Environment owns one Agentic Runtime and its capabilities. A Task owns the initial instruction, optional writable workspace, and declared read-only references. RunLab does not accept an arbitrary command, judge experiment quality, choose a winner, or replace Agent-authored orchestration.
+A **Base** owns one Agent runtime and its execution contract. An **Overlay** owns capability configuration — skills, installed tools, model selection, network access. A **Task** owns the instruction and the material it operates on. Composing Runs into experiments belongs to the caller, not to RunLab.
 
-## Directory protocol
+## Why the layers exist
 
-An Environment contains the runtime:
+Experiments require controlled variables, and a directory containing a `Dockerfile` is not a constant: base image tags move, package managers resolve to new versions, and a cold build cache produces a different image from the same file. When the environment drifts, every new variant forces re-running all controls, and the cost of an experiment stops being proportional to the new work.
 
-```text
-environment/
-├── Dockerfile
-└── environment.json   # optional
-```
+RunLab separates a **declaration** from its **realization**. A declaration is source; a realization is what was actually built, addressed by digest and frozen in a lock file. Runs reference realizations, and a locked realization that can no longer be retrieved fails the Run instead of being silently rebuilt.
 
-The image entrypoint reads `task.md` from stdin and runs the Agent in `/workspace`. RunLab also mounts `/artifacts` as the only persistent task-output directory. A runtime that writes native audit logs declares their container target:
+Separating Overlay from Base is what makes a difference between two Runs attributable. Capability configuration changes often; putting it in the Base would move the Base digest on every skill edit and make every historical Run appear incomparable.
 
-```json
-{
-  "name": "codex",
-  "output_protocol": "codex-jsonl",
-  "logs": {
-    "target": "/root/.codex/sessions"
-  },
-  "credentials": [
-    {
-      "name": "codex",
-      "kind": "file",
-      "target": "/root/.codex/auth.json"
-    }
-  ]
-}
-```
-
-RunLab mounts that target at `logs/runtime/`. For Codex, the Environment must not use `--ephemeral`, because that disables the native session record. `output_protocol` may be `opaque`, `codex-jsonl`, `claude-stream-json`, or `pi-session-jsonl`.
-
-A Task contains the task-owned inputs:
-
-```text
-task/
-├── task.md
-├── task.json          # optional read-only reference declarations
-└── workspace/         # optional initial writable workspace
-```
-
-`task.md` must tell the Agent which deliverables to write under `/artifacts`. An exit code of zero without an artifact is a `collection_failed` Run. The workspace is copied to temporary storage for execution and deleted after collection; it is never a final artifact.
-
-An Experiment is the full Cartesian product of its packages:
-
-```text
-experiment/
-├── experiment.json
-├── environments/
-│   └── <environment>/
-└── tasks/
-    └── <task>/
-```
-
-RunLab executes every Environment × Task pair with bounded concurrency. Selection, repeats, ordering, adaptive scheduling, and judging stay in Agent scripts composed from `runlab run start`.
-
-## Credential protocol
-
-An Environment declares opaque credential slots. RunLab does not know how to log in to a provider or discover its host configuration:
-
-```json
-{
-  "credentials": [
-    {
-      "name": "runtime",
-      "kind": "file",
-      "target": "/run/credentials/runtime"
-    }
-  ]
-}
-```
-
-The caller materializes a private directory whose entries match the declared names. RunLab uses `$XDG_CONFIG_HOME/runlab/credentials`, or `~/.config/runlab/credentials` when `XDG_CONFIG_HOME` is unset, by default:
-
-```text
-credentials/
-├── codex       # file
-├── pi          # file
-├── claude      # file
-└── lark/       # directory
-```
-
-RunLab does not create or modify this directory. Its mode must be `0700`; requested file entries normally use `0600`, and requested directory entries use `0700`.
-
-Override the directory explicitly or through `RUNLAB_CREDENTIALS`:
-
-```bash
-runlab experiment run ./experiment --credentials /private/credentials
-```
-
-RunLab validates entry kinds and private permissions before accepting a Run, then bind-mounts each entry read-only at its Environment-owned target. A runtime entrypoint may copy a credential into ephemeral writable configuration or read a token file into its own process environment.
-
-RunLab itself never writes credential source paths, contents, or digests into a public record, logs, artifacts, workspaces, or images. The logical name, kind, and container target remain in `run.json` as execution facts. An Environment is trusted with credentials it requests; read-only transport cannot prevent a malicious runtime from printing or exfiltrating a credential.
-
-## Retained Run protocol
-
-Every accepted Run preserves a terminal record, including setup, execution, and collection failures:
-
-```text
-run-.../
-├── run.json
-├── artifacts/
-│   └── ...                    # task deliverables only
-└── logs/
-    ├── task.md
-    ├── stdout.log
-    ├── stderr.log
-    ├── measurements.jsonl     # raw Docker observations
-    └── runtime/               # native session/log files, when declared
-```
-
-`run.json` contains identities, policy, terminal outcome, container facts, aggregated usage and resource measurements, plus content-addressed manifests for Artifacts and Logs. Artifact quality evaluation consumes Task + Artifacts. Process audit consumes Run Record + Logs.
-
-Run `runlab guidance show environment` for the version-matched Environment authoring contract distributed with the CLI.
-
-Credentials and host source paths never enter public records. Declared inputs and credentials are mounted read-only. CLI stdout is one compact JSON object; progress and diagnostics go to stderr.
-
-## CLI
-
-```bash
-uv run runlab environment check examples/smoke/environment
-uv run runlab task check examples/smoke/task
-uv run runlab run start \
-  --environment examples/smoke/environment \
-  --task examples/smoke/task \
-  --output runs/smoke
-uv run runlab experiment run <experiment-directory> --jobs 2
-uv run runlab schema show run-record
-```
-
-## Development
-
-RunLab requires Python 3.14 and Docker:
+## Try it
 
 ```bash
 uv sync
+
+uv run runlab base check   examples/bases/pi
+uv run runlab base build   examples/bases/pi          # writes base.lock
+
+uv run runlab run start \
+  --base    examples/bases/pi \
+  --overlay examples/overlays/skills-v1 \
+  --task    examples/tasks/greet \
+  --output  runs
+```
+
+`examples/` holds a working ablation: the same Base and Task with `skills-v1`, `skills-v2`, or no Overlay produce `HELLO`, `GREETINGS`, and `UNKNOWN`. The three Runs share a Base realization and a Task digest, so the only recorded difference is the Overlay.
+
+The example Base runs [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) against DeepSeek and expects a `deepseek` credential; see the credential protocol in the reference layer.
+
+## What a Run keeps
+
+```text
+run-…/
+├── run.json      identities, realization chain, outcome, usage, manifests
+├── inputs/       byte copies of the Base, Overlay, and Task declarations
+├── artifacts/    task deliverables only
+└── logs/         task.md, stdout, stderr, native runtime session
+```
+
+Declarations are copied in rather than referenced, because a digest proves that two things differ but reconstructs neither. Every accepted Run keeps a terminal record, including setup, execution, and collection failures.
+
+## Documentation
+
+The reference layer ships with the CLI, so guidance always matches the installed version:
+
+```bash
+uv run runlab docs list
+uv run runlab docs get principles
+uv run runlab schema show run-record
+```
+
+Start with `principles` for the guarantees and invariants, `model` for declarations, identity, and locks, `architecture` for package layering, and `cli` for the command tree.
+
+## Development
+
+RunLab requires Python 3.14 and Docker.
+
+```bash
 uv run poe check
 ```

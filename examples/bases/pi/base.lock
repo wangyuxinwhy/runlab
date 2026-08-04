@@ -1,0 +1,7 @@
+{
+  "declaration": "sha256:1232d4670be66addc4b292ad17ada2bd31d3c0d3f5d5d1eb0a05ce75c01802eb",
+  "realizations": {
+    "linux/arm64": "sha256:6aca16658574972fb1702c69af6d51eca868e6941bcfbd9e210218f63258e004"
+  },
+  "schema_version": 1
+}
