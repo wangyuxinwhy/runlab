@@ -138,7 +138,7 @@ An Overlay layer is built on top of a specific Base realization, which is alread
 }
 ```
 
-Entries accumulate and are never rewritten: an entry that disappears takes the reproducible baseline of every Run that used it. Editing a declaration starts a fresh entry set, because the recorded entries describe source that no longer exists at that path.
+Entries accumulate: an entry that disappears takes the reproducible baseline of every Run that used it. Editing a declaration starts a fresh entry set, because the recorded entries describe source that no longer exists at that path. `--rebuild` is the one path that replaces an existing entry, which is why it must be requested explicitly — the rebuilt realization is generally not identical to the one it replaces.
 
 A mount-only Overlay is never built, so it has no lock. Its realization is the content digest of the trees it supplies, which is independent of any Base.
 
