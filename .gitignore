@@ -1,15 +1,4 @@
-.DS_Store
-.complexipy_cache/
-.pytest_cache/
-.ruff_cache/
-.venv/
+/target/
+/target-*/
 __pycache__/
 *.pyc
-build/
-dist/
-runs/
-corpora/
-experiments/
-node_modules/
-docs/.vitepress/cache/
-docs/.vitepress/dist/

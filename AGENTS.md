@@ -1,51 +1,74 @@
 # AGENTS.md
 
-## Language
+## Worktree Purpose
 
-- Respond to maintainers in Chinese unless they request another language.
-- Public documentation, CLI text, protocol fields, and code-internal text are English. Experiment inputs preserve their original language.
-- Write prose one paragraph per line in every language and let editors soft-wrap. Hard wraps belong only inside code blocks; in CJK a wrapped paragraph also renders a spurious space at the break.
-- CJK prose uses fullwidth punctuation. A halfwidth mark between two CJK characters is a typo, not a style choice.
+This worktree is the clean rewrite of RunLab around the new Run Protocol.
 
-## Coding Conventions
+The sibling worktree at `/Users/bytedance/workspace/temp/runlab` contains the legacy `Base + Overlay + Task -> Run` implementation. Treat it only as implementation evidence and a source of reusable low-level mechanics. Do not edit it from this worktree, preserve its user-owned changes, and do not carry its public model forward for compatibility.
 
-- Never add `from __future__ import annotations`; the codebase targets Python 3.14+.
-- Keep the cognitive complexity of every function at 15 or below.
-- Declare pydantic defaults with bare assignment; a `Field()` call must carry more than a default, such as a constraint, a pattern, or an alias.
-- A docstring must add a responsibility, contract, reason, or boundary that the code cannot express. Do not restate a name, signature, type, or implementation.
-- Comments explain why instead of restating what, speak at the abstraction level of the code they annotate, and state their constraint in place. Never anchor meaning in a commit, ticket, or document reference, and never bind a neutral abstraction to one concrete runtime.
-- Place direct operands before keyword-only policy and boolean parameters in public callables, and place equivalent parameters the same way across sibling callables.
-- Do not erase `TYPE_CHECKING` imports with runtime `Any` or `object` fallbacks.
-- Place every module by concept ownership, never by formal properties such as being I/O-free. A domain owns one concept and imports no other domain; `engine` sequences domains without re-implementing them; only `core` carries vocabulary that crosses boundaries.
+Do not create a parallel `runlab2`, `next`, compatibility package, or second public protocol. This worktree must converge on one `runlab` product surface.
 
-## Product Invariants
+## Sources of Truth
 
-- RunLab records execution facts. It does not judge experiment quality, score artifacts, or select a winner.
-- The operation is fixed. RunLab never accepts an arbitrary command from a Task or a caller.
-- Base owns the Agent runtime and its execution contract, Overlay owns capability configuration, Task owns the instruction and its material.
-- An accepted Run preserves a terminal record even when setup, execution, or collection fails.
-- Every derived value in a record must be reconstructible from the evidence retained beside it.
-- A missing realization fails the Run. Never rebuild silently to recover from it.
-- Credentials never enter images, public records, logs, workspaces, or artifacts.
-- CLI stdout is one compact machine-readable JSON object. Progress and diagnostics use stderr.
-- New entities, fields, and commands require evidence from real experiments.
+Use this order of authority:
 
-## Required Reading
+1. Agent Wiki owns settled product, protocol, system-design, and architecture decisions.
+2. Files in this worktree own the current implementation, executable tests, local implementation plan, temporary engineering notes, and work in progress.
+3. The sibling legacy worktree owns only facts about the old implementation.
 
-- [Design Principles](src/runlab/docs/reference/principles.md) states the guarantees, the invariant tiers, and the admission test for anything new.
-- [Model](src/runlab/docs/reference/model.md) is the source of truth for declarations, identity, locks, and the Run record.
-- [Architecture](src/runlab/docs/reference/architecture.md) states package layering and the verification chain.
+Do not copy the full protocol or temporary implementation status into this file. A settled design change belongs in Agent Wiki. An implementation plan, checkpoint, open engineering question, or temporary decision belongs in an ordinary file in this worktree until it becomes stable enough to promote into the design documentation.
 
-## Documentation
+When Agent Wiki and inherited source or documentation disagree, Agent Wiki defines the target design. Current executable behavior must still be reported honestly as implementation state.
 
-- All documentation lives in one tree under [src/runlab/docs](src/runlab/docs), organized as tutorial, how-to, reference, and explanation. The tree serves both the VitePress site and `runlab docs`, so a relative link between two documents resolves identically in either. `docs/` holds only `.vitepress`, which keeps site build output out of the Python package.
-- `runlab docs` serves reference and explanation only. Reference states mechanisms an Agent must not guess at; explanation states the constraints behind them. Tutorials and how-to guides are deliberately withheld: one-time setup and human workflows cost an Agent context without changing what it can do.
-- Reference and explanation are the source of truth for mechanisms and their rationale, derived from the implementation. A change touching `src/` must leave them consistent in the same change, and their relative links stay within those two layers so the shipped pair remains self-contained.
-- A document carries only the main line of its stated topic. Side-path content such as one-time setup or another document's mechanism is linked, not inlined, and a tutorial leads with the action rather than with installation.
-- Prose carries no removable content: a repeated statement, a filler transition, a content-free summary, and over-explanation of the obvious are deleted. Emphasis must carry distinguishing information, and numbering is used only when the number is the content.
-- Verify the site with `pnpm build`; it fails on dead links, which is what keeps cross-layer references honest.
+## Required Design Reading
+
+Read the relevant Agent Wiki pages before design or implementation work:
+
+- Documentation index: `http://localhost:8787/app/pages/runlab-index--nw`
+- Run Protocol: `http://localhost:8787/app/pages/runlab-core-model--gt`
+- OCI Images and Local Catalog: `http://localhost:8787/app/pages/runlab-oci-image-catalog--jl`
+- System design: `http://localhost:8787/app/pages/runlab-system-design--ly`
+- Execution Backend Contract: `http://localhost:8787/app/pages/runlab-execution-backend--sv`
+
+For Agent access, fetch page content from `http://localhost:8787/pages/<page-id>/content`. Read open comments when changing a documented area. Give maintainers the Human UI `/app/pages/...` address rather than an API address.
+
+When prior decisions, corrections, experiments, failures, or provenance matter, use `trace-index` instead of relying on memory. If Agent Wiki is unavailable, do not reconstruct settled design from the inherited legacy documentation alone.
+
+Any documentation inherited under `src/runlab/docs` describes the legacy product and is not target-design authority. Replace or remove it only as corresponding behavior becomes real in the new implementation.
+
+## Local Working State
+
+Keep implementation plans and temporary design notes in this worktree, not Agent Wiki. Prefer a small number of plainly named root-level Markdown files when they become necessary; do not create a documentation hierarchy for transient work.
+
+Before acting, inspect the current worktree, its local plans, and the nearest applicable instructions. Update local plans as implementation facts change. Remove or promote temporary notes when they are no longer useful so they do not become an accidental second specification.
+
+Do not let the inherited language, package layout, models, tests, or architecture select the new implementation by default. Implementation language and physical structure require an explicit decision. Reuse code only when it satisfies the target design without importing legacy vocabulary or compatibility constraints.
+
+## Working Rules
+
+- Respond to maintainers in Chinese unless they request another language. Keep public protocol fields, CLI text, and code-internal names in English.
+- Design Agent-facing CLI behavior only after reading `/Users/bytedance/.agents/guidance/agent-friendly-cli.md`.
+- Read `/Users/bytedance/.agents/guidance/experiment-driven-development.md` before changing an Agent tool or abstraction based on experiments.
+- Prefer ordinary Linux concepts and atomic, discoverable operations over RunLab-specific DSLs.
+- Add public vocabulary or extension points only after a real workflow demonstrates the need.
+- Separate execution facts from judgments in implementation, tests, documentation, and reports.
+- Preserve failures, contaminated comparisons, and unsupported assumptions as first-class findings.
+- Preserve user-owned and unrelated changes. Use non-destructive Git operations and do not add `Co-Authored-By` trailers.
+- Do not commit, merge, publish, or release unless explicitly requested.
+- Do not spawn an independent reviewer or subagent unless the user explicitly asks for one.
+
+## Rust Implementation
+
+- Maintain one Rust 2024 binary crate and one public `runlab` surface. Do not add a Python compatibility package, async runtime, SDK wrapper service, ORM, or speculative generic backend framework.
+- Keep `rust-toolchain.toml` fixed for reproducible development and keep `package.rust-version` as the tested MSRV. `unsafe` is forbidden.
+- Prefer blocking standard-library process, filesystem, and thread primitives. OCI content identity is computed from exact bytes; typed JSON views never replace retained content-addressed bytes.
+- Keep Docker and future runtime mechanics behind narrow subprocess boundaries. Add a generic backend trait only after a second real backend demonstrates the shared capability boundary.
+- Run `cargo fmt --check`, all-target tests, Clippy with warnings denied, the declared MSRV check, packaging, separate-process CLI contract tests, and the opt-in real Docker test before claiming completion.
+- Comments must explain a non-obvious invariant, safety boundary, protocol decision, or justified lint exception. Delete comments that merely restate the adjacent name, type, or control flow. Clap doc comments are user-facing help text and must earn their place as interface documentation.
+- Preserve the dependency direction `cli -> execution -> image/backend/storage -> oci/integrity/core`. Keep `integrity` as the shared exact-byte and private-file leaf; do not use OCI as a generic utility module. Do not let CLI own lifecycle semantics, Backend publish OCI assets, Image terminalize Runs, or Storage interpret process outcomes.
 
 ## Verification
 
-- `uv run poe check` is the single verification entry point: `ruff format`, `ruff check`, `basedpyright`, `pytest`, `tach check`, `complexipy`, in that order, fail-fast.
-- Test the installed CLI as a separate process, not only its internal functions. Verify stdout shape, stderr, exit status, and invalid-input behavior.
+Use verification appropriate to the implementation language and current vertical slice. Before reporting implementation complete, test the installed CLI as a separate process, verify stdout, stderr, exit status, invalid input, and interruption behavior, and run at least one deterministic end-to-end Run through the real Docker backend.
+
+Report implemented behavior, verification evidence, failures, and remaining risk separately. Do not turn current behavior into a test contract merely because the inherited implementation does it.

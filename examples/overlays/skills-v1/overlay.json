@@ -1,4 +1,0 @@
-{
-  "name": "skills-v1",
-  "mounts": [{ "source": "files/skills", "target": "/opt/runlab/skills" }]
-}
