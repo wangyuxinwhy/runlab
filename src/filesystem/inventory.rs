@@ -251,7 +251,7 @@ mod tests {
             .expect("anchor");
         let mut follower = regular(Some(path(b"anchor")));
         let EntryKind::Regular { size, .. } = &mut follower.kind else {
-            unreachable!();
+            unreachable!("the fixture above is a regular file")
         };
         *size = 4;
         inventory

@@ -702,7 +702,9 @@ impl EgressNetworkTools {
                     self.route_snapshot(remaining(deadline, "network cleanup timeout")?)?;
                 !routes.overlaps(plan)?
             }
-            LinkOwnership::Foreign => unreachable!(),
+            LinkOwnership::Foreign => {
+                unreachable!("a foreign interface is rejected before any cleanup runs")
+            }
         };
         if remove_conntrack {
             self.cleanup_conntrack(plan, remaining(deadline, "network cleanup timeout")?)?;

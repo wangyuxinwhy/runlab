@@ -52,6 +52,15 @@ struct CaptureBudget {
     content_bytes: u64,
 }
 
+/// The file types `capture_special` handles, so its match has no arm for a
+/// type `capture_entry` already routed elsewhere.
+#[derive(Debug, Clone, Copy)]
+enum SpecialKind {
+    Fifo,
+    Character,
+    Block,
+}
+
 impl CaptureBudget {
     fn new(limits: CaptureLimits) -> Self {
         Self {
@@ -268,8 +277,12 @@ impl TreeCapture {
             FileType::RegularFile => self.capture_regular(directory, source, state),
             FileType::Directory => self.capture_directory(directory, source, state),
             FileType::Symlink => self.capture_symlink(directory, source, state),
-            kind @ (FileType::Fifo | FileType::CharacterDevice | FileType::BlockDevice) => {
-                self.capture_special(directory, source, kind, state)
+            FileType::Fifo => self.capture_special(directory, source, SpecialKind::Fifo, state),
+            FileType::CharacterDevice => {
+                self.capture_special(directory, source, SpecialKind::Character, state)
+            }
+            FileType::BlockDevice => {
+                self.capture_special(directory, source, SpecialKind::Block, state)
             }
             FileType::Socket | FileType::Unknown => {
                 bail!("unsupported filesystem object at {}", source.path.display())
@@ -403,7 +416,7 @@ impl TreeCapture {
         &self,
         directory: &OwnedFd,
         source: &EntryCapture<'_>,
-        kind: FileType,
+        kind: SpecialKind,
         state: &mut CaptureState,
     ) -> Result<FsEntry> {
         let initial_xattrs = read_path_xattrs(
@@ -422,22 +435,21 @@ impl TreeCapture {
             &source.path.display(),
         )?;
         let kind = match kind {
-            FileType::Fifo => EntryKind::Fifo,
-            FileType::CharacterDevice | FileType::BlockDevice if self.ownership.is_single_id() => {
+            SpecialKind::Fifo => EntryKind::Fifo,
+            SpecialKind::Character | SpecialKind::Block if self.ownership.is_single_id() => {
                 bail!(
                     "rootless native execution does not support device nodes at {}",
                     source.path.display()
                 )
             }
-            FileType::CharacterDevice => EntryKind::Character {
+            SpecialKind::Character => EntryKind::Character {
                 major: major(source.initial.st_rdev),
                 minor: minor(source.initial.st_rdev),
             },
-            FileType::BlockDevice => EntryKind::Block {
+            SpecialKind::Block => EntryKind::Block {
                 major: major(source.initial.st_rdev),
                 minor: minor(source.initial.st_rdev),
             },
-            _ => unreachable!(),
         };
         Ok(FsEntry {
             metadata: metadata(source.initial, initial_xattrs, self.ownership)?,

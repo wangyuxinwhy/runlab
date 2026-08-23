@@ -373,7 +373,11 @@ impl FilesystemView {
                         }
                         current = target.clone();
                     }
-                    NodeKind::Directory => unreachable!(),
+                    NodeKind::Directory => {
+                        unreachable!(
+                            "a directory target is rejected before the chain advances to it"
+                        )
+                    }
                     _ => break node.clone(),
                 }
             };
