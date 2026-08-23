@@ -25,10 +25,6 @@ pub(crate) const TCP_PROBE_COMMAND: &str = "__internal-tcp-probe";
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "subprocess spawn, supervision, bounded I/O, and reap form one ordered lifecycle"
-)]
 pub(crate) fn bounded_output(
     command: &mut Command,
     input: Option<&[u8]>,
@@ -36,57 +32,27 @@ pub(crate) fn bounded_output(
     output_limit: usize,
     operation: &str,
 ) -> Result<Output> {
-    if timeout.is_zero() || output_limit == 0 {
-        bail!("bounded subprocess requires positive timeout and output limit");
-    }
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .context("bounded subprocess timeout is too large")?;
-    command
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to invoke {operation}"))?;
+    let stdin = if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    let (mut child, deadline) = spawn_bounded(
+        command,
+        stdin,
+        Stdio::piped(),
+        timeout,
+        output_limit,
+        operation,
+    )?;
     let stdin = child.stdin.take();
-    let Some(stdout) = child.stdout.take() else {
-        terminate(&mut child, operation)?;
-        bail!("{operation} stdout is unavailable");
-    };
-    let Some(stderr) = child.stderr.take() else {
-        terminate(&mut child, operation)?;
-        bail!("{operation} stderr is unavailable");
-    };
-    if let Some(stdin) = stdin.as_ref()
-        && let Err(error) = set_nonblocking(stdin)
-    {
-        return Err(spawned_child_error(
-            &mut child,
-            anyhow::Error::new(error).context("failed to configure subprocess stdin pipe"),
-        ));
+    if let Some(stdin) = stdin.as_ref() {
+        configure_pipe(stdin, &mut child, "stdin")?;
     }
-    if let Err(error) = set_nonblocking(&stdout) {
-        return Err(spawned_child_error(
-            &mut child,
-            anyhow::Error::new(error).context("failed to configure subprocess stdout pipe"),
-        ));
-    }
-    if let Err(error) = set_nonblocking(&stderr) {
-        return Err(spawned_child_error(
-            &mut child,
-            anyhow::Error::new(error).context("failed to configure subprocess stderr pipe"),
-        ));
-    }
+    let stdout = child.stdout.take();
+    let stdout = take_pipe(stdout, &mut child, operation, "stdout")?;
+    let stderr = child.stderr.take();
+    let stderr = take_pipe(stderr, &mut child, operation, "stderr")?;
     let stop_io = Arc::new(AtomicBool::new(false));
     let stdout_exceeded = Arc::new(AtomicBool::new(false));
     let stderr_exceeded = Arc::new(AtomicBool::new(false));
@@ -109,52 +75,48 @@ pub(crate) fn bounded_output(
     let input = input.map(ToOwned::to_owned);
     let writer_stop = Arc::clone(&stop_io);
     let writer = thread::spawn(move || write_input(stdin, input.as_deref(), &writer_stop));
+    let pumps = Pumps {
+        stop: stop_io,
+        writer: Some(writer),
+        stdout: Some(stdout_reader),
+        stderr: stderr_reader,
+        operation: operation.to_owned(),
+    };
     let mut status = None;
     loop {
         if status.is_none() {
             match child.try_wait() {
                 Ok(observed) => status = observed,
                 Err(error) => {
-                    stop_io.store(true, Ordering::Release);
-                    let _ = terminate(&mut child, operation);
-                    let _ = join_writer(writer, operation);
-                    let _ = join_capture(stdout_reader, operation, "stdout");
-                    let _ = join_capture(stderr_reader, operation, "stderr");
-                    return Err(error).with_context(|| format!("failed to poll {operation}"));
+                    let reason =
+                        anyhow::Error::new(error).context(format!("failed to poll {operation}"));
+                    return Err(pumps.abandon(&mut child, reason));
                 }
             }
         }
-        if status.is_some()
-            && writer.is_finished()
-            && stdout_reader.is_finished()
-            && stderr_reader.is_finished()
-        {
+        if status.is_some() && pumps.are_drained() {
             break;
         }
         if stdout_exceeded.load(Ordering::Acquire) || stderr_exceeded.load(Ordering::Acquire) {
-            stop_io.store(true, Ordering::Release);
-            terminate(&mut child, operation)?;
-            let _ = join_writer(writer, operation);
-            let _ = join_capture(stdout_reader, operation, "stdout");
-            let _ = join_capture(stderr_reader, operation, "stderr");
-            bail!("{operation} output exceeds the {output_limit}-byte per-stream limit");
+            return Err(pumps.abandon(
+                &mut child,
+                anyhow::anyhow!(
+                    "{operation} output exceeds the {output_limit}-byte per-stream limit"
+                ),
+            ));
         }
         if Instant::now() >= deadline {
-            stop_io.store(true, Ordering::Release);
-            terminate(&mut child, operation)?;
-            let _ = join_writer(writer, operation);
-            let _ = join_capture(stdout_reader, operation, "stdout");
-            let _ = join_capture(stderr_reader, operation, "stderr");
-            bail!(
-                "{operation} exceeded its {} second deadline",
-                timeout.as_secs()
-            );
+            return Err(pumps.abandon(
+                &mut child,
+                anyhow::anyhow!(
+                    "{operation} exceeded its {} second deadline",
+                    timeout.as_secs()
+                ),
+            ));
         }
         thread::sleep(POLL_INTERVAL);
     }
-    join_writer(writer, operation)?;
-    let stdout = join_capture(stdout_reader, operation, "stdout")?;
-    let stderr = join_capture(stderr_reader, operation, "stderr")?;
+    let (stdout, stderr) = pumps.join()?;
     if stdout_exceeded.load(Ordering::Acquire) || stderr_exceeded.load(Ordering::Acquire) {
         bail!("{operation} output exceeds the {output_limit}-byte per-stream limit");
     }
@@ -172,34 +134,16 @@ pub(crate) fn bounded_status_with_stdout(
     stderr_limit: usize,
     operation: &str,
 ) -> Result<Output> {
-    if timeout.is_zero() || stderr_limit == 0 {
-        bail!("bounded subprocess requires positive timeout and stderr limit");
-    }
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .context("bounded subprocess timeout is too large")?;
-    command
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to invoke {operation}"))?;
-    let Some(stderr) = child.stderr.take() else {
-        terminate(&mut child, operation)?;
-        bail!("{operation} stderr is unavailable");
-    };
-    if let Err(error) = set_nonblocking(&stderr) {
-        return Err(spawned_child_error(
-            &mut child,
-            anyhow::Error::new(error).context("failed to configure subprocess stderr pipe"),
-        ));
-    }
+    let (mut child, deadline) = spawn_bounded(
+        command,
+        Stdio::null(),
+        stdout,
+        timeout,
+        stderr_limit,
+        operation,
+    )?;
+    let stderr = child.stderr.take();
+    let stderr = take_pipe(stderr, &mut child, operation, "stderr")?;
     let stop_io = Arc::new(AtomicBool::new(false));
     let stderr_exceeded = Arc::new(AtomicBool::new(false));
     let stderr_reader = capture(
@@ -210,40 +154,46 @@ pub(crate) fn bounded_status_with_stdout(
         operation,
         "stderr",
     );
+    let pumps = Pumps {
+        stop: stop_io,
+        writer: None,
+        stdout: None,
+        stderr: stderr_reader,
+        operation: operation.to_owned(),
+    };
     let mut status = None;
     loop {
         if status.is_none() {
             match child.try_wait() {
                 Ok(observed) => status = observed,
                 Err(error) => {
-                    stop_io.store(true, Ordering::Release);
-                    let _ = terminate(&mut child, operation);
-                    let _ = join_capture(stderr_reader, operation, "stderr");
-                    return Err(error).with_context(|| format!("failed to poll {operation}"));
+                    let reason =
+                        anyhow::Error::new(error).context(format!("failed to poll {operation}"));
+                    return Err(pumps.abandon(&mut child, reason));
                 }
             }
         }
-        if status.is_some() && stderr_reader.is_finished() {
+        if status.is_some() && pumps.are_drained() {
             break;
         }
         if stderr_exceeded.load(Ordering::Acquire) {
-            stop_io.store(true, Ordering::Release);
-            terminate(&mut child, operation)?;
-            let _ = join_capture(stderr_reader, operation, "stderr");
-            bail!("{operation} stderr exceeds the {stderr_limit}-byte limit");
+            return Err(pumps.abandon(
+                &mut child,
+                anyhow::anyhow!("{operation} stderr exceeds the {stderr_limit}-byte limit"),
+            ));
         }
         if Instant::now() >= deadline {
-            stop_io.store(true, Ordering::Release);
-            terminate(&mut child, operation)?;
-            let _ = join_capture(stderr_reader, operation, "stderr");
-            bail!(
-                "{operation} exceeded its {} second deadline",
-                timeout.as_secs()
-            );
+            return Err(pumps.abandon(
+                &mut child,
+                anyhow::anyhow!(
+                    "{operation} exceeded its {} second deadline",
+                    timeout.as_secs()
+                ),
+            ));
         }
         thread::sleep(POLL_INTERVAL);
     }
-    let stderr = join_capture(stderr_reader, operation, "stderr")?;
+    let (_, stderr) = pumps.join()?;
     if stderr_exceeded.load(Ordering::Acquire) {
         bail!("{operation} stderr exceeds the {stderr_limit}-byte limit");
     }
@@ -252,6 +202,112 @@ pub(crate) fn bounded_status_with_stdout(
         stdout: Vec::new(),
         stderr,
     })
+}
+
+/// Start `command` in its own process group, with its deadline.
+///
+/// The group is what lets termination reach a helper's own children instead of
+/// only the process this crate spawned.
+fn spawn_bounded(
+    command: &mut Command,
+    stdin: Stdio,
+    stdout: Stdio,
+    timeout: Duration,
+    limit: usize,
+    operation: &str,
+) -> Result<(std::process::Child, Instant)> {
+    if timeout.is_zero() || limit == 0 {
+        bail!("bounded subprocess requires positive timeout and output limit");
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("bounded subprocess timeout is too large")?;
+    command.stdin(stdin).stdout(stdout).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let child = command
+        .spawn()
+        .with_context(|| format!("failed to invoke {operation}"))?;
+    Ok((child, deadline))
+}
+
+/// Take one of the child's pipes, in non-blocking mode.
+///
+/// The capture threads poll instead of blocking in `read`, so a child that
+/// outlives its deadline cannot wedge them after it has been killed.
+fn take_pipe<T: std::os::fd::AsFd>(
+    pipe: Option<T>,
+    child: &mut std::process::Child,
+    operation: &str,
+    stream: &str,
+) -> Result<T> {
+    let Some(pipe) = pipe else {
+        terminate(child, operation)?;
+        bail!("{operation} {stream} is unavailable");
+    };
+    configure_pipe(&pipe, child, stream)?;
+    Ok(pipe)
+}
+
+fn configure_pipe(
+    pipe: impl std::os::fd::AsFd,
+    child: &mut std::process::Child,
+    stream: &str,
+) -> Result<()> {
+    if let Err(error) = set_nonblocking(pipe) {
+        return Err(spawned_child_error(
+            child,
+            anyhow::Error::new(error)
+                .context(format!("failed to configure subprocess {stream} pipe")),
+        ));
+    }
+    Ok(())
+}
+
+/// The threads pumping a child's pipes, and the flag that stops them.
+///
+/// Keeping them together is what lets every failure path tear down the same
+/// way: stop the pumps, stop the child, drain the threads, and report the
+/// reason the caller already has. A teardown problem must not be reported in
+/// place of the deadline or limit that caused it.
+struct Pumps {
+    stop: Arc<AtomicBool>,
+    writer: Option<JoinHandle<Result<()>>>,
+    stdout: Option<JoinHandle<Result<Vec<u8>>>>,
+    stderr: JoinHandle<Result<Vec<u8>>>,
+    operation: String,
+}
+
+impl Pumps {
+    fn are_drained(&self) -> bool {
+        self.writer.as_ref().is_none_or(JoinHandle::is_finished)
+            && self.stdout.as_ref().is_none_or(JoinHandle::is_finished)
+            && self.stderr.is_finished()
+    }
+
+    fn abandon(self, child: &mut std::process::Child, reason: anyhow::Error) -> anyhow::Error {
+        self.stop.store(true, Ordering::Release);
+        let operation = self.operation.clone();
+        let _ = terminate(child, &operation);
+        let _ = self.join();
+        reason
+    }
+
+    fn join(self) -> Result<(Vec<u8>, Vec<u8>)> {
+        if let Some(writer) = self.writer {
+            join_writer(writer, &self.operation)?;
+        }
+        let stdout = self
+            .stdout
+            .map(|handle| join_capture(handle, &self.operation, "stdout"))
+            .transpose()?
+            .unwrap_or_default();
+        let stderr = join_capture(self.stderr, &self.operation, "stderr")?;
+        Ok((stdout, stderr))
+    }
 }
 
 fn capture(
