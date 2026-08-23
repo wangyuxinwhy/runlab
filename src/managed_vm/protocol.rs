@@ -1,3 +1,25 @@
+/// The hidden subcommands the host uses to drive a guest `runlab`.
+///
+/// Host and guest are the same binary, so these names are the wire format of
+/// the VM control protocol. They are declared once here: the clap definitions
+/// in `cli` and the argv the host builds in `host` both read them, so renaming
+/// one cannot leave the two sides disagreeing at run time.
+pub(crate) mod command {
+    pub(crate) const HANDSHAKE: &str = "__internal-vm-handshake";
+    pub(crate) const PREPARE: &str = "__internal-vm-prepare";
+    pub(crate) const SEAL_INPUTS: &str = "__internal-vm-seal-inputs";
+    pub(crate) const START: &str = "__internal-vm-start";
+    pub(crate) const STATUS: &str = "__internal-vm-status";
+    pub(crate) const CANCEL: &str = "__internal-vm-cancel";
+    pub(crate) const DISCARD: &str = "__internal-vm-discard";
+    pub(crate) const FILE_INFO: &str = "__internal-vm-file-info";
+    pub(crate) const READ_FILE: &str = "__internal-vm-read-file";
+    pub(crate) const READ_STREAM: &str = "__internal-vm-read-stream";
+    pub(crate) const STREAM_INFO: &str = "__internal-vm-stream-info";
+    pub(crate) const REMOVE: &str = "__internal-vm-remove";
+    pub(crate) const ABANDON: &str = "__internal-vm-abandon";
+}
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File};

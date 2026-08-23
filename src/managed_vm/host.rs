@@ -18,9 +18,10 @@ use crate::signal::TerminationFlag;
 use crate::subprocess::{bounded_output, bounded_status_with_stdout};
 
 use super::protocol::{
-    ensure_status, file_identity, guest_binary_path, normalize_architecture, operation_file,
-    parse_runc_identity, pinned_lima_template, selected_instance_image, validate_forwarded_argv,
-    validate_handshake, validate_name, validate_reference_profile, validate_runc_identity,
+    command, ensure_status, file_identity, guest_binary_path, normalize_architecture,
+    operation_file, parse_runc_identity, pinned_lima_template, selected_instance_image,
+    validate_forwarded_argv, validate_handshake, validate_name, validate_reference_profile,
+    validate_runc_identity,
 };
 use super::staging::validate_runtime_config_inputs;
 use super::{
@@ -270,7 +271,7 @@ impl HostVm {
         let binary = guest_binary_path();
         let mut prepare = vec![
             binary.clone(),
-            "__internal-vm-prepare".to_owned(),
+            command::PREPARE.to_owned(),
             "--operation-id".to_owned(),
             operation_id.to_string(),
             "--namespace".to_owned(),
@@ -293,7 +294,7 @@ impl HostVm {
         }
         self.guest_status([
             binary.as_str(),
-            "__internal-vm-start",
+            command::START,
             "--operation-id",
             &operation_id.to_string(),
         ])
@@ -326,7 +327,7 @@ impl HostVm {
         let binary = guest_binary_path();
         self.guest_json([
             binary.as_str(),
-            "__internal-vm-status",
+            command::STATUS,
             "--operation-id",
             &operation_id.to_string(),
         ])
@@ -337,7 +338,7 @@ impl HostVm {
         let binary = guest_binary_path();
         self.guest_json([
             binary.as_str(),
-            "__internal-vm-cancel",
+            command::CANCEL,
             "--operation-id",
             &operation_id.to_string(),
         ])
@@ -348,7 +349,7 @@ impl HostVm {
         let binary = guest_binary_path();
         self.guest_json([
             binary.as_str(),
-            "__internal-vm-discard",
+            command::DISCARD,
             "--operation-id",
             &operation_id.to_string(),
         ])
@@ -488,7 +489,7 @@ impl HostVm {
     }
 
     fn handshake_at(&self, binary: &str) -> Result<VmHandshake> {
-        let handshake: VmHandshake = self.guest_json([binary, "__internal-vm-handshake"])?;
+        let handshake: VmHandshake = self.guest_json([binary, command::HANDSHAKE])?;
         validate_handshake(&handshake)?;
         Ok(handshake)
     }
@@ -770,7 +771,7 @@ impl HostVm {
                 "shell",
                 &self.instance,
                 &binary,
-                "__internal-vm-read-file",
+                command::READ_FILE,
                 "--operation-id",
                 &operation_id.to_string(),
                 "--kind",
@@ -819,7 +820,7 @@ impl HostVm {
         let binary = guest_binary_path();
         let identity: FileIdentity = self.guest_json([
             binary.as_str(),
-            "__internal-vm-stream-info",
+            command::STREAM_INFO,
             "--operation-id",
             &operation_id.to_string(),
             "--stream",
@@ -831,7 +832,7 @@ impl HostVm {
         );
         let output = self.guest_output([
             binary.as_str(),
-            "__internal-vm-read-stream",
+            command::READ_STREAM,
             "--operation-id",
             &operation_id.to_string(),
             "--stream",
@@ -860,7 +861,7 @@ impl HostVm {
         let binary = guest_binary_path();
         self.guest_json([
             binary.as_str(),
-            "__internal-vm-file-info",
+            command::FILE_INFO,
             "--operation-id",
             &operation_id.to_string(),
             "--kind",
@@ -894,7 +895,7 @@ impl HostVm {
         let binary = guest_binary_path();
         self.guest_status([
             binary.as_str(),
-            "__internal-vm-remove",
+            command::REMOVE,
             "--operation-id",
             &operation_id.to_string(),
         ])
@@ -904,7 +905,7 @@ impl HostVm {
         let binary = guest_binary_path();
         self.guest_status([
             binary.as_str(),
-            "__internal-vm-abandon",
+            command::ABANDON,
             "--operation-id",
             &operation_id.to_string(),
         ])

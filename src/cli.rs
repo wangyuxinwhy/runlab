@@ -27,6 +27,7 @@ use crate::render::FilesystemChange;
 use crate::runtime::RuntimeConfig;
 use crate::state::StateOperation;
 use crate::storage::{RunBytesField, RunDatabase};
+use crate::subprocess::{NETWORK_HOLDER_COMMAND, TCP_PROBE_COMMAND};
 use crate::topology::ManagedServiceFile;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 3600;
@@ -37,6 +38,7 @@ mod image;
 mod inputs;
 mod run;
 mod schema;
+mod vm;
 
 use image::{run_docker, run_image};
 use inputs::{check_runtime_config, run_managed_service, run_runtime_config};
@@ -60,103 +62,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(name = "__internal-network-holder", hide = true)]
+    #[command(flatten)]
+    InternalVm(vm::GuestCommand),
+    #[command(name = NETWORK_HOLDER_COMMAND, hide = true)]
     InternalNetworkHolder {
         #[arg(long)]
         directory: PathBuf,
         #[arg(long)]
         run_id: String,
     },
-    #[command(name = "__internal-tcp-probe", hide = true)]
+    #[command(name = TCP_PROBE_COMMAND, hide = true)]
     InternalTcpProbe {
         #[arg(long)]
         port: u16,
         #[arg(long)]
         timeout_milliseconds: u64,
-    },
-    #[command(name = "__internal-vm-handshake", hide = true)]
-    InternalVmHandshake,
-    #[command(name = "__internal-vm-prepare", hide = true)]
-    InternalVmPrepare {
-        #[arg(long)]
-        operation_id: Uuid,
-        #[arg(long)]
-        namespace: String,
-        #[arg(long)]
-        input_identities: String,
-        #[arg(long)]
-        runtime_config_inputs: String,
-        #[arg(long)]
-        output_count: usize,
-        #[arg(last = true)]
-        argv: Vec<String>,
-    },
-    #[command(name = "__internal-vm-seal-inputs", hide = true)]
-    InternalVmSealInputs {
-        #[arg(long)]
-        operation_id: Uuid,
-    },
-    #[command(name = "__internal-vm-start", hide = true)]
-    InternalVmStart {
-        #[arg(long)]
-        operation_id: Uuid,
-    },
-    #[command(name = "__internal-vm-status", hide = true)]
-    InternalVmStatus {
-        #[arg(long)]
-        operation_id: Uuid,
-    },
-    #[command(name = "__internal-vm-cancel", hide = true)]
-    InternalVmCancel {
-        #[arg(long)]
-        operation_id: Uuid,
-    },
-    #[command(name = "__internal-vm-discard", hide = true)]
-    InternalVmDiscard {
-        #[arg(long)]
-        operation_id: Uuid,
-    },
-    #[command(name = "__internal-vm-file-info", hide = true)]
-    InternalVmFileInfo {
-        #[arg(long)]
-        operation_id: Uuid,
-        #[arg(long)]
-        kind: String,
-        #[arg(long)]
-        index: usize,
-    },
-    #[command(name = "__internal-vm-read-file", hide = true)]
-    InternalVmReadFile {
-        #[arg(long)]
-        operation_id: Uuid,
-        #[arg(long)]
-        kind: String,
-        #[arg(long)]
-        index: usize,
-    },
-    #[command(name = "__internal-vm-read-stream", hide = true)]
-    InternalVmReadStream {
-        #[arg(long)]
-        operation_id: Uuid,
-        #[arg(long)]
-        stream: String,
-    },
-    #[command(name = "__internal-vm-stream-info", hide = true)]
-    InternalVmStreamInfo {
-        #[arg(long)]
-        operation_id: Uuid,
-        #[arg(long)]
-        stream: String,
-    },
-    #[command(name = "__internal-vm-remove", hide = true)]
-    InternalVmRemove {
-        #[arg(long)]
-        operation_id: Uuid,
-    },
-    #[command(name = "__internal-vm-abandon", hide = true)]
-    InternalVmAbandon {
-        #[arg(long)]
-        operation_id: Uuid,
     },
     /// Run Linux `RunLab` in a managed Lima VM without mounting host state.
     Vm {
@@ -1118,79 +1038,7 @@ pub fn run() -> Result<u8> {
             port,
             timeout_milliseconds,
         } => run_internal_tcp_probe(port, timeout_milliseconds),
-        Command::InternalVmHandshake => emit(&crate::managed_vm::guest_handshake()).map(|()| 0),
-        Command::InternalVmPrepare {
-            operation_id,
-            namespace,
-            input_identities,
-            runtime_config_inputs,
-            output_count,
-            argv,
-        } => run_internal_vm_prepare(
-            operation_id,
-            &namespace,
-            &input_identities,
-            &runtime_config_inputs,
-            output_count,
-            argv,
-        ),
-        Command::InternalVmSealInputs { operation_id } => {
-            crate::managed_vm::guest_seal_inputs(operation_id).map(|()| 0)
-        }
-        Command::InternalVmStart { operation_id } => {
-            crate::managed_vm::guest_start(operation_id).map(|()| 0)
-        }
-        Command::InternalVmStatus { operation_id } => {
-            emit(&crate::managed_vm::guest_status(operation_id)?)?;
-            Ok(0)
-        }
-        Command::InternalVmCancel { operation_id } => {
-            emit(&crate::managed_vm::guest_cancel(operation_id)?)?;
-            Ok(0)
-        }
-        Command::InternalVmDiscard { operation_id } => {
-            emit(&crate::managed_vm::guest_discard(operation_id)?)?;
-            Ok(0)
-        }
-        Command::InternalVmFileInfo {
-            operation_id,
-            kind,
-            index,
-        } => {
-            emit(&crate::managed_vm::guest_file_info(
-                operation_id,
-                &kind,
-                index,
-            )?)?;
-            Ok(0)
-        }
-        Command::InternalVmReadFile {
-            operation_id,
-            kind,
-            index,
-        } => {
-            crate::managed_vm::guest_read_file(operation_id, &kind, index)?;
-            Ok(0)
-        }
-        Command::InternalVmReadStream {
-            operation_id,
-            stream,
-        } => {
-            crate::managed_vm::guest_read_stream(operation_id, &stream)?;
-            Ok(0)
-        }
-        Command::InternalVmStreamInfo {
-            operation_id,
-            stream,
-        } => run_internal_vm_stream_info(operation_id, &stream),
-        Command::InternalVmRemove { operation_id } => {
-            crate::managed_vm::guest_remove(operation_id)?;
-            Ok(0)
-        }
-        Command::InternalVmAbandon { operation_id } => {
-            crate::managed_vm::guest_abandon(operation_id)?;
-            Ok(0)
-        }
+        Command::InternalVm(command) => vm::run_guest(command),
         Command::Vm { command } => run_vm(cli.state.as_ref(), command),
         Command::Image { command } => run_image(&resolve_state(cli.state)?, command),
         Command::Docker { command } => run_docker_with_state(cli.state, command),
@@ -1207,31 +1055,6 @@ pub fn run() -> Result<u8> {
         Command::State { command } => run_state(&resolve_state(cli.state)?, command),
         Command::Schema { command } => run_schema(command),
     }
-}
-
-fn run_internal_vm_prepare(
-    operation_id: Uuid,
-    namespace: &str,
-    input_identities: &str,
-    runtime_config_inputs: &str,
-    output_count: usize,
-    argv: Vec<String>,
-) -> Result<u8> {
-    crate::managed_vm::guest_prepare(
-        operation_id,
-        namespace,
-        serde_json::from_str(input_identities).context("invalid VM input identities")?,
-        serde_json::from_str(runtime_config_inputs)
-            .context("invalid VM Runtime Config input slots")?,
-        output_count,
-        argv,
-    )?;
-    Ok(0)
-}
-
-fn run_internal_vm_stream_info(operation_id: Uuid, stream: &str) -> Result<u8> {
-    emit(&crate::managed_vm::guest_stream_info(operation_id, stream)?)?;
-    Ok(0)
 }
 
 fn run_vm(state: Option<&PathBuf>, command: VmCommand) -> Result<u8> {

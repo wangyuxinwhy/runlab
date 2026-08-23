@@ -1,3 +1,11 @@
+//! Running child processes under a bound, and the names under which this
+//! binary re-invokes itself.
+//!
+//! A few operations need a separate process rather than a thread: holding a
+//! network namespace open, or probing a port from inside one. Those hidden
+//! subcommands are named here so the `clap` declaration and the code that
+//! spawns them cannot drift apart — they compile against the same constant.
+
 use std::io::{ErrorKind, Read, Write};
 use std::process::{ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
@@ -6,6 +14,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
+/// Keeps a Run network namespace alive for the lifetime of the Run.
+pub(crate) const NETWORK_HOLDER_COMMAND: &str = "__internal-network-holder";
+
+/// Probes a Managed Service readiness port from inside the Run network
+/// namespace.
+pub(crate) const TCP_PROBE_COMMAND: &str = "__internal-tcp-probe";
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);

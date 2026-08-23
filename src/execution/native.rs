@@ -451,7 +451,7 @@ fn wait_for_managed_readiness(
         let remaining = deadline.saturating_duration_since(now);
         let probe_timeout = remaining.min(Duration::from_millis(250));
         let arguments = [
-            "__internal-tcp-probe".to_owned(),
+            crate::subprocess::TCP_PROBE_COMMAND.to_owned(),
             "--port".to_owned(),
             condition.port.to_string(),
             "--timeout-milliseconds".to_owned(),

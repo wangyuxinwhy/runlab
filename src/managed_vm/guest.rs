@@ -9,8 +9,8 @@ use uuid::Uuid;
 use crate::subprocess::bounded_output;
 
 use super::protocol::{
-    ensure_guest_linux, ensure_regular_file, ensure_status, guest_binary_path, guest_state_path,
-    load_guest_operation, normalize_architecture, operation_file, operation_path,
+    command, ensure_guest_linux, ensure_regular_file, ensure_status, guest_binary_path,
+    guest_state_path, load_guest_operation, normalize_architecture, operation_file, operation_path,
     parse_systemd_status, privileged_file_identity, privileged_file_to_stdout, rewrite_file_tokens,
     set_private_permissions, unit_name, validate_file_slot, validate_forwarded_argv, validate_name,
     write_new_json,
@@ -78,7 +78,7 @@ pub fn guest_start(operation_id: Uuid) -> Result<()> {
         let output = guest_control_output(
             Command::new("/usr/bin/sudo").args([
                 binary.as_str(),
-                "__internal-vm-seal-inputs",
+                command::SEAL_INPUTS,
                 "--operation-id",
                 operation_id_text.as_str(),
             ]),

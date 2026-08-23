@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use crate::core::RunId;
 
+use crate::subprocess::NETWORK_HOLDER_COMMAND;
+
 use super::{
     EgressNetworkTools, HostNetworkLock, NETWORK_HOLDER_DIRECTORY, NativeNetworkIdentity,
     NativeNetworkTools, NetworkHolderHandle, NetworkHolderIdentity, POLL_INTERVAL, RunNetworkMode,
@@ -537,7 +539,7 @@ fn start_network_holder(
         Some(handle) => {
             command
                 .arg(&tools.holder_executable)
-                .arg("__internal-network-holder")
+                .arg(NETWORK_HOLDER_COMMAND)
                 .arg("--directory")
                 .arg(&handle.directory)
                 .arg("--run-id")

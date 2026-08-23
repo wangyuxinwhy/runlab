@@ -20,6 +20,7 @@ pub use guest::{
     guest_stream_info,
 };
 pub use host::HostVm;
+pub(crate) use protocol::command;
 
 use std::time::Duration;
 
@@ -279,7 +280,7 @@ mod tests {
         ];
         assert!(validate_forwarded_argv(&valid, 1, 0).is_ok());
         assert!(validate_forwarded_argv(&valid, 2, 0).is_ok());
-        assert!(validate_forwarded_argv(&["__internal-vm-handshake".to_owned()], 0, 0).is_err());
+        assert!(validate_forwarded_argv(&[command::HANDSHAKE.to_owned()], 0, 0).is_err());
         assert!(
             validate_forwarded_argv(
                 &[
