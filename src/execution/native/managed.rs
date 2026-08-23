@@ -15,7 +15,6 @@ use super::{
 };
 
 impl Runner<'_> {
-    #[cfg(target_os = "linux")]
     pub fn run_with_managed_service(
         &self,
         input: ManagedPrimaryInput<'_>,
@@ -124,7 +123,6 @@ impl Runner<'_> {
         )
     }
 
-    #[cfg(target_os = "linux")]
     fn prepare_managed_run(
         &self,
         backend: &NativeBackend,
@@ -166,7 +164,6 @@ impl Runner<'_> {
         })
     }
 
-    #[cfg(target_os = "linux")]
     fn accept_managed_run(
         &self,
         run_id: RunId,
@@ -209,7 +206,6 @@ impl Runner<'_> {
         })
     }
 
-    #[cfg(target_os = "linux")]
     fn execute_managed_native(
         &self,
         runc: &RuncRunner,
@@ -288,7 +284,6 @@ impl Runner<'_> {
         );
     }
 
-    #[cfg(target_os = "linux")]
     fn prepare_managed_environments<'runc>(
         &self,
         runc: &'runc RuncRunner,
@@ -361,7 +356,6 @@ impl Runner<'_> {
         })
     }
 
-    #[cfg(target_os = "linux")]
     fn complete_managed_executions(
         &self,
         executions: ManagedExecutions<'_, '_>,
@@ -419,7 +413,6 @@ impl Runner<'_> {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[allow(
         clippy::too_many_lines,
         reason = "managed terminalization is one ordered capture, cleanup, and database transaction"
