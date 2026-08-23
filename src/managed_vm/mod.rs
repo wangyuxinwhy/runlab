@@ -14,10 +14,10 @@ use protocol::{
     ensure_guest_linux, ensure_regular_file, ensure_status, file_identity, guest_binary_path,
     guest_state_path, load_guest_operation, normalize_architecture, operation_file, operation_path,
     parse_runc_identity, parse_slot, parse_systemd_status, pinned_lima_template,
-    privileged_file_identity, privileged_file_to_stdout, register_interrupts, rewrite_file_tokens,
-    selected_instance_image, set_private_permissions, unit_name, unregister_interrupts,
-    validate_file_slot, validate_forwarded_argv, validate_handshake, validate_name,
-    validate_reference_profile, validate_runc_identity, write_new_json,
+    privileged_file_identity, privileged_file_to_stdout, rewrite_file_tokens,
+    selected_instance_image, set_private_permissions, unit_name, validate_file_slot,
+    validate_forwarded_argv, validate_handshake, validate_name, validate_reference_profile,
+    validate_runc_identity, write_new_json,
 };
 use staging::{
     derived_input_path, seal_runtime_config_inputs, sealed_operation_path,
@@ -31,8 +31,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
@@ -45,6 +44,8 @@ use uuid::Uuid;
 
 use crate::core::Digest;
 use crate::integrity::finish_sha256;
+use crate::signal::TerminationFlag;
+use crate::subprocess::{bounded_output, bounded_status_with_stdout};
 
 const PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_INSTANCE: &str = "runlab";
@@ -54,6 +55,9 @@ const GUEST_STATE_ROOT: &str = "/var/lib/runlab/namespaces";
 const GUEST_SEALED_INPUT_ROOT: &str = "/var/lib/runlab/vm-inputs";
 const MAX_CONTROL_OUTPUT: usize = 1024 * 1024;
 const MAX_GUEST_STREAM: usize = 64 * 1024 * 1024;
+const VM_CONTROL_TIMEOUT: Duration = Duration::from_mins(2);
+const VM_MUTATION_TIMEOUT: Duration = Duration::from_mins(15);
+const VM_TRANSFER_TIMEOUT: Duration = Duration::from_hours(1);
 const MAX_FILE_SLOTS: usize = 32;
 const MAX_FORWARDED_ARGUMENTS: usize = 256;
 const MAX_FORWARDED_ARGUMENT_BYTES: usize = 64 * 1024;

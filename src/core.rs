@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -350,6 +350,47 @@ impl ProcessFacts {
             backend_error: None,
         }
     }
+
+    pub fn validate(&self) -> Result<()> {
+        match self.terminal_outcome {
+            ProcessOutcome::NotStarted => {
+                if self.exit_code.is_some()
+                    || self.started_at.is_some()
+                    || self.oom_killed.is_some()
+                {
+                    bail!("not_started Process facts contain process execution evidence");
+                }
+            }
+            ProcessOutcome::ProcessExited => {
+                if self.exit_code.is_none() {
+                    bail!("process_exited Process facts require an exit code");
+                }
+                self.validate_execution_times()?;
+            }
+            ProcessOutcome::TimedOut | ProcessOutcome::CaptureLimitExceeded => {
+                self.validate_execution_times()?;
+            }
+            ProcessOutcome::Cancelled => match (self.started_at, self.ended_at) {
+                (Some(_), Some(_)) => self.validate_execution_times()?,
+                (None, Some(_)) if self.exit_code.is_none() && self.oom_killed.is_none() => {}
+                _ => bail!("cancelled Process facts contain incomplete execution evidence"),
+            },
+        }
+        Ok(())
+    }
+
+    fn validate_execution_times(&self) -> Result<()> {
+        let started_at = self
+            .started_at
+            .context("started Process facts require started_at")?;
+        let ended_at = self
+            .ended_at
+            .context("started Process facts require ended_at")?;
+        if ended_at < started_at {
+            bail!("Process ended_at precedes started_at");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -370,6 +411,16 @@ impl ProcessSlot {
         match self {
             Self::Available { facts } => Some(facts),
             Self::Unavailable { .. } => None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Available { facts } => facts.validate(),
+            Self::Unavailable { error } if error.is_empty() => {
+                bail!("unavailable Process slot requires an error")
+            }
+            Self::Unavailable { .. } => Ok(()),
         }
     }
 }
@@ -528,6 +579,8 @@ pub enum BackendDetails {
         runtime_version: String,
         runtime_commit: String,
         runtime_spec: String,
+        runtime_digest: Digest,
+        runtime_size: u64,
         kernel_release: String,
         runtime_invocation: NativeRuntimeInvocation,
         runtime_config: NativeRuntimeConfigRealization,
@@ -681,6 +734,7 @@ impl ManagedServiceFacts {
         }
         self.readiness_condition.validate()?;
         self.readiness.validate()?;
+        self.process.validate()?;
         if self
             .operation_errors
             .iter()
@@ -693,7 +747,7 @@ impl ManagedServiceFacts {
 }
 
 pub(crate) const ACCEPTED_RUN_RECORD_SCHEMA_VERSION: u32 = 3;
-pub(crate) const TERMINAL_RUN_RECORD_SCHEMA_VERSION: u32 = 6;
+pub(crate) const TERMINAL_RUN_RECORD_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AcceptedRunRecord {
@@ -795,6 +849,41 @@ mod tests {
         }
         .validate()
         .expect("probe setup may fail before the first attempt");
+    }
+
+    #[test]
+    fn process_facts_reject_contradictory_execution_evidence() {
+        let observed_at = Utc::now();
+        ProcessFacts {
+            terminal_outcome: ProcessOutcome::ProcessExited,
+            exit_code: Some(0),
+            started_at: Some(observed_at),
+            ended_at: Some(observed_at),
+            oom_killed: Some(false),
+            backend_error: None,
+        }
+        .validate()
+        .expect("complete process facts");
+
+        let missing_exit = ProcessFacts {
+            terminal_outcome: ProcessOutcome::ProcessExited,
+            exit_code: None,
+            started_at: Some(observed_at),
+            ended_at: Some(observed_at),
+            oom_killed: None,
+            backend_error: Some("observation failed".to_owned()),
+        };
+        assert!(missing_exit.validate().is_err());
+
+        let false_start = ProcessFacts {
+            terminal_outcome: ProcessOutcome::NotStarted,
+            exit_code: None,
+            started_at: Some(observed_at),
+            ended_at: Some(observed_at),
+            oom_killed: None,
+            backend_error: None,
+        };
+        assert!(false_start.validate().is_err());
     }
 
     #[test]

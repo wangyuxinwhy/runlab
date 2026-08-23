@@ -1,10 +1,9 @@
 use std::fs::File;
 use std::path::Path;
 
-use crate::integrity::{ensure_private_directory, open_regular_lock};
+use crate::integrity::ensure_private_directory;
 use anyhow::{Context, Result, bail};
-
-const LOCK_FILE: &str = ".mutation.lock";
+use rustix::fs::{Mode, OFlags, open};
 
 pub(crate) struct StateOperation {
     _lock: File,
@@ -16,13 +15,14 @@ pub(crate) struct StateMaintenance {
 
 impl StateOperation {
     pub(crate) fn enter(state: &Path) -> Result<Self> {
-        let lock = open_state_lock(state)?;
+        ensure_private_directory(state)?;
+        let lock = open_state_directory(state)?;
         File::lock_shared(&lock).context("failed to enter RunLab state operation")?;
         Ok(Self { _lock: lock })
     }
 
     pub(crate) fn enter_existing(state: &Path) -> Result<Self> {
-        let lock = open_existing_state_lock(state)?;
+        let lock = open_state_directory(state)?;
         File::lock_shared(&lock).context("failed to enter RunLab state operation")?;
         Ok(Self { _lock: lock })
     }
@@ -30,30 +30,30 @@ impl StateOperation {
 
 impl StateMaintenance {
     pub(crate) fn enter_existing(state: &Path) -> Result<Self> {
-        let lock = open_existing_state_lock(state)?;
+        let lock = open_state_directory(state)?;
         lock.lock()
             .context("failed to enter exclusive RunLab state maintenance")?;
         Ok(Self { _lock: lock })
     }
 }
 
-fn open_state_lock(state: &Path) -> Result<File> {
-    ensure_private_directory(state)?;
-    open_lock(state, true)
-}
-
-fn open_existing_state_lock(state: &Path) -> Result<File> {
-    let metadata = std::fs::symlink_metadata(state)
-        .with_context(|| format!("failed to inspect RunLab state {}", state.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+fn open_state_directory(state: &Path) -> Result<File> {
+    let directory = File::from(
+        open(
+            state,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("failed to inspect RunLab state {}", state.display()))?,
+    );
+    if !directory
+        .metadata()
+        .with_context(|| format!("failed to inspect RunLab state {}", state.display()))?
+        .is_dir()
+    {
         bail!("RunLab state is not a real directory: {}", state.display());
     }
-    open_lock(state, false)
-}
-
-fn open_lock(state: &Path, create: bool) -> Result<File> {
-    let path = state.join(LOCK_FILE);
-    open_regular_lock(&path, create, "RunLab state lock")
+    Ok(directory)
 }
 
 #[cfg(test)]

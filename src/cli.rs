@@ -11,7 +11,6 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::backend::DockerBackend;
 use crate::catalog::{
     CatalogDescriptionUpdate, CatalogEntry, ImageSelector, LocalImageCatalog, normalize_reference,
 };
@@ -20,10 +19,14 @@ use crate::core::{
     OciDescriptor, Platform, RunControls, RunId, ServiceName, StoredBytes, TcpReadinessCondition,
     TerminalRunRecord,
 };
+use crate::docker::{DockerBackend, DockerImageAdapter};
 #[cfg(target_os = "linux")]
 use crate::execution::{ManagedPrimaryInput, ManagedServiceInput};
-use crate::execution::{RunReconcileBatchResult, RunReconcileResult, RunStartResult, Runner};
+use crate::execution::{RunStartResult, Runner};
 use crate::image::{ImageService, ImageStructureDiff};
+use crate::image_ingress::{
+    ImageImportResult as IngressImportResult, ImagePullResult as IngressPullResult,
+};
 use crate::ingress::ImportSourceKind;
 use crate::integrity::{digest_bytes, ensure_private_directory, write_new_output};
 use crate::maintenance::{
@@ -31,6 +34,7 @@ use crate::maintenance::{
 };
 use crate::managed_vm::HostVm;
 use crate::oci::OciLayout;
+use crate::reconciliation::{RunReconcileBatchResult, RunReconcileResult};
 use crate::render::FilesystemChange;
 use crate::runtime::RuntimeConfig;
 use crate::state::{StateMaintenance, StateOperation};
@@ -40,6 +44,16 @@ use crate::topology::ManagedServiceFile;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 3600;
 const DEFAULT_STREAM_LIMIT_BYTES: u64 = MAX_CAPTURED_STREAM_BYTES;
 const MAX_STDIN_BYTES: u64 = 16 * 1024 * 1024;
+
+mod image;
+mod inputs;
+mod run;
+mod schema;
+
+use image::{resolve_image, run_docker, run_image};
+use inputs::{check_runtime_config, run_managed_service, run_runtime_config};
+use run::{run_run, run_state};
+use schema::run_schema;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1048,8 +1062,8 @@ struct SchemaListResult {
     schemas: Vec<SchemaName>,
 }
 
-impl From<crate::image::ImageImportResult> for ImageImportResult {
-    fn from(value: crate::image::ImageImportResult) -> Self {
+impl From<IngressImportResult> for ImageImportResult {
+    fn from(value: IngressImportResult) -> Self {
         Self {
             schema_version: 1,
             source_kind: value.source_kind,
@@ -1063,8 +1077,8 @@ impl From<crate::image::ImageImportResult> for ImageImportResult {
     }
 }
 
-impl From<crate::image::ImagePullResult> for ImagePullResult {
-    fn from(value: crate::image::ImagePullResult) -> Self {
+impl From<IngressPullResult> for ImagePullResult {
+    fn from(value: IngressPullResult) -> Self {
         Self {
             schema_version: 1,
             remote_reference: value.remote_reference,
@@ -1191,15 +1205,15 @@ pub fn run() -> Result<u8> {
         }
         Command::Vm { command } => run_vm(cli.state.as_ref(), command),
         Command::Image { command } => run_image(&resolve_state(cli.state)?, command),
-        Command::Docker { command } => with_state(cli.state, |state| run_docker(state, command)),
+        Command::Docker { command } => run_docker_with_state(cli.state, command),
         Command::RuntimeConfig {
             command: RuntimeConfigCommand::Check { path },
         } => check_runtime_config(&path),
         Command::RuntimeConfig { command } => {
-            with_state(cli.state, |state| run_runtime_config(state, command))
+            with_existing_state(cli.state, |state| run_runtime_config(state, command))
         }
         Command::ManagedService { command } => {
-            with_state(cli.state, |state| run_managed_service(state, command))
+            with_existing_state(cli.state, |state| run_managed_service(state, command))
         }
         Command::Run { command } => run_run(&resolve_state(cli.state)?, command),
         Command::State { command } => run_state(&resolve_state(cli.state)?, command),
@@ -1332,13 +1346,29 @@ fn ensure_vm_owns_state(state: Option<&PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn with_state(
+fn with_existing_state(
     explicit: Option<PathBuf>,
     operation: impl FnOnce(&Path) -> Result<u8>,
 ) -> Result<u8> {
     let state = resolve_state(explicit)?;
-    let _operation = StateOperation::enter(&state)?;
+    let _operation = StateOperation::enter_existing(&state)?;
     operation(&state)
+}
+
+fn run_docker_with_state(explicit: Option<PathBuf>, command: DockerCommand) -> Result<u8> {
+    let state = resolve_state(explicit)?;
+    let imports_image = matches!(
+        command,
+        DockerCommand::Image {
+            command: DockerImageCommand::Import { .. }
+        }
+    );
+    let _operation = if imports_image {
+        StateOperation::enter(&state)?
+    } else {
+        StateOperation::enter_existing(&state)?
+    };
+    run_docker(&state, command)
 }
 
 #[cfg(target_os = "linux")]
@@ -1378,884 +1408,6 @@ fn run_internal_tcp_probe(port: u16, timeout_milliseconds: u64) -> Result<u8> {
 #[cfg(not(target_os = "linux"))]
 fn run_internal_tcp_probe(_port: u16, _timeout_milliseconds: u64) -> Result<u8> {
     bail!("internal TCP readiness probe requires Linux")
-}
-
-fn run_image(state: &Path, command: ImageCommand) -> Result<u8> {
-    if let ImageCommand::Import { source, .. } = &command {
-        crate::ingress::validate_source_destination(source, &state.join("oci"))?;
-    }
-    let _operation = StateOperation::enter(state)?;
-    match command {
-        ImageCommand::Import {
-            source,
-            platform,
-            manifest,
-            source_reference,
-            name,
-            description,
-        } => {
-            let platform = match platform {
-                Some(platform) => platform.into(),
-                None => host_platform()?,
-            };
-            let result = image_service(state)?.import_oci(
-                &source,
-                platform,
-                manifest.as_ref(),
-                source_reference.as_deref(),
-                &name,
-                description.as_deref(),
-            )?;
-            emit(&ImageImportResult::from(result))?;
-        }
-        ImageCommand::Pull {
-            remote_reference,
-            platform,
-            name,
-            description,
-        } => {
-            let platform = match platform {
-                Some(platform) => platform.into(),
-                None => host_platform()?,
-            };
-            let result = image_service(state)?.pull_image(
-                &remote_reference,
-                platform,
-                name.as_deref(),
-                description.as_deref(),
-            )?;
-            emit(&ImagePullResult::from(result))?;
-        }
-        ImageCommand::Catalog { command } => run_image_catalog(state, command)?,
-        ImageCommand::Inspect { image } => {
-            let images = image_service(state)?;
-            let (image, _) = resolve_image(state, &images, &image)?;
-            emit(&ImageInspectResult::from(image))?;
-        }
-        ImageCommand::Diff {
-            from,
-            to,
-            limit,
-            after_path_hex,
-        } => run_image_diff(state, &from, &to, limit, after_path_hex.as_deref())?,
-        ImageCommand::Export { image, output } => {
-            let images = image_service(state)?;
-            let (resolved, requested_reference) = resolve_image(state, &images, &image)?;
-            let manifest_digest = resolved.manifest.digest;
-            let (digest, size) = images.export_tar(&manifest_digest, &output)?;
-            emit(&ImageExportResult {
-                schema_version: 1,
-                requested_reference,
-                manifest_digest,
-                output: absolute_path(&output)?,
-                digest,
-                size,
-                format: ImageExportFormat::Tar,
-            })?;
-        }
-        ImageCommand::File { command } => match command {
-            ImageFileCommand::Get {
-                image,
-                source,
-                output,
-            } => {
-                let images = image_service(state)?;
-                let (resolved, requested_reference) = resolve_image(state, &images, &image)?;
-                let manifest_digest = resolved.manifest.digest;
-                let (digest, size) = images.get_file(&manifest_digest, &source, &output)?;
-                emit(&ImageFileGetResult {
-                    schema_version: 1,
-                    requested_reference,
-                    manifest_digest,
-                    source,
-                    output: absolute_path(&output)?,
-                    digest,
-                    size,
-                })?;
-            }
-        },
-    }
-    Ok(0)
-}
-
-fn run_docker(state: &Path, command: DockerCommand) -> Result<u8> {
-    match command {
-        DockerCommand::Image { command } => run_docker_image(state, command),
-    }
-}
-
-fn run_docker_image(state: &Path, command: DockerImageCommand) -> Result<u8> {
-    let images = image_service(state)?;
-    let docker = local_docker()?;
-    match command {
-        DockerImageCommand::Import { docker_image } => emit(&ImageOperationResult::from(
-            images.import_image(&docker, &docker_image)?,
-        ))?,
-        DockerImageCommand::Materialize { manifest_digest } => {
-            let docker_image = images.materialize(&docker, &manifest_digest)?;
-            emit(&DockerImageMaterializeResult {
-                schema_version: 1,
-                manifest_digest,
-                docker_image,
-            })?;
-        }
-        DockerImageCommand::Checkout { command } => match command {
-            CheckoutCommand::Create { manifest_digest } => {
-                let (container, parent) = images.create_checkout(&docker, &manifest_digest)?;
-                emit(&DockerImageCheckoutCreateResult {
-                    schema_version: 1,
-                    checkout_id: container.clone(),
-                    parent_manifest: parent,
-                    exec_argv: vec![
-                        "docker".to_owned(),
-                        "exec".to_owned(),
-                        "-it".to_owned(),
-                        container,
-                        "/bin/sh".to_owned(),
-                    ],
-                })?;
-            }
-            CheckoutCommand::Commit { checkout_id } => emit(&ImageOperationResult::from(
-                images.freeze_checkout(&docker, &checkout_id)?,
-            ))?,
-        },
-    }
-    Ok(0)
-}
-
-fn run_image_catalog(state: &Path, command: ImageCatalogCommand) -> Result<()> {
-    let layout = catalog_layout(state)?;
-    let catalog = LocalImageCatalog::new(&layout);
-    match command {
-        ImageCatalogCommand::List { limit, after } => {
-            if !(1..=1000).contains(&limit) {
-                bail!("--limit must be between 1 and 1000");
-            }
-            let after = after.as_deref().map(normalize_reference).transpose()?;
-            let mut entries = catalog
-                .list()?
-                .into_iter()
-                .filter(|entry| {
-                    after
-                        .as_ref()
-                        .is_none_or(|after| entry.reference.as_str() > after.as_str())
-                })
-                .take(limit + 1)
-                .collect::<Vec<_>>();
-            let has_more = entries.len() > limit;
-            if has_more {
-                entries.truncate(limit);
-            }
-            let next_after = has_more
-                .then(|| entries.last().map(|entry| entry.reference.clone()))
-                .flatten();
-            emit(&ImageCatalogListResult {
-                schema_version: 1,
-                entries: entries.into_iter().map(Into::into).collect(),
-                next_after,
-            })?;
-        }
-        ImageCatalogCommand::Show { reference } => {
-            let reference = normalize_reference(&reference)?;
-            let entry = catalog
-                .resolve(&reference)?
-                .with_context(|| format!("local OCI reference is unknown: {reference}"))?;
-            let image = image_service(state)?.inspect(&entry.manifest.digest)?;
-            if image.manifest != entry.manifest {
-                bail!("Catalog descriptor does not match resolved OCI Manifest: {reference}");
-            }
-            emit(&ImageCatalogShowResult {
-                schema_version: 1,
-                entry: entry.into(),
-            })?;
-        }
-        ImageCatalogCommand::Set {
-            reference,
-            manifest,
-            description,
-            clear_description,
-        } => {
-            let reference = normalize_reference(&reference)?;
-            let image = image_service(state)?.inspect(&manifest)?;
-            let description = match (clear_description, description.as_deref()) {
-                (true, _) => CatalogDescriptionUpdate::Clear,
-                (false, Some(description)) => CatalogDescriptionUpdate::Set(description),
-                (false, None) => CatalogDescriptionUpdate::Preserve,
-            };
-            let update = catalog.set(&reference, &image.manifest, image.platform, description)?;
-            emit(&ImageCatalogSetResult {
-                schema_version: 1,
-                changed: update.changed,
-                previous: update.previous.map(Into::into),
-                entry: update.entry.into(),
-            })?;
-        }
-        ImageCatalogCommand::Remove { reference } => {
-            let reference = normalize_reference(&reference)?;
-            let previous = catalog.remove(&reference)?;
-            emit(&ImageCatalogRemoveResult {
-                schema_version: 1,
-                reference,
-                removed: previous.is_some(),
-                previous: previous.map(Into::into),
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn run_image_diff(
-    state: &Path,
-    from: &ImageSelector,
-    to: &ImageSelector,
-    limit: usize,
-    after_path_hex: Option<&str>,
-) -> Result<()> {
-    if !(1..=1000).contains(&limit) {
-        bail!("--limit must be between 1 and 1000");
-    }
-    let after_path_hex = after_path_hex.map(validate_path_hex_cursor).transpose()?;
-    let images = image_service(state)?;
-    let (from, from_requested_reference) = resolve_image(state, &images, from)?;
-    let (to, to_requested_reference) = resolve_image(state, &images, to)?;
-    let diff = images.diff(&from.manifest.digest, &to.manifest.digest)?;
-    let total_changes = diff.filesystem.changes.len();
-    let mut changes = diff
-        .filesystem
-        .changes
-        .into_iter()
-        .filter(|change| {
-            after_path_hex
-                .as_ref()
-                .is_none_or(|after| change.path_hex.as_str() > after.as_str())
-        })
-        .take(limit + 1)
-        .collect::<Vec<_>>();
-    let has_more = changes.len() > limit;
-    if has_more {
-        changes.truncate(limit);
-    }
-    let next_after_path_hex = has_more
-        .then(|| changes.last().map(|change| change.path_hex.clone()))
-        .flatten();
-    emit(&ImageDiffResult {
-        schema_version: diff.schema_version,
-        from: ResolvedImageResult {
-            requested_reference: from_requested_reference,
-            manifest: diff.from,
-        },
-        to: ResolvedImageResult {
-            requested_reference: to_requested_reference,
-            manifest: diff.to,
-        },
-        structure: diff.structure,
-        filesystem: ImageFilesystemDiffResult {
-            total_changes,
-            changes,
-            next_after_path_hex,
-        },
-    })?;
-    Ok(())
-}
-
-fn resolve_image(
-    state: &Path,
-    images: &ImageService,
-    selector: &ImageSelector,
-) -> Result<(ImageView, Option<String>)> {
-    match selector {
-        ImageSelector::Digest(digest) => Ok((images.inspect(digest)?, None)),
-        ImageSelector::Reference(reference) => {
-            let layout = catalog_layout(state)?;
-            let entry = LocalImageCatalog::new(&layout)
-                .resolve(reference)?
-                .with_context(|| format!("local OCI reference is unknown: {reference}"))?;
-            let image = images.inspect(&entry.manifest.digest)?;
-            if image.manifest != entry.manifest {
-                bail!("Catalog descriptor does not match resolved OCI Manifest: {reference}");
-            }
-            Ok((image, Some(reference.clone())))
-        }
-    }
-}
-
-fn validate_path_hex_cursor(value: &str) -> Result<String> {
-    if value.len() < 2
-        || !value.len().is_multiple_of(2)
-        || !value.starts_with("2f")
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("--after-path-hex must be lowercase hex for an absolute raw path");
-    }
-    Ok(value.to_owned())
-}
-
-fn catalog_layout(state: &Path) -> Result<OciLayout> {
-    ensure_private_directory(state)?;
-    OciLayout::open(state.join("oci"))
-}
-
-fn host_platform() -> Result<Platform> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok(Platform::linux(Architecture::Amd64)),
-        "aarch64" => Ok(Platform::linux(Architecture::Arm64)),
-        architecture => {
-            bail!("host architecture {architecture} has no default OCI platform; supply --platform")
-        }
-    }
-}
-
-fn run_runtime_config(state: &Path, command: RuntimeConfigCommand) -> Result<u8> {
-    match command {
-        RuntimeConfigCommand::Create { image, output } => {
-            let images = image_service(state)?;
-            let (resolved, requested_reference) = resolve_image(state, &images, &image)?;
-            let manifest_digest = resolved.manifest.digest;
-            let runtime =
-                RuntimeConfig::from_image_config(&images.image_config(&manifest_digest)?)?;
-            let bytes = runtime.encoded()?;
-            write_new_output(&output, &bytes)?;
-            emit(&RuntimeConfigCreateResult {
-                schema_version: 1,
-                requested_reference,
-                manifest_digest,
-                output: absolute_path(&output)?,
-                size: bytes.len(),
-            })?;
-        }
-        RuntimeConfigCommand::Check { path } => return check_runtime_config(&path),
-    }
-    Ok(0)
-}
-
-fn check_runtime_config(path: &Path) -> Result<u8> {
-    let bytes = read_bounded_file(path, 16 * 1024 * 1024)?;
-    let runtime = RuntimeConfig::load(&bytes)?;
-    emit(&RuntimeConfigCheckResult {
-        schema_version: 1,
-        valid: true,
-        oci_version: runtime.oci_version().to_owned(),
-    })?;
-    Ok(0)
-}
-
-fn run_managed_service(state: &Path, command: ManagedServiceCommand) -> Result<u8> {
-    let ManagedServiceCommand::Check { path } = command;
-    let service = ManagedServiceFile::load(&path)?;
-    let runtime_source = read_bounded_file(&service.runtime_config_file, 16 * 1024 * 1024)?;
-    let runtime = RuntimeConfig::load(&runtime_source)?;
-    runtime.validate_native_managed_profile()?;
-    let runtime_bytes = runtime.encoded()?;
-    let images = image_service(state)?;
-    let (image, requested_reference) =
-        resolve_image(state, &images, &service.initial_image.parse()?)?;
-    emit(&ManagedServiceCheckResult {
-        schema_version: 1,
-        valid: true,
-        name: service.name,
-        requested_reference,
-        initial_image: image.manifest,
-        runtime_config: ContentSummary {
-            digest: digest_bytes(&runtime_bytes),
-            size: runtime_bytes.len(),
-        },
-        readiness: service.readiness,
-    })?;
-    Ok(0)
-}
-
-fn run_run(state: &Path, command: RunCommand) -> Result<u8> {
-    let command = match command {
-        RunCommand::Start(arguments) => return run_start(state, arguments),
-        command => command,
-    };
-    let _operation = match &command {
-        RunCommand::Verify { .. } => StateOperation::enter_existing(state)?,
-        RunCommand::Reconcile(arguments) if arguments.dry_run => {
-            StateOperation::enter_existing(state)?
-        }
-        _ => StateOperation::enter(state)?,
-    };
-    match command {
-        RunCommand::Start(_) => unreachable!("Run start returned before acquiring state"),
-        RunCommand::Get { run_id } => {
-            emit(&run_database(state)?.get(run_id)?)?;
-            Ok(0)
-        }
-        RunCommand::Verify { run_id } => {
-            emit(&crate::maintenance::verify_run(state, run_id)?)?;
-            Ok(0)
-        }
-        RunCommand::List {
-            limit,
-            after,
-            lifecycle,
-        } => run_list(state, limit, after, lifecycle),
-        RunCommand::Diff { left, right, limit } => run_diff(state, left, right, limit),
-        RunCommand::Reconcile(arguments) => run_reconcile(state, &arguments),
-        RunCommand::Stdout { command } => run_bytes(state, command, RunStream::Stdout),
-        RunCommand::Stderr { command } => run_bytes(state, command, RunStream::Stderr),
-    }
-}
-
-fn run_state(state: &Path, command: StateCommand) -> Result<u8> {
-    match command {
-        StateCommand::Verify => {
-            let _maintenance = StateMaintenance::enter_existing(state)?;
-            emit(&crate::maintenance::verify_state(state)?)?;
-            Ok(0)
-        }
-        StateCommand::Gc {
-            command: StateGcCommand::Plan { output },
-        } => {
-            let _maintenance = StateMaintenance::enter_existing(state)?;
-            let plan = crate::maintenance::plan_gc(state)?;
-            write_new_output(&output, &plan.encoded()?)?;
-            emit(&StateGcPlanResult {
-                schema_version: 1,
-                output: absolute_path(&output)?,
-                plan_digest: plan.plan_digest.clone(),
-                roots: u64::try_from(plan.roots.len()).context("GC root count overflow")?,
-                reachable_oci_blobs: plan.reachable_oci_blobs,
-                reachable_oci_bytes: plan.reachable_oci_bytes,
-                delete_oci_blobs: u64::try_from(plan.delete.len())
-                    .context("GC delete count overflow")?,
-                delete_oci_bytes: plan.delete_bytes()?,
-            })?;
-            Ok(0)
-        }
-        StateCommand::Gc {
-            command: StateGcCommand::Apply { plan },
-        } => {
-            let bytes = read_bounded_file(&plan, crate::maintenance::MAX_STATE_GC_PLAN_BYTES)?;
-            let plan: StateGcPlan =
-                serde_json::from_slice(&bytes).context("state GC plan is invalid JSON")?;
-            let _maintenance = StateMaintenance::enter_existing(state)?;
-            let result = crate::maintenance::apply_gc(state, &plan)?;
-            let exit = u8::from(result.failed > 0);
-            emit(&result)?;
-            Ok(exit)
-        }
-    }
-}
-
-fn run_list(
-    state: &Path,
-    limit: usize,
-    after: Option<RunId>,
-    lifecycle: Option<RunLifecycleArg>,
-) -> Result<u8> {
-    if !(1..=100).contains(&limit) {
-        bail!("--limit must be between 1 and 100");
-    }
-    let page = run_database(state)?.list(lifecycle.map(RunLifecycleArg::as_str), after, limit)?;
-    let next_after = page
-        .has_more
-        .then(|| page.records.last().map(record_run_id))
-        .flatten();
-    emit(&RunListResult {
-        schema_version: 1,
-        runs: page.records,
-        next_after,
-    })?;
-    Ok(0)
-}
-
-fn run_diff(state: &Path, left: RunId, right: RunId, limit: usize) -> Result<u8> {
-    if !(1..=1000).contains(&limit) {
-        bail!("--limit must be between 1 and 1000");
-    }
-    let database = run_database(state)?;
-    let left_record = database.get(left)?;
-    let right_record = database.get(right)?;
-    let left_value = comparable_run_record(&left_record)?;
-    let right_value = comparable_run_record(&right_record)?;
-    let mut differences = Vec::new();
-    collect_run_differences("", Some(&left_value), Some(&right_value), &mut differences);
-    let total_differences = differences.len();
-    differences.truncate(limit);
-    emit(&RunDiffResult {
-        schema_version: 1,
-        left_run_id: left,
-        right_run_id: right,
-        equal: total_differences == 0,
-        total_differences,
-        truncated: total_differences > differences.len(),
-        differences,
-    })?;
-    Ok(0)
-}
-
-fn record_run_id(record: &crate::core::RunRecord) -> RunId {
-    match record {
-        crate::core::RunRecord::Accepted(record) => record.run_id,
-        crate::core::RunRecord::Terminal(record) => record.run_id,
-    }
-}
-
-fn comparable_run_record(record: &crate::core::RunRecord) -> Result<Value> {
-    let mut value = serde_json::to_value(record).context("failed to project Run Record")?;
-    let object = value
-        .as_object_mut()
-        .context("Run Record projection must be an object")?;
-    for field in ["schema_version", "run_id", "accepted_at", "terminal_at"] {
-        object.remove(field);
-    }
-    Ok(value)
-}
-
-fn collect_run_differences(
-    path: &str,
-    left: Option<&Value>,
-    right: Option<&Value>,
-    output: &mut Vec<RunFieldDifference>,
-) {
-    if left == right {
-        return;
-    }
-    match (left, right) {
-        (Some(Value::Object(left)), Some(Value::Object(right))) => {
-            let keys = left.keys().chain(right.keys()).collect::<BTreeSet<_>>();
-            for key in keys {
-                let path = format!("{path}/{}", json_pointer_segment(key));
-                collect_run_differences(&path, left.get(key), right.get(key), output);
-            }
-        }
-        (Some(Value::Array(left)), Some(Value::Array(right))) => {
-            for index in 0..left.len().max(right.len()) {
-                let path = format!("{path}/{index}");
-                collect_run_differences(&path, left.get(index), right.get(index), output);
-            }
-        }
-        _ => output.push(RunFieldDifference {
-            path: if path.is_empty() {
-                "/".to_owned()
-            } else {
-                path.to_owned()
-            },
-            left: run_field_value(left),
-            right: run_field_value(right),
-        }),
-    }
-}
-
-fn run_field_value(value: Option<&Value>) -> RunFieldValue {
-    value.map_or(RunFieldValue::Missing, |value| RunFieldValue::Value {
-        value: value.clone(),
-    })
-}
-
-fn json_pointer_segment(value: &str) -> String {
-    value.replace('~', "~0").replace('/', "~1")
-}
-
-#[cfg(target_os = "linux")]
-fn run_reconcile(state: &Path, arguments: &RunReconcileArgs) -> Result<u8> {
-    let database = if arguments.dry_run {
-        RunDatabase::open_existing(state.join("runs.sqlite3"))?
-    } else {
-        run_database(state)?
-    };
-    let images = (!arguments.dry_run)
-        .then(|| image_service(state))
-        .transpose()?;
-    if let Some(run_id) = arguments.run_id {
-        emit(&crate::native_reconcile::reconcile_native_run(
-            state,
-            &database,
-            images.as_ref(),
-            run_id,
-            arguments.dry_run,
-        )?)?;
-        return Ok(0);
-    }
-    let limit = arguments.limit.unwrap_or(20);
-    if !(1..=100).contains(&limit) {
-        bail!("--limit must be between 1 and 100");
-    }
-    let result = crate::native_reconcile::reconcile_native_runs(
-        state,
-        &database,
-        images.as_ref(),
-        arguments.after,
-        limit,
-        arguments.dry_run,
-    )?;
-    let exit_code = u8::from(result.failed > 0);
-    emit(&result)?;
-    Ok(exit_code)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn run_reconcile(_state: &Path, _arguments: &RunReconcileArgs) -> Result<u8> {
-    bail!("native Run reconciliation currently requires Linux")
-}
-
-fn run_start(state: &Path, arguments: RunStartArgs) -> Result<u8> {
-    if arguments.timeout_seconds == 0 {
-        bail!("--timeout-seconds must be greater than zero");
-    }
-    if arguments.stdout_limit_bytes == 0 || arguments.stderr_limit_bytes == 0 {
-        bail!("stream limits must be greater than zero");
-    }
-    if arguments.stdout_limit_bytes > MAX_CAPTURED_STREAM_BYTES
-        || arguments.stderr_limit_bytes > MAX_CAPTURED_STREAM_BYTES
-    {
-        bail!("stream limits must not exceed {MAX_CAPTURED_STREAM_BYTES} bytes");
-    }
-    if matches!(arguments.backend, RunBackendArg::Docker) && arguments.managed_service.is_some() {
-        bail!("--managed-service requires --backend native");
-    }
-    let runtime_source = read_bounded_file(&arguments.runtime_config, 16 * 1024 * 1024)?;
-    let runtime = RuntimeConfig::load(&runtime_source)?;
-    let runtime_bytes = runtime.encoded()?;
-    let managed_service = arguments
-        .managed_service
-        .as_deref()
-        .map(load_managed_service)
-        .transpose()?;
-    let stdin = match arguments.stdin {
-        Some(path) => read_bounded_file(&path, MAX_STDIN_BYTES)?,
-        None => Vec::new(),
-    };
-    let controls = RunControls {
-        stdin: StoredBytes::Available {
-            digest: digest_bytes(&stdin),
-            size: u64::try_from(stdin.len()).context("stdin size overflow")?,
-        },
-        timeout_seconds: arguments.timeout_seconds,
-        stdout_limit_bytes: arguments.stdout_limit_bytes,
-        stderr_limit_bytes: arguments.stderr_limit_bytes,
-        network: arguments.network.into(),
-    };
-    let _operation = StateOperation::enter(state)?;
-    let images = image_service(state)?;
-    let (initial_image, requested_image_reference) =
-        resolve_image(state, &images, &arguments.initial_image)?;
-    let initial_manifest = initial_image.manifest.digest;
-    let managed_service = managed_service
-        .map(|mut service| {
-            let (image, requested_reference) = resolve_image(state, &images, &service.image)?;
-            service.image = ImageSelector::Digest(image.manifest.digest);
-            Ok::<_, anyhow::Error>((service, requested_reference))
-        })
-        .transpose()?;
-    let database = run_database(state)?;
-    let result = match arguments.backend {
-        RunBackendArg::Docker => {
-            let docker = DockerBackend::discover()?;
-            Runner::docker(&database, &images, &docker).run_selected(
-                &initial_manifest,
-                requested_image_reference.as_deref(),
-                &runtime,
-                &runtime_bytes,
-                controls,
-                &stdin,
-            )?
-        }
-        RunBackendArg::Native => run_native(
-            &database,
-            &images,
-            &initial_manifest,
-            requested_image_reference.as_deref(),
-            &runtime,
-            &runtime_bytes,
-            controls,
-            &stdin,
-            managed_service.as_ref(),
-        )?,
-    };
-    emit(&RunStartResult::from(&result))?;
-    Ok(result.cli_exit_code)
-}
-
-#[cfg(target_os = "linux")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the CLI boundary passes each accepted Run input without hiding protocol fields"
-)]
-fn run_native(
-    database: &RunDatabase,
-    images: &ImageService,
-    initial_manifest: &Digest,
-    requested_image_reference: Option<&str>,
-    runtime: &RuntimeConfig,
-    runtime_bytes: &[u8],
-    controls: RunControls,
-    stdin: &[u8],
-    managed_service: Option<&(LoadedManagedService, Option<String>)>,
-) -> Result<crate::execution::RunResult> {
-    let runc = crate::runc::RuncRunner::discover(std::time::Duration::from_secs(5))?;
-    let runner = Runner::native(database, images, &runc);
-    match managed_service {
-        Some((service, service_requested_reference)) => runner.run_with_managed_service(
-            ManagedPrimaryInput {
-                initial_manifest,
-                requested_image_reference,
-                runtime,
-                runtime_bytes,
-                controls,
-                stdin,
-            },
-            &ManagedServiceInput {
-                name: service.declaration.name.clone(),
-                requested_image_reference: service_requested_reference.as_deref(),
-                initial_manifest: match &service.image {
-                    ImageSelector::Digest(digest) => digest,
-                    ImageSelector::Reference(_) => {
-                        unreachable!("Managed Service image was resolved before acceptance")
-                    }
-                },
-                runtime: &service.runtime,
-                runtime_bytes: &service.runtime_bytes,
-                readiness: service.declaration.readiness.clone(),
-            },
-        ),
-        None => runner.run_selected(
-            initial_manifest,
-            requested_image_reference,
-            runtime,
-            runtime_bytes,
-            controls,
-            stdin,
-        ),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the portable stub mirrors the native CLI boundary exactly"
-)]
-fn run_native(
-    _database: &RunDatabase,
-    _images: &ImageService,
-    _initial_manifest: &Digest,
-    _requested_image_reference: Option<&str>,
-    _runtime: &RuntimeConfig,
-    _runtime_bytes: &[u8],
-    _controls: RunControls,
-    _stdin: &[u8],
-    _managed_service: Option<&(LoadedManagedService, Option<String>)>,
-) -> Result<crate::execution::RunResult> {
-    bail!("the native execution backend currently requires Linux")
-}
-
-fn load_managed_service(path: &Path) -> Result<LoadedManagedService> {
-    let declaration = ManagedServiceFile::load(path)?;
-    let image = declaration.initial_image.parse()?;
-    let source = read_bounded_file(&declaration.runtime_config_file, 16 * 1024 * 1024)?;
-    let runtime = RuntimeConfig::load(&source)?;
-    let runtime_bytes = runtime.encoded()?;
-    Ok(LoadedManagedService {
-        declaration,
-        image,
-        runtime,
-        runtime_bytes,
-    })
-}
-
-fn run_bytes(state: &Path, command: RunBytesCommand, stream: RunStream) -> Result<u8> {
-    let RunBytesCommand::Get {
-        run_id,
-        participant,
-        output,
-    } = command;
-    let field = stream.storage_field(participant);
-    let bytes = run_database(state)?.bytes(run_id, field)?;
-    write_new_output(&output, &bytes)?;
-    emit(&RunStreamGetResult {
-        schema_version: 2,
-        run_id,
-        participant,
-        field: stream,
-        output: absolute_path(&output)?,
-    })?;
-    Ok(0)
-}
-
-fn run_schema(command: SchemaCommand) -> Result<u8> {
-    match command {
-        SchemaCommand::List => emit(&SchemaListResult {
-            schema_version: 1,
-            schemas: SchemaName::ALL.to_vec(),
-        })?,
-        SchemaCommand::Show { name } => match name {
-            SchemaName::AcceptedRunRecord => emit(&schemars::schema_for!(AcceptedRunRecord))?,
-            SchemaName::TerminalRunRecord => emit(&schemars::schema_for!(TerminalRunRecord))?,
-            SchemaName::RunStartResult => emit(&schemars::schema_for!(RunStartResult))?,
-            SchemaName::RunListResult => emit(&schemars::schema_for!(RunListResult))?,
-            SchemaName::RunDiffResult => emit(&schemars::schema_for!(RunDiffResult))?,
-            SchemaName::RunStreamGetResult => emit(&schemars::schema_for!(RunStreamGetResult))?,
-            SchemaName::RunReconcileResult => emit(&schemars::schema_for!(RunReconcileResult))?,
-            SchemaName::RunReconcileBatchResult => {
-                emit(&schemars::schema_for!(RunReconcileBatchResult))?;
-            }
-            SchemaName::RunVerifyResult => emit(&schemars::schema_for!(RunVerifyResult))?,
-            SchemaName::ImageOperationResult => emit(&schemars::schema_for!(ImageOperationResult))?,
-            SchemaName::ImageInspectResult => emit(&schemars::schema_for!(ImageInspectResult))?,
-            SchemaName::ImageImportResult => emit(&schemars::schema_for!(ImageImportResult))?,
-            SchemaName::ImagePullResult => emit(&schemars::schema_for!(ImagePullResult))?,
-            SchemaName::ImageCatalogListResult => {
-                emit(&schemars::schema_for!(ImageCatalogListResult))?;
-            }
-            SchemaName::ImageCatalogShowResult => {
-                emit(&schemars::schema_for!(ImageCatalogShowResult))?;
-            }
-            SchemaName::ImageCatalogSetResult => {
-                emit(&schemars::schema_for!(ImageCatalogSetResult))?;
-            }
-            SchemaName::ImageCatalogRemoveResult => {
-                emit(&schemars::schema_for!(ImageCatalogRemoveResult))?;
-            }
-            SchemaName::ImageDiffResult => emit(&schemars::schema_for!(ImageDiffResult))?,
-            SchemaName::ImageExportResult => emit(&schemars::schema_for!(ImageExportResult))?,
-            SchemaName::ImageFileGetResult => emit(&schemars::schema_for!(ImageFileGetResult))?,
-            SchemaName::DockerImageMaterializeResult => {
-                emit(&schemars::schema_for!(DockerImageMaterializeResult))?;
-            }
-            SchemaName::DockerImageCheckoutCreateResult => {
-                emit(&schemars::schema_for!(DockerImageCheckoutCreateResult))?;
-            }
-            SchemaName::RuntimeConfigCreateResult => {
-                emit(&schemars::schema_for!(RuntimeConfigCreateResult))?;
-            }
-            SchemaName::RuntimeConfigCheckResult => {
-                emit(&schemars::schema_for!(RuntimeConfigCheckResult))?;
-            }
-            SchemaName::ManagedServiceCheckResult => {
-                emit(&schemars::schema_for!(ManagedServiceCheckResult))?;
-            }
-            SchemaName::StateVerifyResult => emit(&schemars::schema_for!(StateVerifyResult))?,
-            SchemaName::StateGcPlan => emit(&schemars::schema_for!(StateGcPlan))?,
-            SchemaName::StateGcPlanResult => {
-                emit(&schemars::schema_for!(StateGcPlanResult))?;
-            }
-            SchemaName::StateGcApplyResult => {
-                emit(&schemars::schema_for!(StateGcApplyResult))?;
-            }
-            SchemaName::VmStatus => emit(&schemars::schema_for!(crate::managed_vm::VmStatus))?,
-            SchemaName::VmInstallResult => {
-                emit(&schemars::schema_for!(crate::managed_vm::VmInstallResult))?;
-            }
-            SchemaName::VmOperationResult => {
-                emit(&schemars::schema_for!(crate::managed_vm::VmOperationResult))?;
-            }
-            SchemaName::VmOperationStatus => {
-                emit(&schemars::schema_for!(crate::managed_vm::VmOperationStatus))?;
-            }
-            SchemaName::VmCancelResult => {
-                emit(&schemars::schema_for!(crate::managed_vm::VmCancelResult))?;
-            }
-            SchemaName::VmDiscardResult => {
-                emit(&schemars::schema_for!(crate::managed_vm::VmDiscardResult))?;
-            }
-            SchemaName::SchemaListResult => emit(&schemars::schema_for!(SchemaListResult))?,
-        },
-    }
-    Ok(0)
 }
 
 fn resolve_state(explicit: Option<PathBuf>) -> Result<PathBuf> {

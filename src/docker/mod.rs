@@ -1,10 +1,13 @@
+mod image;
+
+pub(crate) use image::DockerImageAdapter;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,13 +16,13 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
-use signal_hook::consts::{SIGINT, SIGTERM};
 use tempfile::tempfile;
 
 use crate::core::{
     Architecture, BackendDetails, BackendFacts, NetworkControl, Platform, RunControls, RunId,
 };
 use crate::runtime::RuntimeConfig;
+use crate::signal::TerminationFlag;
 
 const MAX_COMMAND_OUTPUT_BYTES: u64 = 1024 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -356,9 +359,7 @@ impl DockerBackend {
     ) -> Result<AttachedResult> {
         let stdout = private_output(stdout_path)?;
         let stderr = private_output(stderr_path)?;
-        let interrupted = Arc::new(AtomicBool::new(false));
-        signal_hook::flag::register(SIGINT, Arc::clone(&interrupted))?;
-        signal_hook::flag::register(SIGTERM, Arc::clone(&interrupted))?;
+        let interrupted = TerminationFlag::register()?;
         let started_at = Utc::now();
         let mut child = Command::new(&self.executable)
             .args(["container", "start", "--attach", "--interactive", container])
@@ -380,7 +381,7 @@ impl DockerBackend {
             stdout_path,
             stderr_path,
             controls,
-            &interrupted,
+            interrupted.flag(),
         ) {
             Ok((status, reason)) => (Some(status), reason),
             Err(error) => {

@@ -496,19 +496,25 @@ pub(super) fn ensure_regular_file(path: &Path) -> Result<()> {
 }
 
 pub(super) fn privileged_file_identity(path: &str) -> Result<FileIdentity> {
-    let digest_output = Command::new("/usr/bin/sudo")
-        .args(["/usr/bin/sha256sum", "--", path])
-        .output()
-        .context("cannot hash guest operation file")?;
+    let digest_output = bounded_output(
+        Command::new("/usr/bin/sudo").args(["/usr/bin/sha256sum", "--", path]),
+        None,
+        VM_TRANSFER_TIMEOUT,
+        MAX_CONTROL_OUTPUT,
+        "guest operation file hash",
+    )?;
     ensure_status(&digest_output, "guest operation file hash")?;
     let hexadecimal = std::str::from_utf8(&digest_output.stdout)?
         .split_ascii_whitespace()
         .next()
         .context("sha256sum omitted the digest")?;
-    let size_output = Command::new("/usr/bin/sudo")
-        .args(["/usr/bin/stat", "--format=%s", "--", path])
-        .output()
-        .context("cannot inspect guest operation file")?;
+    let size_output = bounded_output(
+        Command::new("/usr/bin/sudo").args(["/usr/bin/stat", "--format=%s", "--", path]),
+        None,
+        VM_CONTROL_TIMEOUT,
+        MAX_CONTROL_OUTPUT,
+        "guest operation file inspection",
+    )?;
     ensure_status(&size_output, "guest operation file inspection")?;
     Ok(FileIdentity {
         schema_version: 1,
@@ -521,14 +527,14 @@ pub(super) fn privileged_file_identity(path: &str) -> Result<FileIdentity> {
 }
 
 pub(super) fn privileged_file_to_stdout(path: &str) -> Result<()> {
-    let status = Command::new("/usr/bin/sudo")
-        .args(["/usr/bin/cat", "--", path])
-        .status()
-        .context("cannot read guest operation file")?;
-    ensure!(
-        status.success(),
-        "guest operation file read failed: {status}"
-    );
+    let output = bounded_status_with_stdout(
+        Command::new("/usr/bin/sudo").args(["/usr/bin/cat", "--", path]),
+        Stdio::inherit(),
+        VM_TRANSFER_TIMEOUT,
+        MAX_CONTROL_OUTPUT,
+        "guest operation file read",
+    )?;
+    ensure_status(&output, "guest operation file read")?;
     Ok(())
 }
 
@@ -550,29 +556,6 @@ pub(super) fn set_private_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 pub(super) fn set_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
-}
-
-#[cfg(unix)]
-pub(super) fn register_interrupts(flag: Arc<AtomicBool>) -> Result<[signal_hook::SigId; 2]> {
-    let int = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag))?;
-    match signal_hook::flag::register(signal_hook::consts::SIGTERM, flag) {
-        Ok(term) => Ok([int, term]),
-        Err(error) => {
-            signal_hook::low_level::unregister(int);
-            Err(error.into())
-        }
-    }
-}
-
-#[cfg(not(unix))]
-pub(super) fn register_interrupts(_flag: Arc<AtomicBool>) -> Result<[signal_hook::SigId; 0]> {
-    Ok([])
-}
-
-pub(super) fn unregister_interrupts<const N: usize>(registrations: [signal_hook::SigId; N]) {
-    for registration in registrations {
-        signal_hook::low_level::unregister(registration);
-    }
 }
 
 pub(super) fn normalize_architecture(value: &str) -> &str {

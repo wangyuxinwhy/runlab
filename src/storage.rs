@@ -10,8 +10,9 @@ use rusqlite::{
 };
 
 use crate::core::{
-    ACCEPTED_RUN_RECORD_SCHEMA_VERSION, AcceptedRunRecord, ImageSlot, MAX_CAPTURED_STREAM_BYTES,
-    RunId, RunRecord, StoredBytes, TERMINAL_RUN_RECORD_SCHEMA_VERSION, TerminalRunRecord,
+    ACCEPTED_RUN_RECORD_SCHEMA_VERSION, AcceptedRunRecord, BackendDetails, BackendFacts, ImageSlot,
+    MAX_CAPTURED_STREAM_BYTES, RunId, RunRecord, StoredBytes, TERMINAL_RUN_RECORD_SCHEMA_VERSION,
+    TerminalRunRecord,
 };
 use crate::integrity::{canonical_json, digest_bytes, ensure_private_directory};
 
@@ -1114,6 +1115,7 @@ fn verify_terminal_schema(record: &TerminalRunRecord) -> Result<()> {
     if let Some(service) = &record.managed_service {
         service.validate()?;
     }
+    record.process.validate()?;
     if record
         .operation_errors
         .iter()
@@ -1125,6 +1127,14 @@ fn verify_terminal_schema(record: &TerminalRunRecord) -> Result<()> {
         && let Some(network) = &backend.run_network
     {
         network.validate(backend.network)?;
+    }
+    if let Some(BackendFacts {
+        details: BackendDetails::NativeLinux { runtime_size, .. },
+        ..
+    }) = &record.backend
+        && *runtime_size == 0
+    {
+        bail!("native backend runtime artifact size must be positive");
     }
     match (&record.managed_service, &record.backend) {
         (Some(_), Some(backend)) if backend.run_network.is_some() => {}
@@ -1352,8 +1362,8 @@ mod tests {
             process: ProcessSlot::available(ProcessFacts {
                 terminal_outcome: ProcessOutcome::ProcessExited,
                 exit_code: Some(0),
-                started_at: None,
-                ended_at: None,
+                started_at: Some(accepted_at),
+                ended_at: Some(accepted_at),
                 oom_killed: Some(false),
                 backend_error: None,
             }),
@@ -1914,6 +1924,8 @@ mod tests {
                         runtime_version: "1.3.6".to_owned(),
                         runtime_commit: "fixture".to_owned(),
                         runtime_spec: "1.2.1".to_owned(),
+                        runtime_digest: digest_bytes(b"runc fixture"),
+                        runtime_size: 12,
                         kernel_release: "fixture".to_owned(),
                         runtime_invocation: crate::core::NativeRuntimeInvocation::Direct,
                         runtime_config: crate::core::NativeRuntimeConfigRealization::Accepted,
@@ -2002,11 +2014,12 @@ mod tests {
     }
 
     fn exited_process() -> ProcessSlot {
+        let observed_at = Utc::now();
         ProcessSlot::available(ProcessFacts {
             terminal_outcome: ProcessOutcome::ProcessExited,
             exit_code: Some(0),
-            started_at: None,
-            ended_at: None,
+            started_at: Some(observed_at),
+            ended_at: Some(observed_at),
             oom_killed: None,
             backend_error: None,
         })

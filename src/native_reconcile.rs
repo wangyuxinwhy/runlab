@@ -11,12 +11,10 @@ use crate::core::{
     ProcessSlot, RunId, RunRecord, StoredBytes, TERMINAL_RUN_RECORD_SCHEMA_VERSION,
     TerminalLifecycle, TerminalRunRecord,
 };
-use crate::execution::{
-    RunReconcileBatchItem, RunReconcileBatchOutcome, RunReconcileBatchResult, RunReconcileResult,
-};
 use crate::filesystem::{FilesystemOwnership, TreeCapture};
 use crate::image::ImageService;
 use crate::integrity::digest_bytes;
+use crate::native_backend::RuncRunner;
 use crate::native_fs::OverlayRootfs;
 use crate::native_network::{EgressNetworkTools, NetworkHolderHandle, RunNetworkMode};
 use crate::native_recovery::{
@@ -25,7 +23,9 @@ use crate::native_recovery::{
     NativeSharedNetworkPhase, RecoveryCaptureCheckpoint, TerminalCheckpoint,
 };
 use crate::native_resolver::recover_cleanup;
-use crate::runc::RuncRunner;
+use crate::reconciliation::{
+    RunReconcileBatchItem, RunReconcileBatchOutcome, RunReconcileBatchResult, RunReconcileResult,
+};
 use crate::storage::RunDatabase;
 
 pub(crate) fn reconcile_native_run(
@@ -293,9 +293,13 @@ fn reconcile_accepted_primary(
     )?;
     actions.push("run_terminalized");
     if network_cleanup_complete {
-        attempt.remove_after_terminal()?;
-        actions.push("attempt_removed");
-        Ok(completed(run_id, "reconciled", true, actions))
+        match attempt.remove_after_terminal() {
+            Ok(()) => {
+                actions.push("attempt_removed");
+                Ok(completed(run_id, "reconciled", true, actions))
+            }
+            Err(error) => Ok(cleanup_pending(run_id, actions, &error)),
+        }
     } else {
         Ok(completed_with_resources(
             run_id,
@@ -552,9 +556,13 @@ fn terminalize_recovered_managed(
     )?;
     actions.push("run_terminalized");
     if recovered.network_cleanup_complete {
-        attempt.remove_after_terminal()?;
-        actions.push("attempt_removed");
-        Ok(completed(accepted.run_id, "reconciled", true, actions))
+        match attempt.remove_after_terminal() {
+            Ok(()) => {
+                actions.push("attempt_removed");
+                Ok(completed(accepted.run_id, "reconciled", true, actions))
+            }
+            Err(error) => Ok(cleanup_pending(accepted.run_id, actions, &error)),
+        }
     } else {
         Ok(completed_with_resources(
             accepted.run_id,
@@ -610,12 +618,13 @@ fn already_terminal(run_id: RunId) -> RunReconcileResult {
 
 fn planned(run_id: RunId, actions: Vec<&'static str>) -> RunReconcileResult {
     RunReconcileResult {
-        schema_version: 1,
+        schema_version: 2,
         run_id,
         status: "planned",
         terminalized: false,
         actions,
         resources_absent: false,
+        cleanup_errors: Vec::new(),
     }
 }
 
@@ -636,12 +645,29 @@ fn completed_with_resources(
     resources_absent: bool,
 ) -> RunReconcileResult {
     RunReconcileResult {
-        schema_version: 1,
+        schema_version: 2,
         run_id,
         status,
         terminalized,
         actions,
         resources_absent,
+        cleanup_errors: Vec::new(),
+    }
+}
+
+fn cleanup_pending(
+    run_id: RunId,
+    actions: Vec<&'static str>,
+    error: &anyhow::Error,
+) -> RunReconcileResult {
+    RunReconcileResult {
+        schema_version: 2,
+        run_id,
+        status: "terminalized_cleanup_pending",
+        terminalized: true,
+        actions,
+        resources_absent: false,
+        cleanup_errors: vec![format!("native recovery attempt removal failed: {error:#}")],
     }
 }
 
@@ -902,6 +928,8 @@ fn verify_runtime_identity(runner: &RuncRunner, attempt: &NativeAttempt) -> Resu
         runtime_version,
         runtime_commit,
         runtime_spec,
+        runtime_digest,
+        runtime_size,
         ..
     } = &attempt.journal().backend().details
     else {
@@ -912,6 +940,8 @@ fn verify_runtime_identity(runner: &RuncRunner, attempt: &NativeAttempt) -> Resu
         || runtime_version != &identity.version
         || runtime_commit != &identity.commit
         || runtime_spec != &identity.runtime_spec
+        || runtime_digest != &identity.digest
+        || runtime_size != &identity.size
     {
         bail!("installed runc identity differs from the interrupted native attempt");
     }
@@ -1635,6 +1665,8 @@ mod tests {
                 runtime_version: "1.3.6".to_owned(),
                 runtime_commit: "fixture".to_owned(),
                 runtime_spec: "1.2.1".to_owned(),
+                runtime_digest: digest_bytes(b"runc fixture"),
+                runtime_size: 12,
                 kernel_release: "fixture".to_owned(),
                 runtime_invocation: crate::core::NativeRuntimeInvocation::Direct,
                 runtime_config: crate::core::NativeRuntimeConfigRealization::Accepted,

@@ -1,35 +1,39 @@
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Seek as _};
+use std::io::Seek as _;
+#[cfg(test)]
+use std::io::{Cursor, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
-use tar::{Archive, Builder, EntryType, Header};
+#[cfg(test)]
+use tar::Archive;
+use tar::{Builder, EntryType, Header};
 
-use crate::backend::DockerBackend;
-use crate::catalog::{CatalogMetadata, LocalImageCatalog, normalize_reference};
-use crate::changeset::{ChangeSet, ContentStore, LayerEncoder};
+#[cfg(test)]
+use crate::changeset::ChangeSet;
+#[cfg(any(test, target_os = "linux"))]
+use crate::changeset::LayerEncoder;
+use crate::changeset::StagedLayer;
 #[cfg(target_os = "linux")]
 use crate::core::RunId;
 use crate::core::{
     Architecture, Digest, ImageView, OCI_IMAGE_CONFIG, OCI_IMAGE_INDEX, OCI_IMAGE_MANIFEST,
     OCI_LAYER_GZIP, OCI_LAYER_TAR, OCI_LAYER_ZSTD, OciDescriptor, Platform,
 };
-use crate::distribution::{DistributionClient, DistributionPullResult, RemoteReference};
-use crate::ingress::{ImportSourceKind, ingest_image};
-use crate::integrity::{canonical_json, digest_bytes};
-use crate::oci::{OciLayout, digest_reader};
+#[cfg(test)]
+use crate::filesystem::ContentStore;
+use crate::integrity::{canonical_json, digest_reader};
+use crate::oci::{MAX_IMAGE_LAYERS, OciLayout};
 use crate::render::{FilesystemDiff, ImageRenderer, layer_diff_id};
 #[cfg(target_os = "linux")]
 use crate::{
     filesystem::{CapturedTree, FilesystemOwnership, Inventory, TreeCapture},
     materialize::MaterializedRootfs,
 };
-
-const MAX_ARCHIVE_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ImageService {
@@ -40,28 +44,6 @@ pub struct ImageService {
 pub struct CaptureResult {
     pub image: ImageView,
     pub cleanup_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ImagePullResult {
-    pub(crate) remote_reference: String,
-    pub(crate) source_index: Option<OciDescriptor>,
-    pub(crate) selected_manifest: OciDescriptor,
-    pub(crate) platform: Platform,
-    pub(crate) downloaded_blobs: u64,
-    pub(crate) downloaded_bytes: u64,
-    pub(crate) local_reference: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ImageImportResult {
-    pub(crate) source_kind: ImportSourceKind,
-    pub(crate) source_index: OciDescriptor,
-    pub(crate) selected_manifest: OciDescriptor,
-    pub(crate) platform: Platform,
-    pub(crate) verified_blobs: u64,
-    pub(crate) verified_bytes: u64,
-    pub(crate) local_reference: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -83,19 +65,19 @@ pub(crate) struct ImageStructureDiff {
 }
 
 #[derive(Debug)]
-struct FinalLayer {
-    descriptor: OciDescriptor,
-    diff_id: Digest,
+pub(crate) struct FinalLayer {
+    pub(crate) descriptor: OciDescriptor,
+    pub(crate) diff_id: Digest,
 }
 
 #[derive(Debug)]
-struct CaptureMetadata {
-    captured_at: DateTime<Utc>,
-    action: CaptureAction,
+pub(crate) struct CaptureMetadata {
+    pub(crate) captured_at: DateTime<Utc>,
+    pub(crate) action: CaptureAction,
 }
 
 #[derive(Debug)]
-enum CaptureAction {
+pub(crate) enum CaptureAction {
     Run(String),
     Checkout,
 }
@@ -115,123 +97,9 @@ impl ImageService {
         Self { layout }
     }
 
-    pub(crate) fn pull_image(
-        &self,
-        remote: &str,
-        platform: Platform,
-        local_reference: Option<&str>,
-        description: Option<&str>,
-    ) -> Result<ImagePullResult> {
-        let client = DistributionClient::https()?;
-        self.pull_image_with(&client, remote, platform, local_reference, description)
-    }
-
-    pub(crate) fn pull_image_with(
-        &self,
-        client: &DistributionClient,
-        remote: &str,
-        platform: Platform,
-        local_reference: Option<&str>,
-        description: Option<&str>,
-    ) -> Result<ImagePullResult> {
-        let remote = RemoteReference::parse(remote)?;
-        let local_reference = normalize_reference(
-            &local_reference.map_or_else(|| remote.default_local_reference(), ToOwned::to_owned),
-        )?;
-        let DistributionPullResult {
-            remote_reference,
-            source_index,
-            selected_manifest,
-            source,
-            downloaded_blobs,
-            downloaded_bytes,
-        } = client.pull(&self.layout, &remote, platform)?;
-        let image = self.inspect(&selected_manifest.digest)?;
-        if image.manifest != selected_manifest {
-            bail!("selected OCI Manifest changed during local verification");
-        }
-        if image.platform != platform {
-            bail!(
-                "selected OCI Manifest platform mismatch: expected {platform}, received {}",
-                image.platform
-            );
-        }
-        LocalImageCatalog::new(&self.layout).upsert(
-            &local_reference,
-            &selected_manifest,
-            platform,
-            &CatalogMetadata {
-                description: description.map(ToOwned::to_owned),
-                source: Some(source),
-                maintainer: Some("local".to_owned()),
-            },
-        )?;
-        Ok(ImagePullResult {
-            remote_reference,
-            source_index,
-            selected_manifest,
-            platform,
-            downloaded_blobs,
-            downloaded_bytes,
-            local_reference,
-        })
-    }
-
-    pub(crate) fn import_oci(
-        &self,
-        source: &Path,
-        platform: Platform,
-        manifest: Option<&Digest>,
-        source_reference: Option<&str>,
-        local_reference: &str,
-        description: Option<&str>,
-    ) -> Result<ImageImportResult> {
-        let local_reference = normalize_reference(local_reference)?;
-        let ingested = ingest_image(&self.layout, source, platform, manifest, source_reference)?;
-        let image = self.inspect(&ingested.selected_manifest.digest)?;
-        if image.manifest != ingested.selected_manifest {
-            bail!("selected OCI Manifest changed during local verification");
-        }
-        if image.platform != platform {
-            bail!(
-                "selected OCI Manifest platform mismatch: expected {platform}, received {}",
-                image.platform
-            );
-        }
-        let source_kind = match ingested.source_kind {
-            ImportSourceKind::Layout => "oci-layout",
-            ImportSourceKind::Archive => "oci-archive",
-        };
-        LocalImageCatalog::new(&self.layout).upsert(
-            &local_reference,
-            &ingested.selected_manifest,
-            platform,
-            &CatalogMetadata {
-                description: description.map(ToOwned::to_owned),
-                source: Some(format!("{source_kind}@{}", ingested.source_index.digest)),
-                maintainer: Some("local".to_owned()),
-            },
-        )?;
-        Ok(ImageImportResult {
-            source_kind: ingested.source_kind,
-            source_index: ingested.source_index,
-            selected_manifest: ingested.selected_manifest,
-            platform,
-            verified_blobs: ingested.verified_blobs,
-            verified_bytes: ingested.verified_bytes,
-            local_reference,
-        })
-    }
-
-    pub fn import_image(&self, docker: &DockerBackend, image: &str) -> Result<ImageView> {
-        let directory = tempfile::Builder::new()
-            .prefix("runlab-import-")
-            .tempdir()
-            .context("failed to create image import directory")?;
-        let archive_path = directory.path().join("image.tar");
-        docker.save_image(image, &archive_path)?;
-        let imported = self.import_docker_archive(&archive_path)?;
-        self.publish_imported(imported, None, None)
+    #[must_use]
+    pub(crate) const fn layout(&self) -> &OciLayout {
+        &self.layout
     }
 
     pub fn inspect(&self, manifest_digest: &Digest) -> Result<ImageView> {
@@ -271,6 +139,9 @@ impl ImageService {
             .enumerate()
             .map(|(index, value)| descriptor_from_value(value, &format!("layers[{index}]")))
             .collect::<Result<Vec<_>>>()?;
+        if layers.len() > MAX_IMAGE_LAYERS {
+            bail!("OCI Image exceeds the {MAX_IMAGE_LAYERS}-Layer limit");
+        }
         for layer in &layers {
             if !matches!(
                 layer.media_type.as_str(),
@@ -393,87 +264,15 @@ impl ImageService {
         staging_parent: &Path,
     ) -> Result<CaptureResult> {
         let changes = crate::changeset::compare(before, &after.inventory)?;
-        let encoded = LayerEncoder::default().encode_in(
-            &self.layout,
-            &changes,
-            &after.contents,
-            staging_parent,
-        )?;
+        let staged = LayerEncoder::default().stage_in(&changes, &after.contents, staging_parent)?;
+        let layer = self.publish_staged_layer(staged)?;
         self.publish_final_image(
             parent_manifest,
-            FinalLayer {
-                descriptor: encoded.descriptor,
-                diff_id: encoded.diff_id,
-            },
+            layer,
             &CaptureMetadata {
                 captured_at,
                 action: CaptureAction::Run(run_id.to_string()),
             },
-        )
-    }
-
-    pub fn materialize(&self, docker: &DockerBackend, manifest_digest: &Digest) -> Result<String> {
-        let image = self.inspect(manifest_digest)?;
-        let reference = image.manifest.digest.to_string();
-        if docker.image_exists(&reference)? {
-            Self::verify_materialized(docker, &reference, &image)?;
-            return Ok(reference);
-        }
-        let directory = tempfile::Builder::new()
-            .prefix("runlab-materialize-")
-            .tempdir()
-            .context("failed to create materialization directory")?;
-        let archive = directory.path().join("image.tar");
-        let tag = format!("runlab-image:{}", &manifest_digest.hex()[..24]);
-        self.write_oci_archive(&image, &archive, &tag)?;
-        docker.load_image(&archive)?;
-        if !docker.image_exists(&reference)? {
-            bail!("Docker did not load OCI Image Manifest: {manifest_digest}");
-        }
-        Self::verify_materialized(docker, &reference, &image)?;
-        Ok(reference)
-    }
-
-    pub fn create_checkout(
-        &self,
-        docker: &DockerBackend,
-        manifest_digest: &Digest,
-    ) -> Result<(String, Digest)> {
-        let image = self.materialize(docker, manifest_digest)?;
-        let container = docker.create_checkout(&image, manifest_digest.as_str())?;
-        Ok((container, manifest_digest.clone()))
-    }
-
-    pub fn freeze_checkout(&self, docker: &DockerBackend, container: &str) -> Result<ImageView> {
-        let parent = Digest::parse(docker.checkout_parent(container)?)?;
-        let capture =
-            self.capture_container(docker, container, &parent, CaptureAction::Checkout)?;
-        let mut errors = Vec::new();
-        if let Some(error) = capture.cleanup_error {
-            errors.push(format!("temporary tag cleanup failed: {error}"));
-        }
-        if !errors.is_empty() {
-            bail!(
-                "captured Image {} is available, but {}",
-                capture.image.manifest.digest,
-                errors.join("; ")
-            );
-        }
-        Ok(capture.image)
-    }
-
-    pub fn freeze_run(
-        &self,
-        docker: &DockerBackend,
-        container: &str,
-        parent: &Digest,
-        run_id: &str,
-    ) -> Result<CaptureResult> {
-        self.capture_container(
-            docker,
-            container,
-            parent,
-            CaptureAction::Run(run_id.to_owned()),
         )
     }
 
@@ -554,97 +353,7 @@ impl ImageService {
         Ok((digest, size))
     }
 
-    fn capture_container(
-        &self,
-        docker: &DockerBackend,
-        container: &str,
-        parent_digest: &Digest,
-        action: CaptureAction,
-    ) -> Result<CaptureResult> {
-        let parent = self.inspect(parent_digest)?;
-        let capture = CaptureMetadata {
-            captured_at: Utc::now(),
-            action,
-        };
-        let safe_id = container
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() {
-                    character
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        let tag = format!("runlab-freeze:{}", &safe_id[..safe_id.len().min(48)]);
-        docker.commit(container, &tag)?;
-        let directory = tempfile::Builder::new()
-            .prefix("runlab-capture-")
-            .tempdir()
-            .context("failed to create image capture directory")?;
-        let archive_path = directory.path().join("image.tar");
-        let result = (|| {
-            docker.save_image(&tag, &archive_path)?;
-            let child = Self::inspect_docker_archive(&archive_path)?;
-            if child.layers.len() != child.diff_ids.len() {
-                bail!("captured OCI Image has inconsistent Layer and DiffID counts");
-            }
-            if child.platform != parent.platform {
-                bail!("committed OCI Image changed its parent platform");
-            }
-            let child_descriptors = child
-                .layers
-                .iter()
-                .map(|layer| layer.descriptor.clone())
-                .collect::<Vec<_>>();
-            let structure = compare_layer_structure(&parent.layers, &child_descriptors);
-            if structure.parent_remaining != 0 || structure.common_prefix != parent.layers.len() {
-                bail!("committed OCI Image does not extend its parent Layer chain");
-            }
-            if child.diff_ids[..parent.diff_ids.len()] != parent.diff_ids {
-                bail!("committed OCI Image does not extend its parent DiffID chain");
-            }
-            let added_layers = &child.layers[structure.common_prefix..];
-            if added_layers.len() != structure.child_remaining {
-                bail!("captured OCI Image Layer comparison is inconsistent");
-            }
-            let added_diff_ids = &child.diff_ids[parent.diff_ids.len()..];
-            let layer = if added_layers.is_empty() && added_diff_ids.is_empty() {
-                let encoded = LayerEncoder::default().encode(
-                    &self.layout,
-                    &ChangeSet::default(),
-                    &ContentStore::new()?,
-                )?;
-                self.verify_stored_final_layer(encoded.descriptor, encoded.diff_id)?
-            } else if let ([added_layer], [added_diff_id]) = (added_layers, added_diff_ids) {
-                let descriptor = self.import_layer_member(&archive_path, &added_layer.path)?;
-                if descriptor != added_layer.descriptor {
-                    bail!("captured OCI Image Layer changed during archive ingestion");
-                }
-                self.verify_stored_final_layer(descriptor, added_diff_id.clone())?
-            } else {
-                bail!(
-                    "one Run capture must produce exactly one child Layer, received {}",
-                    added_layers.len()
-                );
-            };
-            self.publish_final_image(parent_digest, layer, &capture)
-        })();
-        let cleanup = docker.remove_image_tag(&tag);
-        match (result, cleanup) {
-            (Ok(capture), Ok(())) => Ok(capture),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(cleanup_error)) => Err(error).context(format!(
-                "capture failed and temporary tag cleanup also failed: {cleanup_error:#}"
-            )),
-            (Ok(mut capture), Err(error)) => {
-                capture.cleanup_error = Some(format!("{error:#}"));
-                Ok(capture)
-            }
-        }
-    }
-
-    fn publish_final_image(
+    pub(crate) fn publish_final_image(
         &self,
         parent_manifest: &Digest,
         layer: FinalLayer,
@@ -657,7 +366,18 @@ impl ImageService {
         })
     }
 
-    fn verify_stored_final_layer(
+    pub(crate) fn publish_staged_layer(&self, mut staged: StagedLayer) -> Result<FinalLayer> {
+        let expected = staged.descriptor.clone();
+        let descriptor =
+            self.layout
+                .put_reader(staged.reader(), OCI_LAYER_GZIP, Some(&expected))?;
+        Ok(FinalLayer {
+            descriptor,
+            diff_id: staged.diff_id,
+        })
+    }
+
+    pub(crate) fn verify_stored_final_layer(
         &self,
         descriptor: OciDescriptor,
         expected_diff_id: Digest,
@@ -738,104 +458,7 @@ impl ImageService {
         })
     }
 
-    fn import_docker_archive(&self, path: &Path) -> Result<ImportedImage> {
-        let archive = Self::inspect_docker_archive(path)?;
-        let config = self
-            .layout
-            .put_bytes(&archive.config_bytes, OCI_IMAGE_CONFIG)?;
-        let mut layers = Vec::with_capacity(archive.layers.len());
-        for layer in archive.layers {
-            let descriptor = self.import_layer_member(path, &layer.path)?;
-            if descriptor != layer.descriptor {
-                bail!(
-                    "Docker archive Layer changed during ingestion: {}",
-                    layer.path
-                );
-            }
-            layers.push(descriptor);
-        }
-        Ok(ImportedImage {
-            config,
-            layers,
-            diff_ids: archive.diff_ids,
-            platform: archive.platform,
-        })
-    }
-
-    fn inspect_docker_archive(path: &Path) -> Result<DockerArchiveImage> {
-        let manifest_bytes = read_tar_member(path, "manifest.json", MAX_ARCHIVE_JSON_BYTES)?;
-        let entries: Vec<DockerManifestEntry> = serde_json::from_slice(&manifest_bytes)
-            .context("Docker archive manifest.json is invalid")?;
-        let [entry] = entries.as_slice() else {
-            bail!("Docker archive must describe exactly one saved image");
-        };
-        let config_bytes = read_tar_member(path, &entry.config, MAX_ARCHIVE_JSON_BYTES)?;
-        let expected_config_digest = digest_from_archive_path(&entry.config)?;
-        let actual_config_digest = digest_bytes(&config_bytes);
-        if actual_config_digest != expected_config_digest {
-            bail!("Docker archive OCI Image config failed descriptor verification");
-        }
-        let config_value: Value = serde_json::from_slice(&config_bytes)
-            .context("Docker archive OCI Image config is invalid JSON")?;
-        let diff_ids = config_diff_ids(&config_value)?;
-        if entry.layers.len() != diff_ids.len() {
-            bail!("Docker archive has inconsistent Layer and DiffID counts");
-        }
-        let layers = entry
-            .layers
-            .iter()
-            .map(|layer_path| {
-                Ok(DockerArchiveLayer {
-                    path: layer_path.clone(),
-                    descriptor: inspect_layer_member(path, layer_path)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(DockerArchiveImage {
-            config_bytes,
-            layers,
-            diff_ids,
-            platform: config_platform(&config_value)?,
-        })
-    }
-
-    fn import_layer_member(&self, archive_path: &Path, member_name: &str) -> Result<OciDescriptor> {
-        let expected_digest = digest_from_archive_path(member_name)?;
-        let file = File::open(archive_path)
-            .with_context(|| format!("failed to open Docker archive {}", archive_path.display()))?;
-        let mut archive = Archive::new(file);
-        for entry in archive.entries().context("failed to read Docker archive")? {
-            let mut entry = entry.context("failed to read Docker archive entry")?;
-            if entry.path_bytes().as_ref() != member_name.as_bytes() {
-                continue;
-            }
-            if entry.header().entry_type() != EntryType::Regular {
-                bail!("Docker archive Layer is not a regular file: {member_name}");
-            }
-            let size = entry
-                .header()
-                .size()
-                .context("Docker Layer size is invalid")?;
-            let mut prefix = [0_u8; 4];
-            let read = entry
-                .read(&mut prefix)
-                .context("failed to read Docker Layer")?;
-            let media_type = layer_media_type(&prefix[..read]);
-            let expected = OciDescriptor {
-                digest: expected_digest,
-                size,
-                media_type: media_type.to_owned(),
-            };
-            return self.layout.put_reader(
-                Cursor::new(prefix[..read].to_vec()).chain(entry),
-                media_type,
-                Some(&expected),
-            );
-        }
-        bail!("Docker archive is missing {member_name}")
-    }
-
-    fn publish_imported(
+    pub(crate) fn publish_imported(
         &self,
         imported: ImportedImage,
         parent_manifest: Option<Digest>,
@@ -883,7 +506,12 @@ impl ImageService {
         Ok(())
     }
 
-    fn write_oci_archive(&self, image: &ImageView, destination: &Path, tag: &str) -> Result<()> {
+    pub(crate) fn write_oci_archive(
+        &self,
+        image: &ImageView,
+        destination: &Path,
+        tag: &str,
+    ) -> Result<()> {
         let file = File::create(destination)
             .with_context(|| format!("failed to create OCI archive {}", destination.display()))?;
         let mut builder = Builder::new(file);
@@ -926,58 +554,40 @@ impl ImageService {
             .sync_all()
             .context("failed to fsync OCI archive")
     }
-
-    fn verify_materialized(
-        docker: &DockerBackend,
-        docker_image: &str,
-        image: &ImageView,
-    ) -> Result<()> {
-        let actual = docker.image_diff_ids(docker_image)?;
-        let expected = image
-            .diff_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        if actual != expected {
-            bail!(
-                "Docker materialization changed OCI Image rootfs: {}",
-                image.manifest.digest
-            );
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
-struct ImportedImage {
+pub(crate) struct ImportedImage {
     config: OciDescriptor,
     layers: Vec<OciDescriptor>,
     diff_ids: Vec<Digest>,
     platform: Platform,
 }
 
-#[derive(Debug)]
-struct DockerArchiveImage {
-    config_bytes: Vec<u8>,
-    layers: Vec<DockerArchiveLayer>,
-    diff_ids: Vec<Digest>,
-    platform: Platform,
-}
-
-#[derive(Debug)]
-struct DockerArchiveLayer {
-    path: String,
-    descriptor: OciDescriptor,
+impl ImportedImage {
+    pub(crate) fn new(
+        config: OciDescriptor,
+        layers: Vec<OciDescriptor>,
+        diff_ids: Vec<Digest>,
+        platform: Platform,
+    ) -> Self {
+        Self {
+            config,
+            layers,
+            diff_ids,
+            platform,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LayerStructureDiff {
-    common_prefix: usize,
-    parent_remaining: usize,
-    child_remaining: usize,
+pub(crate) struct LayerStructureDiff {
+    pub(crate) common_prefix: usize,
+    pub(crate) parent_remaining: usize,
+    pub(crate) child_remaining: usize,
 }
 
-fn compare_layer_structure(
+pub(crate) fn compare_layer_structure(
     parent: &[OciDescriptor],
     child: &[OciDescriptor],
 ) -> LayerStructureDiff {
@@ -991,13 +601,6 @@ fn compare_layer_structure(
         parent_remaining: parent.len() - common_prefix,
         child_remaining: child.len() - common_prefix,
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct DockerManifestEntry {
-    config: String,
-    layers: Vec<String>,
 }
 
 fn descriptor_from_value(value: &Value, field: &str) -> Result<OciDescriptor> {
@@ -1066,7 +669,7 @@ fn descriptor_value(descriptor: &OciDescriptor) -> Value {
     })
 }
 
-fn config_diff_ids(config: &Value) -> Result<Vec<Digest>> {
+pub(crate) fn config_diff_ids(config: &Value) -> Result<Vec<Digest>> {
     let rootfs = config
         .get("rootfs")
         .and_then(Value::as_object)
@@ -1089,7 +692,7 @@ fn config_diff_ids(config: &Value) -> Result<Vec<Digest>> {
         .collect()
 }
 
-fn config_platform(config: &Value) -> Result<Platform> {
+pub(crate) fn config_platform(config: &Value) -> Result<Platform> {
     let object = config
         .as_object()
         .context("OCI Image config must be an object")?;
@@ -1136,86 +739,6 @@ fn final_config_value(
         "empty_layer": false
     }));
     Ok(final_config)
-}
-
-fn layer_media_type(prefix: &[u8]) -> &'static str {
-    if prefix.starts_with(&[0x1f, 0x8b]) {
-        OCI_LAYER_GZIP
-    } else if prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        OCI_LAYER_ZSTD
-    } else {
-        OCI_LAYER_TAR
-    }
-}
-
-fn digest_from_archive_path(path: &str) -> Result<Digest> {
-    let name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("Docker archive path is invalid: {path}"))?;
-    Digest::parse(format!("sha256:{name}"))
-}
-
-fn read_tar_member(path: &Path, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open Docker archive {}", path.display()))?;
-    let mut archive = Archive::new(file);
-    for entry in archive.entries().context("failed to read Docker archive")? {
-        let entry = entry.context("failed to read Docker archive entry")?;
-        if entry.path_bytes().as_ref() != name.as_bytes() {
-            continue;
-        }
-        let size = entry
-            .header()
-            .size()
-            .context("Docker archive member size is invalid")?;
-        if size > max_bytes {
-            bail!("Docker archive member {name} exceeds the {max_bytes}-byte limit");
-        }
-        let mut bytes = Vec::with_capacity(usize::try_from(size).context("member is too large")?);
-        entry
-            .take(max_bytes + 1)
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("failed to read Docker archive member {name}"))?;
-        return Ok(bytes);
-    }
-    bail!("Docker archive is missing {name}")
-}
-
-fn inspect_layer_member(archive_path: &Path, member_name: &str) -> Result<OciDescriptor> {
-    let expected_digest = digest_from_archive_path(member_name)?;
-    let file = File::open(archive_path)
-        .with_context(|| format!("failed to open Docker archive {}", archive_path.display()))?;
-    let mut archive = Archive::new(file);
-    for entry in archive.entries().context("failed to read Docker archive")? {
-        let mut entry = entry.context("failed to read Docker archive entry")?;
-        if entry.path_bytes().as_ref() != member_name.as_bytes() {
-            continue;
-        }
-        if entry.header().entry_type() != EntryType::Regular {
-            bail!("Docker archive Layer is not a regular file: {member_name}");
-        }
-        let expected_size = entry
-            .header()
-            .size()
-            .context("Docker Layer size is invalid")?;
-        let mut prefix = [0_u8; 4];
-        let read = entry
-            .read(&mut prefix)
-            .context("failed to read Docker Layer")?;
-        let media_type = layer_media_type(&prefix[..read]);
-        let (actual_digest, actual_size) =
-            digest_reader(Cursor::new(prefix[..read].to_vec()).chain(entry))?;
-        if actual_digest != expected_digest || actual_size != expected_size {
-            bail!("Docker archive Layer failed descriptor verification: {member_name}");
-        }
-        return Ok(OciDescriptor {
-            digest: actual_digest,
-            size: actual_size,
-            media_type: media_type.to_owned(),
-        });
-    }
-    bail!("Docker archive is missing {member_name}")
 }
 
 fn append_bytes(builder: &mut Builder<File>, name: &str, bytes: &[u8]) -> Result<()> {

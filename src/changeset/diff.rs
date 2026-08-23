@@ -12,14 +12,6 @@ pub(crate) struct ChangeSet {
 }
 
 impl ChangeSet {
-    pub(crate) fn merged(root: Option<Metadata>, entries: BTreeMap<FsPath, FsEntry>) -> Self {
-        Self {
-            root,
-            removals: BTreeSet::new(),
-            entries,
-        }
-    }
-
     pub(crate) fn removals(&self) -> impl Iterator<Item = &FsPath> {
         self.removals.iter()
     }

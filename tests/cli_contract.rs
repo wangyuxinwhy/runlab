@@ -245,6 +245,7 @@ const PUBLIC_SCHEMA_EXPECTATIONS: &[SchemaExpectation] = &[
             "stderr",
             "operation_errors",
             "managed_service",
+            "cleanup",
         ],
     ),
     (
@@ -280,6 +281,7 @@ const PUBLIC_SCHEMA_EXPECTATIONS: &[SchemaExpectation] = &[
             "terminalized",
             "actions",
             "resources_absent",
+            "cleanup_errors",
         ],
     ),
     (
@@ -754,6 +756,28 @@ fn state_verify_does_not_initialize_missing_state() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("failed to inspect RunLab state"));
     assert!(!state.exists());
+}
+
+#[test]
+fn ordinary_read_commands_do_not_initialize_missing_state() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let digest = format!("sha256:{}", "0".repeat(64));
+    for (name, arguments) in [
+        ("image inspect", vec!["image", "inspect", digest.as_str()]),
+        ("run get", vec!["run", "get", RUN_ID]),
+        ("run list", vec!["run", "list"]),
+    ] {
+        let state = directory.path().join(name.replace(' ', "-"));
+        let output = Command::new(env!("CARGO_BIN_EXE_runlab"))
+            .arg("--state")
+            .arg(&state)
+            .args(arguments)
+            .output()
+            .expect("runlab process");
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        assert!(!state.exists(), "{name} created state");
+    }
 }
 
 #[test]
@@ -1301,6 +1325,8 @@ fn terminal_record(with_service: bool) -> Value {
                 "runtime_version": "1.3.6",
                 "runtime_commit": "fixture",
                 "runtime_spec": "1.2.0",
+                "runtime_digest": "sha256:629ecefe6e91e307e72dd9bce8f4e9234f6bc2403bc8387253c7e4f0c4c4e6e0",
+                "runtime_size": 12,
                 "kernel_release": "fixture",
                 "runtime_invocation": {"kind": "direct"},
                 "runtime_config": {"kind": "accepted"},

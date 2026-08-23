@@ -17,25 +17,16 @@ use tempfile::tempfile;
 use uuid::Uuid;
 
 use crate::bundle::OciBundle;
-use crate::core::{
-    Architecture, BackendDetails, BackendFacts, MAX_CAPTURED_STREAM_BYTES,
-    NativeFilesystemRealization, NativeRuntimeConfigRealization, NativeRuntimeInvocation,
-    NetworkControl, Platform, RunControls,
-};
-use crate::filesystem::FilesystemOwnership;
-use crate::integrity::{digest_bytes, ensure_private_directory};
+use crate::core::{Digest, MAX_CAPTURED_STREAM_BYTES, NativeRuntimeInvocation};
+use crate::integrity::{digest_reader, ensure_private_directory};
 use crate::native_cgroup::PreparedNativeCgroup;
-use crate::native_network::{EgressNetworkTools, NativeNetworkBinding, NativeNetworkTools};
-use crate::native_resolver::ResolverConfig;
-use crate::read_only_file::{VerifiedSourceFile, verify_all_sources, verify_sources};
+use crate::native_network::NativeNetworkBinding;
+use crate::read_only_file::{VerifiedSourceFile, verify_all_sources};
 use crate::runtime::{RootlessMapping, RuntimeConfig};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CANCELLATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_HELPER_OUTPUT_BYTES: u64 = 1024 * 1024;
-const SUPPORTED_RUNC_VERSION: &str = "1.5.1";
-const SUPPORTED_RUNC_COMMIT: &str = "v1.5.1-0-g8f2685a47";
-const SUPPORTED_RUNC_SPEC: &str = "1.3.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuncStopReason {
@@ -50,62 +41,6 @@ pub(crate) enum RuncStopReason {
 pub(crate) struct RuncCaptureLimits {
     stdout_bytes: u64,
     stderr_bytes: u64,
-}
-
-#[derive(Debug)]
-pub(crate) struct RuncPreflight {
-    pub facts: BackendFacts,
-    pub runner: RuncRunner,
-    pub mode: NativeExecutionMode,
-    pub realized_runtime: Option<RuntimeConfig>,
-    pub capture_limits: RuncCaptureLimits,
-    pub primary_files: Vec<VerifiedSourceFile>,
-    pub managed_service_files: Vec<VerifiedSourceFile>,
-    pub native_network_tools: Option<NativeNetworkTools>,
-    pub egress_network_tools: Option<EgressNetworkTools>,
-    pub resolver: Option<ResolverConfig>,
-}
-
-struct RuncPreflightRequest<'a> {
-    rootless_runtime: Option<&'a RuntimeConfig>,
-    controls: &'a RunControls,
-    state_root: &'a Path,
-    primary_files: Vec<VerifiedSourceFile>,
-    managed_service_files: Vec<VerifiedSourceFile>,
-    managed: bool,
-    rootless: bool,
-}
-
-struct RuncRealization {
-    runner: RuncRunner,
-    mode: NativeExecutionMode,
-    runtime: Option<RuntimeConfig>,
-    runtime_fact: NativeRuntimeConfigRealization,
-    filesystem_fact: NativeFilesystemRealization,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeExecutionMode {
-    Rootful,
-    Rootless { mapping: RootlessMapping },
-}
-
-impl NativeExecutionMode {
-    #[must_use]
-    pub(crate) const fn ownership(self) -> FilesystemOwnership {
-        match self {
-            Self::Rootful => FilesystemOwnership::Native,
-            Self::Rootless { mapping } => FilesystemOwnership::SingleId {
-                host_uid: mapping.host_uid,
-                host_gid: mapping.host_gid,
-            },
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn is_rootless(self) -> bool {
-        matches!(self, Self::Rootless { .. })
-    }
 }
 
 impl RuncCaptureLimits {
@@ -231,6 +166,8 @@ pub(crate) struct RuncIdentity {
     pub version: String,
     pub commit: String,
     pub runtime_spec: String,
+    pub digest: Digest,
+    pub size: u64,
 }
 
 impl RuncRunner {
@@ -250,8 +187,23 @@ impl RuncRunner {
                 executable.display()
             );
         }
-        executable.metadata().with_context(|| {
-            format!("failed to inspect runc executable {}", executable.display())
+        let executable = fs::canonicalize(&executable).with_context(|| {
+            format!("failed to resolve runc executable {}", executable.display())
+        })?;
+        let file = File::open(&executable)
+            .with_context(|| format!("failed to open runc executable {}", executable.display()))?;
+        if !file
+            .metadata()
+            .with_context(|| format!("failed to inspect runc executable {}", executable.display()))?
+            .is_file()
+        {
+            bail!(
+                "runc executable is not a regular file: {}",
+                executable.display()
+            );
+        }
+        let (digest, size) = digest_reader(file).with_context(|| {
+            format!("failed to digest runc executable {}", executable.display())
         })?;
         let mut runner = Self {
             executable,
@@ -260,6 +212,8 @@ impl RuncRunner {
                 version: String::new(),
                 commit: String::new(),
                 runtime_spec: String::new(),
+                digest: digest.clone(),
+                size,
             },
             invocation: ConfiguredInvocation::Direct,
         };
@@ -267,7 +221,7 @@ impl RuncRunner {
         if !version.status.success() {
             return Err(helper_failure("runc --version", &version));
         }
-        runner.identity = decode_identity(&version.stdout)?;
+        runner.identity = decode_identity(&version.stdout, digest, size)?;
         Ok(runner)
     }
 
@@ -293,7 +247,7 @@ impl RuncRunner {
         }
     }
 
-    fn invocation_fact(&self) -> NativeRuntimeInvocation {
+    pub(crate) fn invocation_fact(&self) -> NativeRuntimeInvocation {
         match &self.invocation {
             ConfiguredInvocation::Direct => NativeRuntimeInvocation::Direct,
             ConfiguredInvocation::Apparmor { profile, .. } => {
@@ -327,7 +281,7 @@ impl RuncRunner {
         })
     }
 
-    fn probe_rootless_invocation(
+    pub(crate) fn probe_rootless_invocation(
         &self,
         state_root: &Path,
         mapping: RootlessMapping,
@@ -517,192 +471,6 @@ impl RuncRunner {
         Ok(entries.unwrap_or_default())
     }
 
-    pub(crate) fn preflight(
-        &self,
-        runtime: &RuntimeConfig,
-        controls: &crate::core::RunControls,
-        state_root: &Path,
-    ) -> Result<RuncPreflight> {
-        let rootless = !rustix::process::geteuid().is_root();
-        let primary_files = if rootless {
-            runtime.validate_native_rootless_profile(controls.network)?;
-            Vec::new()
-        } else {
-            runtime.validate_native_run_profile(controls.network)?;
-            verify_sources(&runtime.native_file_mounts()?, state_root)?
-        };
-        self.preflight_host(RuncPreflightRequest {
-            rootless_runtime: Some(runtime),
-            controls,
-            state_root,
-            primary_files,
-            managed_service_files: Vec::new(),
-            managed: false,
-            rootless,
-        })
-    }
-
-    pub(crate) fn preflight_managed(
-        &self,
-        primary_runtime: &RuntimeConfig,
-        service_runtime: &RuntimeConfig,
-        controls: &crate::core::RunControls,
-        state_root: &Path,
-    ) -> Result<RuncPreflight> {
-        if !rustix::process::geteuid().is_root() {
-            bail!("rootless native execution does not support Managed Service");
-        }
-        primary_runtime.validate_native_managed_profile()?;
-        service_runtime.validate_native_managed_profile()?;
-        let primary_files = verify_sources(&primary_runtime.native_file_mounts()?, state_root)?;
-        let managed_service_files =
-            verify_sources(&service_runtime.native_file_mounts()?, state_root)?;
-        if primary_files.len() + managed_service_files.len() > 8 {
-            bail!("a native Run accepts at most 8 read-only file mounts across all participants");
-        }
-        self.preflight_host(RuncPreflightRequest {
-            rootless_runtime: None,
-            controls,
-            state_root,
-            primary_files,
-            managed_service_files,
-            managed: true,
-            rootless: false,
-        })
-    }
-
-    fn preflight_host(&self, request: RuncPreflightRequest<'_>) -> Result<RuncPreflight> {
-        if self.identity.version != SUPPORTED_RUNC_VERSION
-            || self.identity.commit != SUPPORTED_RUNC_COMMIT
-            || self.identity.runtime_spec != SUPPORTED_RUNC_SPEC
-        {
-            bail!(
-                "native execution supports runc {SUPPORTED_RUNC_VERSION} commit {SUPPORTED_RUNC_COMMIT} spec {SUPPORTED_RUNC_SPEC}, received {} commit {} spec {}",
-                self.identity.version,
-                self.identity.commit,
-                self.identity.runtime_spec
-            );
-        }
-        let controls = request.controls;
-        let native_network_tools = (!request.rootless
-            && (request.managed || controls.network == NetworkControl::Egress))
-            .then(|| {
-                NativeNetworkTools::discover().context("native Run network tools are unavailable")
-            })
-            .transpose()?;
-        let egress_network_tools = (!request.rootless
-            && controls.network == NetworkControl::Egress)
-            .then(|| {
-                let tools = EgressNetworkTools::discover()
-                    .context("native egress network tools are unavailable")?;
-                tools
-                    .preflight(Duration::from_secs(5))
-                    .context("native egress network preflight failed")?;
-                Ok::<_, anyhow::Error>(tools)
-            })
-            .transpose()?;
-        let resolver = (!request.rootless && controls.network == NetworkControl::Egress)
-            .then(|| ResolverConfig::preflight().context("native egress resolver is unavailable"))
-            .transpose()?;
-        checked_deadline(
-            Duration::from_secs(controls.timeout_seconds),
-            "native execution timeout",
-        )?;
-        let capture_limits =
-            RuncCaptureLimits::new(controls.stdout_limit_bytes, controls.stderr_limit_bytes)?;
-        let realization = self.realize_execution(
-            request.rootless_runtime,
-            request.state_root,
-            request.rootless,
-        )?;
-        let architecture = match std::env::consts::ARCH {
-            "x86_64" => Architecture::Amd64,
-            "aarch64" => Architecture::Arm64,
-            other => bail!("unsupported native Linux architecture: {other}"),
-        };
-        let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")
-            .context("failed to read Linux kernel release")?
-            .trim()
-            .to_owned();
-        Ok(RuncPreflight {
-            facts: BackendFacts {
-                name: "native_linux".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                platform: Platform::linux(architecture),
-                network: controls.network,
-                run_network: None,
-                details: BackendDetails::NativeLinux {
-                    runtime_name: "runc".to_owned(),
-                    runtime_version: self.identity.version.clone(),
-                    runtime_commit: self.identity.commit.clone(),
-                    runtime_spec: self.identity.runtime_spec.clone(),
-                    kernel_release,
-                    runtime_invocation: realization.runner.invocation_fact(),
-                    runtime_config: realization.runtime_fact,
-                    filesystem: realization.filesystem_fact,
-                },
-            },
-            runner: realization.runner,
-            mode: realization.mode,
-            realized_runtime: realization.runtime,
-            capture_limits,
-            primary_files: request.primary_files,
-            managed_service_files: request.managed_service_files,
-            native_network_tools,
-            egress_network_tools,
-            resolver,
-        })
-    }
-
-    fn realize_execution(
-        &self,
-        rootless_runtime: Option<&RuntimeConfig>,
-        state_root: &Path,
-        rootless: bool,
-    ) -> Result<RuncRealization> {
-        if !rootless {
-            verify_cgroup_v2()?;
-            PreparedNativeCgroup::probe().context("native cgroup preflight failed")?;
-            crate::native_fs::OverlayRootfs::preflight_at(state_root)?;
-            return Ok(RuncRealization {
-                runner: self.clone(),
-                mode: NativeExecutionMode::Rootful,
-                runtime: None,
-                runtime_fact: NativeRuntimeConfigRealization::Accepted,
-                filesystem_fact: NativeFilesystemRealization::OverlayFs {
-                    profile: "metacopy=off,redirect_dir=nofollow,index=on,nfs_export=off"
-                        .to_owned(),
-                },
-            });
-        }
-
-        let mapping = RootlessMapping {
-            host_uid: rustix::process::geteuid().as_raw(),
-            host_gid: rustix::process::getegid().as_raw(),
-        };
-        let runner = self.probe_rootless_invocation(state_root, mapping)?;
-        let runtime = rootless_runtime
-            .context("rootless preflight requires a Runtime Config")?
-            .realize_rootless(mapping)?;
-        let encoded = runtime.encoded()?;
-        Ok(RuncRealization {
-            runner,
-            mode: NativeExecutionMode::Rootless { mapping },
-            runtime: Some(runtime),
-            runtime_fact: NativeRuntimeConfigRealization::RootlessSingleId {
-                digest: digest_bytes(&encoded),
-                size: u64::try_from(encoded.len())
-                    .context("realized OCI Runtime config size overflow")?,
-            },
-            filesystem_fact: NativeFilesystemRealization::WritableMaterialized {
-                container_uid: 0,
-                host_uid: mapping.host_uid,
-                container_gid: 0,
-                host_gid: mapping.host_gid,
-            },
-        })
-    }
-
     #[cfg(test)]
     pub(crate) fn run(
         &self,
@@ -744,7 +512,7 @@ impl RuncRunner {
         &'a self,
         runtime_root: &Path,
         runtime_id: &str,
-        mode: NativeExecutionMode,
+        rootless: bool,
     ) -> Result<PreparedRuncRun<'a>> {
         let lifecycle = RuncLifecycle::create_at(self, runtime_root, runtime_id)?;
         let checkpoint = runtime_root
@@ -756,7 +524,7 @@ impl RuncRunner {
             lifecycle: Some(lifecycle),
             cgroup: None,
         };
-        if mode.is_rootless() {
+        if rootless {
             return Ok(prepared);
         }
         match PreparedNativeCgroup::prepare(runtime_id, &checkpoint) {
@@ -982,16 +750,30 @@ impl RuncRunner {
                     self.executable.display()
                 )
             })?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("runc stdout pipe is unavailable")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("runc stderr pipe is unavailable")?;
-        set_nonblocking(&stdout).context("failed to configure runc stdout pipe")?;
-        set_nonblocking(&stderr).context("failed to configure runc stderr pipe")?;
+        let Some(stdout) = child.stdout.take() else {
+            return Err(spawned_child_error(
+                &mut child,
+                anyhow::anyhow!("runc stdout pipe is unavailable"),
+            ));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            return Err(spawned_child_error(
+                &mut child,
+                anyhow::anyhow!("runc stderr pipe is unavailable"),
+            ));
+        };
+        if let Err(error) = set_nonblocking(&stdout) {
+            return Err(spawned_child_error(
+                &mut child,
+                anyhow::Error::new(error).context("failed to configure runc stdout pipe"),
+            ));
+        }
+        if let Err(error) = set_nonblocking(&stderr) {
+            return Err(spawned_child_error(
+                &mut child,
+                anyhow::Error::new(error).context("failed to configure runc stderr pipe"),
+            ));
+        }
         let stdout_progress = Arc::new(StreamProgress::default());
         let stderr_progress = Arc::new(StreamProgress::default());
         let stdout_drain = spawn_stream_drain(
@@ -1337,7 +1119,16 @@ impl RuncRunner {
             })?;
         let deadline = checked_deadline(timeout, "runc helper timeout")?;
         let status = loop {
-            if let Some(status) = child.try_wait().context("failed to poll runc helper")? {
+            let observed = match child.try_wait() {
+                Ok(observed) => observed,
+                Err(error) => {
+                    return Err(spawned_child_error(
+                        &mut child,
+                        anyhow::Error::new(error).context("failed to poll runc helper"),
+                    ));
+                }
+            };
+            if let Some(status) = observed {
                 break status;
             }
             if Instant::now() >= deadline {
@@ -1459,28 +1250,6 @@ fn find_executable(name: &str) -> Result<PathBuf> {
         }
     }
     bail!("executable is not available in PATH: {name}")
-}
-
-fn verify_cgroup_v2() -> Result<()> {
-    fs::metadata("/proc/self/ns/cgroup").context("cgroup namespace is unavailable")?;
-    fs::metadata("/sys/fs/cgroup/cgroup.controllers")
-        .context("the unified cgroup v2 hierarchy is unavailable")?;
-    let mounted = fs::read_to_string("/proc/self/mountinfo")
-        .context("failed to read /proc/self/mountinfo")?
-        .lines()
-        .any(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            fields.get(4) == Some(&"/sys/fs/cgroup")
-                && fields
-                    .iter()
-                    .position(|field| *field == "-")
-                    .and_then(|separator| fields.get(separator + 1))
-                    == Some(&"cgroup2")
-        });
-    if !mounted {
-        bail!("/sys/fs/cgroup is not a cgroup v2 mount");
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -1803,7 +1572,7 @@ fn decode_state(bytes: &[u8], expected_id: &str) -> Result<RuncState> {
     Ok(state)
 }
 
-fn decode_identity(bytes: &[u8]) -> Result<RuncIdentity> {
+fn decode_identity(bytes: &[u8], digest: Digest, size: u64) -> Result<RuncIdentity> {
     let text = std::str::from_utf8(bytes).context("runc --version returned non-UTF-8 stdout")?;
     let mut lines = text.lines();
     let version = lines
@@ -1825,6 +1594,8 @@ fn decode_identity(bytes: &[u8]) -> Result<RuncIdentity> {
         version: version.to_owned(),
         commit: commit.to_owned(),
         runtime_spec: runtime_spec.to_owned(),
+        digest,
+        size,
     })
 }
 
@@ -1914,6 +1685,19 @@ fn set_nonblocking(fd: impl std::os::fd::AsFd) -> std::io::Result<()> {
 
     let flags = fcntl_getfl(&fd)?;
     Ok(fcntl_setfl(fd, flags | OFlags::NONBLOCK)?)
+}
+
+fn spawned_child_error(child: &mut Child, error: anyhow::Error) -> anyhow::Error {
+    let kill = child.kill();
+    match child.wait() {
+        Ok(_) => error,
+        Err(wait_error) => match kill {
+            Ok(()) => error.context(format!("failed to reap spawned child: {wait_error}")),
+            Err(kill_error) => error.context(format!(
+                "failed to kill spawned child: {kill_error}; failed to reap it: {wait_error}"
+            )),
+        },
+    }
 }
 
 fn drain_pipe(mut reader: impl Read, limit: u64, progress: &StreamProgress) -> StreamDrainResult {
@@ -2149,6 +1933,8 @@ mod tests {
     fn decodes_runtime_identity_without_selecting_a_supported_version() {
         let identity = decode_identity(
             b"runc version 1.3.6\ncommit: v1.3.6-0-g491b69ba\nspec: 1.2.1\ngo: go1.25.5\n",
+            crate::integrity::digest_bytes(b"runc fixture"),
+            12,
         )
         .expect("identity");
         assert_eq!(
@@ -2157,6 +1943,8 @@ mod tests {
                 version: "1.3.6".to_owned(),
                 commit: "v1.3.6-0-g491b69ba".to_owned(),
                 runtime_spec: "1.2.1".to_owned(),
+                digest: crate::integrity::digest_bytes(b"runc fixture"),
+                size: 12,
             }
         );
     }
@@ -2565,14 +2353,13 @@ if command == "list":
         let executable = required_absolute_path("RUNLAB_TEST_RUNC");
         let python = required_absolute_path("RUNLAB_TEST_PYTHON");
         let runner = RuncRunner::probe(&executable, Duration::from_secs(5)).expect("runc probe");
-        assert_eq!(
-            runner.identity(),
-            &RuncIdentity {
-                version: "1.5.1".to_owned(),
-                commit: "v1.5.1-0-g8f2685a47".to_owned(),
-                runtime_spec: "1.3.0".to_owned(),
-            }
-        );
+        let (digest, size) =
+            digest_reader(File::open(&executable).expect("open runc")).expect("digest runc");
+        assert_eq!(runner.identity().version, "1.5.1");
+        assert_eq!(runner.identity().commit, "v1.5.1-0-g8f2685a47");
+        assert_eq!(runner.identity().runtime_spec, "1.3.0");
+        assert_eq!(runner.identity().digest, digest);
+        assert_eq!(runner.identity().size, size);
         let limits =
             RuncCaptureLimits::new(TEST_CAPTURE_LIMIT, TEST_CAPTURE_LIMIT).expect("capture limits");
         let idle_cancel = AtomicBool::new(false);

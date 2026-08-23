@@ -10,14 +10,16 @@ use sha2::{Digest as _, Sha256};
 use tar::{Archive, EntryType};
 use thiserror::Error;
 
-use crate::changeset::{ChangeSet, ContentStore, LayerEncoder};
 use crate::core::{
     Digest, ImageView, OCI_LAYER_GZIP, OCI_LAYER_TAR, OCI_LAYER_ZSTD, OciDescriptor,
 };
-use crate::filesystem::{EntryKind, FsEntry, FsPath, FsPathError, Metadata};
+use crate::filesystem::pax::{self, PaxError, PaxRecords, TarPaxIndex, TarPaxLimits};
+use crate::filesystem::{
+    ContentStore, EntryKind, FilesystemTarWriter, FsEntry, FsPath, FsPathError, Metadata,
+};
+use crate::integrity::digest_reader;
 use crate::integrity::finish_sha256;
-use crate::oci::{OciLayout, digest_reader};
-use crate::pax::{self, PaxError, PaxRecords, TarPaxIndex, TarPaxLimits};
+use crate::oci::{MAX_IMAGE_LAYERS, OciLayout};
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -48,7 +50,7 @@ pub struct RenderLimits {
 impl Default for RenderLimits {
     fn default() -> Self {
         Self {
-            layers: 1024,
+            layers: MAX_IMAGE_LAYERS as u64,
             entries: 1_000_000,
             total_uncompressed_bytes: 64 * 1024 * 1024 * 1024,
             entry_bytes: 64 * 1024 * 1024 * 1024,
@@ -718,7 +720,7 @@ impl ImageRenderer {
 
     pub(crate) fn export_tar(&self, image: &ImageView, destination: &mut File) -> Result<()> {
         let view = self.filesystem_view(image, true)?;
-        let (changes, mut regulars) = export_changeset(view)?;
+        let (tree, mut regulars) = export_tree(view)?;
         let mut contents = ContentStore::new()?;
         for descriptor in &image.layers {
             let Some(expected) = regulars.remove(&descriptor.digest) else {
@@ -748,7 +750,14 @@ impl ImageRenderer {
         if !regulars.is_empty() {
             bail!("resolved filesystem refers to an unavailable OCI Layer");
         }
-        LayerEncoder::write_tar(destination, &changes, &contents)
+        let mut writer = FilesystemTarWriter::new(destination);
+        if let Some(root) = &tree.root {
+            writer.append_root(root)?;
+        }
+        for (path, entry) in &tree.entries {
+            writer.append_entry(path, entry, &contents)?;
+        }
+        writer.finish()
     }
 
     fn filesystem_nodes(&self, image: &ImageView) -> Result<BTreeMap<ImagePath, FilesystemNode>> {
@@ -802,9 +811,12 @@ impl ImageRenderer {
     }
 }
 
-fn export_changeset(
-    view: FilesystemView,
-) -> Result<(ChangeSet, BTreeMap<Digest, Vec<LayerEntry>>)> {
+struct ExportTree {
+    root: Option<Metadata>,
+    entries: BTreeMap<FsPath, FsEntry>,
+}
+
+fn export_tree(view: FilesystemView) -> Result<(ExportTree, BTreeMap<Digest, Vec<LayerEntry>>)> {
     let mut root = None;
     let mut entries = BTreeMap::new();
     let mut anchors = BTreeMap::<(Digest, u64), ImagePath>::new();
@@ -868,7 +880,7 @@ fn export_changeset(
             _ => unreachable!("regular export plan contains only regular entries"),
         });
     }
-    Ok((ChangeSet::merged(root, entries), regulars))
+    Ok((ExportTree { root, entries }, regulars))
 }
 
 fn filesystem_node(node: FsNode) -> FilesystemNode {

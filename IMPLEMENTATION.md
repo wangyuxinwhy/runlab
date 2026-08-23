@@ -26,25 +26,28 @@ src/oci.rs        OCI Layout bytes、same-fd verification、atomic publish、ind
 src/catalog.rs    Local reference grammar、Catalog metadata 与 resolve/list/set/remove
 src/ingress.rs    read-only OCI Layout/archive graph selection、验证与 exact-byte ingest
 src/distribution.rs OCI Distribution pull、auth、platform selection
-src/filesystem/   raw-byte path 与 semantic filesystem inventory
-src/changeset/    before/after comparison、content spool 与 Layer encoding
-src/image.rs      Image inspect/diff/export、Layer artifact 验证与 Final assembly
-src/pax.rs        bounded length-aware PAX codec 与 sparse ordinal index
+src/image_ingress.rs import/pull application workflow 与 Catalog publication
+src/filesystem/   raw-byte path、semantic inventory、content spool 与 deterministic tar/PAX primitives
+src/changeset/    before/after comparison、OCI whiteout semantics 与 staged Layer encoding
+src/image.rs      OCI Image inspect/diff/export、staged Layer publication 与 Final assembly
+src/filesystem/pax.rs bounded length-aware PAX codec 与 sparse ordinal index
 src/render.rs     verified Layers、byte-safe filesystem view 与 file streaming
 src/materialize.rs Linux-only verified Layers → private rootfs materialization
 src/runtime.rs    Runtime config structural/typed check、canonical bytes、authoring
 src/bundle.rs     private OCI Runtime bundle 与 rootfs/config.json ownership
-src/backend.rs    Docker profile、subprocess、process lifecycle、signal、capture
-src/native_network.rs durable private namespace、IPv4 egress 与 host resource ownership
-src/native_recovery.rs durable native attempt journal
+src/docker/       显式 compatibility adapter、Docker process lifecycle 与 Image bridge
+src/native_backend.rs native host/runtime/filesystem/network preflight 与 realization
+src/native_network/ durable private namespace、IPv4 egress 与 host resource ownership
+src/native_recovery/ durable native attempt journal、journal validation 与 private layout
 src/native_reconcile.rs interrupted native Run reconciliation
 src/read_only_file.rs native read-only regular-file mount identity guards
-src/runc.rs       Linux-only runc probe、foreground lifecycle、streams 与 recovery handle
-src/execution.rs  acceptance → execute → terminal orchestration
+src/native_backend/runc.rs Linux-only runc identity、subprocess lifecycle、streams 与 raw observations
+src/execution/    acceptance → execute → terminal orchestration；Managed Service workflow 独立成模块
+src/reconciliation.rs reconciliation 公开结果类型
 src/storage.rs    SQLite transactions、immutable Run records、exact bytes
-src/state.rs      state-wide ordinary/maintenance operation lock
+src/state.rs      state directory 上的 ordinary/maintenance process lock；只读命令不创建 lock file
 src/maintenance.rs Run/state verification、retention graph 与 plan/apply GC
-src/managed_vm/ Lima lifecycle、versioned guest control、digest-verified file staging 与 recoverable operation
+src/managed_vm/ Lima lifecycle、versioned guest control、bounded subprocess、digest-verified file staging 与 recoverable operation
 src/topology.rs   bounded one-Service declaration 与 TCP readiness input
 ```
 
@@ -113,7 +116,7 @@ runlab [--state DIRECTORY]
 
 成功响应在 stdout 输出单行紧凑 JSON，diagnostic 写 stderr。成功 operation 返回 0，RunLab operation error 返回 1，Clap usage error 返回 2，成功 terminalize 的 cancellation 返回 130。目标进程非零 exit code 仍返回 0。
 
-State 优先级是 `--state`、`RUNLAB_STATE`、`$XDG_DATA_HOME/runlab`、`~/.local/share/runlab`，布局为标准 OCI Image Layout 加 `runs.sqlite3`。State root、数据库、OCI metadata 和 blobs 以当前用户私有权限创建。OCI Layout 首次初始化和 index mutation 使用同一把布局锁；blob 在 digest namespace 之外的同文件系统目录 staging，再 no-clobber 发布。descriptor-backed reads 在同一 file descriptor 上完成 digest/size 验证和读取，避免 verify-close-reopen。SQLite 显式拒绝未知 storage version，且不会先用当前 schema 改写未来版本数据库。`runtime-config check` 与 `schema` 不解析 state。`state verify` 必须打开已存在的 state，`run verify` 必须打开已存在的 OCI Layout 和 Run Database；两者都不初始化缺失的 Layout 或数据库。其他普通 stateful command 进入 state 时可创建 state root 和操作锁，Image writer 才初始化 Layout，Run writer 才初始化数据库。
+State 优先级是 `--state`、`RUNLAB_STATE`、`$XDG_DATA_HOME/runlab`、`~/.local/share/runlab`，布局为标准 OCI Image Layout 加 `runs.sqlite3`。State root、数据库、OCI metadata 和 blobs 以当前用户私有权限创建。OCI Layout 首次初始化和 index mutation 使用同一把布局锁；blob 在 digest namespace 之外的同文件系统目录 staging，再 no-clobber 发布。descriptor-backed reads 在同一 file descriptor 上完成 digest/size 验证和读取，避免 verify-close-reopen。SQLite 显式拒绝未知 storage version，且不会先用当前 schema 改写未来版本数据库。`runtime-config check` 与 `schema` 不解析 state。普通读取命令只进入已存在的 state，不会为了失败的 `image inspect`、`run get/list/diff`、stream read、authoring input resolution 或 VM operation query 创建目录或启动 VM。Image import/pull、Catalog mutation、Docker import 和 `run start` 是当前可以创建或扩展 state 的写路径；Image writer 才初始化 Layout，Run writer 才初始化数据库。
 
 macOS `vm` 命令不使用上述 host state precedence，并显式拒绝 host `--state`。namespace grammar 固定为 1–63 个小写字母、数字、`-`、`_`，且首字符只能是小写字母或数字；guest rootful engine state 固定在 `/var/lib/runlab/namespaces/<namespace>`。Lima preflight 精确要求 limactl 2.2.0、VZ、同架构、plain mode、零 mounts 和当前 architecture 的 digest-pinned server image。create 输入是内置的单一 Ubuntu 24.04 release URL/digest，不使用 mutable alias 或 fallback；上游 release URL 的长期保留仍是 release artifact 风险。host/guest control protocol 固定为 v1，握手同时校验 RunLab package version、Linux OS 和 architecture；安装 RunLab/runc、输入和输出均校验 exact SHA-256/size，runc identity 精确要求 1.5.1、commit `v1.5.1-0-g8f2685a47`、Runtime Spec 1.3.0。公开 `vm exec` 只接受 public RunLab argv 和显式 `@input/N`、`@output/N` slot，不是 shell transport。
 
@@ -190,11 +193,11 @@ State root 的 `.mutation.lock` 对普通 stateful operations 取 shared lease�
 
 Docker container creation 显式映射 argv、env、cwd、user/groups、hostname、readonly root、no-new-privileges、network 和 cgroup namespace，并 drop all capabilities。pid 与 mount 使用 Docker container 固有隔离；当前没有逐字段 conformance test 来证明完整 OCI fidelity。Docker 仍注入其 default mounts 和 daemon policy；adapter 为当前 slice 使用 `seccomp=unconfined`，因此不能宣称支持任意 OCI Runtime Configuration。
 
-Docker profile 位于 `backend.rs`，在 `run start` 的 Docker preflight、accepted transaction 之前转换并拒绝 adapter 无法 faithfully realize 的字段。named user、umask、PTY、mounts、resources、rlimits、capability set、seccomp profile、hooks、devices、masked/readonly paths 等当前会在这里作为 unsupported Docker capability 拒绝。Initial Image 的 declared Volumes 和删除 inherited environment name 也只属于 Docker preflight。
+Docker profile 位于 `docker/`，在 `run start` 的 Docker preflight、accepted transaction 之前转换并拒绝 adapter 无法 faithfully realize 的字段。named user、umask、PTY、mounts、resources、rlimits、capability set、seccomp profile、hooks、devices、masked/readonly paths 等当前会在这里作为 unsupported Docker capability 拒绝。Initial Image 的 declared Volumes 和删除 inherited environment name 也只属于 Docker preflight。
 
 `runtime-config check` 是纯 OCI/RunLab structural operation，只返回 `schema_version`、`valid` 与 `oci_version`，不读取 state、不连接 Docker、也不声称某个 backend profile。独立 OCI bundle boundary 只接受已通过唯一键、OCI typed view 与 RunLab invariant 校验的 `RuntimeConfig`，没有第二条 raw JSON 解析路径；它创建私有临时 `rootfs/` 与 canonical `config.json`，拒绝 symlink/escape 并由对象生命周期清理。
 
-Linux-only `RuncRunner` 已接入 `execution.rs` 和公开 `run start --backend native`。它先 probe absolute executable 与精确 version identity，为每个 Run 使用 recovery attempt 内固定 runtime root 和由 Run ID 派生的 container ID，使用 pipe 并发 drain 独立 stdout/stderr，记录 retained bytes、observed bytes 与 partial fact，并实现 monotonic deadline和 cancellation。正常路径在 stopped-state observation 后显式 `delete --force` 并审计 private root 为空；后置 observation、capture 或 cleanup 错误不会抹掉已经观察到的 process facts。
+Linux-only concrete `NativeBackend` 拥有 host、filesystem、network、resolver、rootful/rootless policy 与 Runtime Config realization；`RuncRunner` 只拥有 runc identity、subprocess lifecycle 与 raw observations。公开 `run start --backend native` 为每个 Run 使用 recovery attempt 内固定 runtime root 和由 Run ID 派生的 container ID，使用 pipe 并发 drain 独立 stdout/stderr，记录 retained bytes、observed bytes 与 partial fact，并实现 monotonic deadline 和 cancellation。正常路径在 stopped-state observation 后显式 `delete --force` 并审计 private root 为空；后置 observation、capture 或 cleanup 错误不会抹掉已经观察到的 process facts。
 
 Native recovery attempt 位于 `<state>/recovery/native/<run-id>/`，以 0700 directory、0600 journal/lock/stream sidecar、进程锁、单调 phase、临时文件 + fsync + rename 保存资源身份和 terminal checkpoint。所有 native working directory 与 content spool 都位于该 attempt owner 下。`run get` 不触发恢复；监督器丢失后，`run reconcile RUN_ID [--dry-run]` 只做 orphan cleanup/finalization，不 reattach 或重启进程。无法证明的 process 时间、exit code 和 streams 保持 unavailable；`supervisor_lost` 记录为 operation/recovery error，不伪造成一个 Process Outcome。SQLite terminal transaction 成功后才删除 attempt；重复 reconcile 返回 `already_terminal`。
 
@@ -234,7 +237,7 @@ Controls 包括 exact stdin bytes、timeout seconds、stdout/stderr prefix limit
 
 因此当前已经能做无网络任务、需要一个本地服务的任务、通过 IPv4 endpoint 使用外部 API 的任务，以及由只读文件注入 credential 的任务。它还不能把任意外部数据库 endpoint、read-write mount 或多个 service 的 before/after state 自动捕获成实验资产；这类状态不能被误报为 Primary Final Image 的一部分。
 
-setup、capture 和 cleanup 的可恢复错误进入 `operation_errors`。进程已经启动后，process outcome 不会因 inspect/capture error 被改写为 `not_started`。Final Config/Manifest content 按 digest 发布后即可作为 `final_image=available` 写入 terminal Run；Catalog mutation不是 Final publication 的隐式后续步骤。terminal database failure 或监督器强杀会留下可锁定的 accepted attempt；显式 reconciliation 停止仍可定位的资源、保存已有事实并以不完整终态封口，不透明重启目标进程。
+setup、capture 和 cleanup 的可恢复错误进入 `operation_errors`。进程已经启动后，process outcome 不会因 inspect/capture error 被改写为 `not_started`；缺少 exit code 或 start/end evidence 的终态不会伪装成 available Process facts。Final Config/Manifest content 按 digest 发布后即可作为 `final_image=available` 写入 terminal Run；Catalog mutation不是 Final publication 的隐式后续步骤。terminal database failure 或监督器强杀会留下可锁定的 accepted attempt；显式 reconciliation 停止仍可定位的资源、保存已有事实并以不完整终态封口，不透明重启目标进程。SQLite terminal transaction 已成功、但 recovery attempt 删除失败时，`run start` 返回 terminal record 加结构化 `cleanup.resources_absent=false/errors`，并返回非零 operation status；不会用一个 opaque 顶层错误隐藏已经提交的终态。
 
 ## SQLite 与公开 Schema
 
@@ -244,7 +247,7 @@ SQLite 当前使用 rollback journal `DELETE`、`synchronous=FULL`、5 秒 busy 
 
 `schema list|show` 为当前所有成功 JSON result shape 注册 schema：Run Record/start/list/diff/stream/reconcile/verify，OCI Image import/inspect/pull/Catalog list/show/set/remove/diff/export/file，Docker image import/checkout publish 共用的 `image-operation-result`、Docker materialize/checkout create，Runtime Config create/check、Managed Service check，state verify、GC plan document/plan result/apply result，managed VM status/install/operation/cancel/discard，以及有界的 schema list 本身。`schema list` 当前返回 36 个 kebab-case 名称；每个命令使用与 `schema show` 相同的 typed result，而不是独立拼装 `Value`。当前 error 仍是稳定 stderr diagnostic，不是 JSON error response；schema evolution 和兼容策略尚未冻结。
 
-`BackendFacts` 已拆成 common `name/version/platform/network` 与 tagged `details`。`docker` 保存 context、endpoint kind 与 Engine ID；`native_linux` 保存 runc version/commit/runtime-spec、kernel release、runtime invocation/config realization 与 filesystem realization。rootful profile 为每个 participant 创建 dedicated cgroup，执行前记录 baseline，只有验证过 init membership 后才从 terminal `memory.events` 形成 OOM true/false；不能从 exit 9、137 或 SIGKILL 猜测。rootless restricted profile 不声称 cgroup 或 OOM facts。
+`BackendFacts` 已拆成 common `name/version/platform/network` 与 tagged `details`。`docker` 保存 context、endpoint kind 与 Engine ID；`native_linux` 保存 runc version/commit/runtime-spec、executable digest/size、kernel release、runtime invocation/config realization 与 filesystem realization。version text 不能唯一标识 runtime build；恢复必须重新观测相同 executable digest/size，否则 fail closed。rootful profile 为每个 participant 创建 dedicated cgroup，执行前记录 baseline，只有验证过 init membership 后才从 terminal `memory.events` 形成 OOM true/false；不能从 exit 9、137 或 SIGKILL 猜测。rootless restricted profile 不声称 cgroup 或 OOM facts。
 
 ## 尚未实现或未证明
 
@@ -299,10 +302,11 @@ Experiment、Matrix、scoring、causal judgment 与跨 Run orchestration 是产�
 28. GC 最初如果复用 Catalog view 作为全部 OCI roots，会遗漏根 Index 中没有 reference annotation 的 Manifest。当前 Layout 提供独立的全量 root inventory，Catalog 仍只暴露有 reference 的 entries；GC 使用前者。
 29. 仅靠 OCI index lock 无法关闭 Catalog/Run roots 与 blob sweep 之间的竞态。当前 state-wide shared/exclusive lease 把全部普通 operations 与 maintenance 隔离，GC apply 还基于最新 roots 只缩小旧 plan 的删除集。
 30. 维护路径需要不创建 sidecar 的 read-only SQLite snapshot，与先前文档所述 WAL 不相容。当前 writer 明确固定 rollback journal `DELETE`，read-only open 先检查 SQLite header 并对 WAL payload fail closed。
+31. 早期有界 subprocess 只在 child leader 存活时计时；leader 退出后，继承 stdout/stderr pipe 的 descendant 可以让 reader thread 无界阻塞。当前 pipe 使用 nonblocking I/O，deadline 覆盖 child status、stream drain 和 thread join；超时后会停止 I/O 并回收 child，且有 inherited-pipe regression test。
 
 中途失败和被并发源码修改污染的 package comparison 均不计入下方最终证据；全部修正后必须从稳定 worktree 重跑每个 gate。
 
-早期四次 Claude Opus review 都在 5–10 分钟硬上限内没有输出，只能记为无证据的 `Execution error`，不能解释成“无问题”。后续两个有界源码审查 pass 成功返回，分别发现 Managed Service recovery guard 不对称、IPv6 policy bypass、迟到 cleanup 误删复用 conntrack，以及 allocation rollback 自锁四个高优先级问题，均已修复并进入真实 Linux 或定向回归验证。最终 pass 没有报告其他 blocker/high；它还指出 pre-acceptance 失败可能保留 attempt directory、reconcile discovery/open 之间存在一次性竞态，这两项不破坏已接受 Run 的事实或资源所有权，重试可收束，当前按低边际收益不扩张本 checkpoint。OCI ingress checkpoint 另一次 Claude Opus 5 review 在五分钟内没有输出，终止后返回 `Execution error`，因此同样没有审查证据。独立 subagent review 发现并推动修复了 checkpoint 可替换、reconcile 非幂等、runtime-start recovery 竞态、文档/公开 surface 不一致，以及上述 OCI ingress selector/overlap/PAX/FIFO/platform 五项缺口；最终 ingress 复核未发现剩余 blocker/high。审查只吸收影响正确性、安全、资源有界性、恢复能力或 contract honesty 的问题，低收益命名和风格意见不作为验收目标。
+早期四次 Claude Opus review 都在 5–10 分钟硬上限内没有输出，只能记为无证据的 `Execution error`，不能解释成“无问题”。后续两个有界源码审查 pass 成功返回，分别发现 Managed Service recovery guard 不对称、IPv6 policy bypass、迟到 cleanup 误删复用 conntrack，以及 allocation rollback 自锁四个高优先级问题，均已修复并进入真实 Linux 或定向回归验证。最终 pass 没有报告其他 blocker/high；它还指出 pre-acceptance 失败可能保留 attempt directory、reconcile discovery/open 之间存在一次性竞态，这两项不破坏已接受 Run 的事实或资源所有权，重试可收束，当前按低边际收益不扩张本 checkpoint。OCI ingress checkpoint 和本轮 schema-7 最终 checkpoint 各有一次 Claude Opus 5 review 在五分钟内没有输出，终止后返回 `Execution error`，因此同样没有审查证据。独立 subagent review 发现并推动修复了 checkpoint 可替换、reconcile 非幂等、runtime-start recovery 竞态、文档/公开 surface 不一致，以及上述 OCI ingress selector/overlap/PAX/FIFO/platform 五项缺口；最终 ingress 复核未发现剩余 blocker/high。审查只吸收影响正确性、安全、资源有界性、恢复能力或 contract honesty 的问题，低收益命名和风格意见不作为验收目标。
 
 ## 当前验证证据
 
@@ -311,36 +315,37 @@ Experiment、Matrix、scoring、causal judgment 与跨 Run orchestration 是产�
 ```text
 macOS:
 cargo fmt --check
-cargo check --all-targets --locked
+cargo check --all-targets --all-features --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo +1.95.0 check --all-targets --locked
 → passed
 
-cargo test --all-targets --all-features --locked
-→ unit 166 passed/2 ignored
-→ CLI contract 20 passed
+cargo test --all-targets --locked
+→ unit 172 passed/2 ignored
+→ CLI contract 21 passed
 → Image read integration 5 passed
 → OCI import/Catalog/GC integration 21 passed
 → backend/probe tests ignored by their declared environment gates
 
-Linux arm64, ordinary uid 501, Rust 1.95:
+Linux arm64 container, Rust 1.95:
+cargo +1.95.0 check --all-targets --all-features --locked
 cargo +1.95.0 clippy --all-targets --all-features --locked -- -D warnings
-cargo +1.95.0 test --all-targets --all-features --locked
-→ Clippy passed
-→ unit 225 passed/12 ignored
-→ CLI contract 20 passed
-→ Image read integration 5 passed
-→ OCI import/Catalog/GC integration 22 passed
-→ native/rootless/probe E2Es ignored by their declared host-capability gates
+→ passed; this is compile/lint evidence, not native/runc execution evidence
 
-cargo package --allow-dirty --locked
-→ verified 55 files, 1.8 MiB
+CARGO_TARGET_DIR=<isolated-temporary-target> cargo package --allow-dirty --locked
+→ verified 71 files, 1.8 MiB, 369285-byte crate
+→ archive contains native_backend/runc.rs, filesystem/pax.rs and image_ingress.rs
 
 cargo install --path . --locked --root <temporary-root>
-→ installed binary version/schema/invalid-command/missing-input separate-process checks passed
+→ installed binary help/version/schema/invalid-command/missing-input separate-process checks passed
 ```
 
-最新真实 Docker compatibility E2E 在当前代码路径上以 `debian:bookworm-slim` 通过，耗时 294.09 秒，覆盖 exact streams、目标非零 exit、capture limits、timeout、SIGINT、Final Image 和 terminal SQLite bytes。Docker 不是 native 或 VM 证据。
+最新真实 Docker compatibility E2E 在当前代码路径上以 `alpine:3.22` 通过，耗时 48.01 秒，覆盖 exact streams、目标非零 exit、capture limits、timeout、SIGINT、Final Image 和 terminal SQLite bytes。Docker 不是 native 或 VM 证据。
+
+一台 Debian 10 x86_64 普通用户开发机完成了当前 schema-7 static-musl binary 的 rootless control Run。冻结输入是 Pi 0.80.6 的单层 OCI Image Manifest `sha256:9418e6e70c576d57bb6d9eeff56d59a59f0c8a250a5c1dc4eaf44364b37ca66b`、Runtime Config SHA-256 `7bb10b963c58a3425604ec6c28a7275a9c61040eff00a661e6506b22d921f517`、`network=none`、60-second timeout 和 1 MiB stream limits。Run `run-01a02afd-71f2-7b21-99ff-fc333be56a89` 得到 exit 0、exact stdout `0.80.6\n`、empty stderr、Final Image available、零 operation error、`run verify`/`state verify` valid 与零 recovery residue；Terminal Run Record 保存了实际 runc artifact `sha256:df87472bcf881489d77480197f81339a14255fa470c594e1c3a05e5688401298` / 13509736 bytes。target process 只运行约 1.84 秒，但整个 350 MiB、包含大量 `node_modules` 的 materialize/capture 路径约需 6 分钟；这是当前 rootless Final Image 路径的性能边界，不能由 process 时间替代。
+
+同一开发机还保留两个 pre-acceptance 失败 arm。官方 runc 1.5.1 amd64 artifact 在定制 kernel release `5.4.143.bsk.8-amd64` 上由 libpathrs kernel-version parser panic；不含 libpathrs 的同 source build 继续后，多层 Pi Image 因早期 Layer 存在非零 owner 而被 rootless materializer 拒绝，即使 resolved filesystem 后续已 chown 回 0/0。单层 flattened Image 是独立的新 arm，不是对失败评估器的追加修改。两次失败都未创建 accepted Run。
+
+该主机只有 cgroup v1，没有 OverlayFS、nft/conntrack 或可用的 DeepSeek provider/model/credential；Pi 0.80.6 的真实非交互入口是 `pi -p`，但 rootless profile 明确禁止 egress 和 read-only credential mount。因此该结果只证明 Pi package 能在 RunLab rootless OCI Run 中执行和产生 Final Image，不是 DeepSeek Agent task 或 Managed Service 证据。
 
 最新 Linux release binary SHA-256 为 `f0128ef92c7ccdd4eed7620cb10a483da2ffb8a26b08007925066c40c5192dd1`，在一个从固定 Ubuntu 24.04 arm64 image 新建、没有手工预配置的 Lima 2.2.0 VM 中安装并通过 runc 1.5.1 identity 和 reference-profile 检查。该 VM 上的最新 binary 复验了：
 

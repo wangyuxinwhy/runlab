@@ -25,6 +25,7 @@ impl HostVm {
 
     pub fn status(&self) -> Result<VmStatus> {
         let instance = self.inspect_instance()?;
+        self.validate_instance(&instance)?;
         let image = selected_instance_image(&instance)?;
         let (handshake, handshake_error) = if instance.status == "Running" {
             match self.handshake() {
@@ -289,7 +290,7 @@ impl HostVm {
     }
 
     pub fn operation_status(&self, operation_id: Uuid) -> Result<VmOperationStatus> {
-        self.ensure_ready()?;
+        self.ensure_ready_without_start()?;
         let binary = guest_binary_path();
         self.guest_json([
             binary.as_str(),
@@ -323,11 +324,14 @@ impl HostVm {
 
     pub fn attach(&self, operation_id: Uuid, outputs: &[PathBuf]) -> Result<AttachedOperation> {
         self.ensure_ready()?;
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let registrations = register_interrupts(Arc::clone(&interrupted))?;
+        let interrupted = TerminationFlag::register()?;
+        let mut cancellation_delivered = false;
         let status = loop {
-            if interrupted.swap(false, Ordering::SeqCst) {
-                let _ = self.cancel(operation_id);
+            if !cancellation_delivered && interrupted.flag().load(Ordering::SeqCst) {
+                self.cancel(operation_id).with_context(|| {
+                    format!("failed to cancel guest operation {operation_id} after interruption")
+                })?;
+                cancellation_delivered = true;
             }
             let status = self.operation_status(operation_id)?;
             if status.terminal {
@@ -335,8 +339,6 @@ impl HostVm {
             }
             thread::sleep(Duration::from_millis(300));
         };
-        unregister_interrupts(registrations);
-
         let stdout = self.read_operation_stream(operation_id, "stdout", MAX_GUEST_STREAM)?;
         let stderr = self.read_operation_stream(operation_id, "stderr", MAX_GUEST_STREAM)?;
         if outputs.len() != status.output_count {
@@ -416,30 +418,39 @@ impl HostVm {
     }
 
     fn ensure_ready(&self) -> Result<VmHandshake> {
-        let status = self.start()?;
-        ensure!(
-            status.status == "Running",
-            "managed VM did not reach Running state"
-        );
-        let handshake = status.handshake.context(
-            status
-                .handshake_error
-                .unwrap_or_else(|| "guest RunLab handshake is unavailable".to_owned()),
-        )?;
-        let _ = status.runc.context(
-            status
-                .runc_error
-                .unwrap_or_else(|| "guest runc identity is unavailable".to_owned()),
-        )?;
-        let profile = status.reference_profile.context(
-            status
-                .reference_profile_error
-                .unwrap_or_else(|| "guest reference profile is unavailable".to_owned()),
-        )?;
-        validate_reference_profile(&profile)?;
-        Ok(handshake)
+        ready_handshake(self.start()?)
     }
 
+    fn ensure_ready_without_start(&self) -> Result<VmHandshake> {
+        ready_handshake(self.status()?)
+    }
+}
+
+fn ready_handshake(status: VmStatus) -> Result<VmHandshake> {
+    ensure!(
+        status.status == "Running",
+        "managed VM is not running; start it explicitly with `runlab vm start`"
+    );
+    let handshake = status.handshake.context(
+        status
+            .handshake_error
+            .unwrap_or_else(|| "guest RunLab handshake is unavailable".to_owned()),
+    )?;
+    let _ = status.runc.context(
+        status
+            .runc_error
+            .unwrap_or_else(|| "guest runc identity is unavailable".to_owned()),
+    )?;
+    let profile = status.reference_profile.context(
+        status
+            .reference_profile_error
+            .unwrap_or_else(|| "guest reference profile is unavailable".to_owned()),
+    )?;
+    validate_reference_profile(&profile)?;
+    Ok(handshake)
+}
+
+impl HostVm {
     fn handshake(&self) -> Result<VmHandshake> {
         self.handshake_at(&guest_binary_path())
     }
@@ -459,18 +470,24 @@ impl HostVm {
 
     fn provision_reference_profile(&self, operation_id: Uuid) -> Result<VmReferenceProfile> {
         if self.guest_package_version("conntrack")?.as_deref() != Some(CONNTRACK_PACKAGE_VERSION) {
-            self.guest_status(["/usr/bin/sudo", "/usr/bin/apt-get", "update"])?;
-            self.guest_status([
-                "/usr/bin/sudo",
-                "/usr/bin/env",
-                "DEBIAN_FRONTEND=noninteractive",
-                "/usr/bin/apt-get",
-                "install",
-                "--yes",
-                "--no-install-recommends",
-                "--allow-downgrades",
-                &format!("conntrack={CONNTRACK_PACKAGE_VERSION}"),
-            ])?;
+            self.guest_status_with_timeout(
+                ["/usr/bin/sudo", "/usr/bin/apt-get", "update"],
+                VM_MUTATION_TIMEOUT,
+            )?;
+            self.guest_status_with_timeout(
+                [
+                    "/usr/bin/sudo",
+                    "/usr/bin/env",
+                    "DEBIAN_FRONTEND=noninteractive",
+                    "/usr/bin/apt-get",
+                    "install",
+                    "--yes",
+                    "--no-install-recommends",
+                    "--allow-downgrades",
+                    &format!("conntrack={CONNTRACK_PACKAGE_VERSION}"),
+                ],
+                VM_MUTATION_TIMEOUT,
+            )?;
         }
 
         ensure!(
@@ -715,8 +732,8 @@ impl HostVm {
         let mut temporary = NamedTempFile::new_in(parent)
             .with_context(|| format!("cannot stage output beside {}", destination.display()))?;
         let binary = guest_binary_path();
-        let output = Command::new(&self.limactl)
-            .args([
+        let output = bounded_status_with_stdout(
+            Command::new(&self.limactl).args([
                 "--tty=false",
                 "shell",
                 &self.instance,
@@ -728,11 +745,12 @@ impl HostVm {
                 "output",
                 "--index",
                 &index.to_string(),
-            ])
-            .stdout(Stdio::from(temporary.reopen()?))
-            .stderr(Stdio::piped())
-            .output()
-            .context("failed to read staged guest output")?;
+            ]),
+            Stdio::from(temporary.reopen()?),
+            VM_TRANSFER_TIMEOUT,
+            MAX_CONTROL_OUTPUT,
+            "guest output transfer",
+        )?;
         ensure_status(&output, "guest output transfer")?;
         temporary.flush()?;
         let local = file_identity(temporary.path())?;
@@ -862,12 +880,15 @@ impl HostVm {
 
     fn copy_to_guest(&self, source: &Path, destination: &str) -> Result<()> {
         let remote = format!("{}:{destination}", self.instance);
-        self.limactl_status([
-            OsStr::new("copy"),
-            OsStr::new("--backend=scp"),
-            source.as_os_str(),
-            OsStr::new(&remote),
-        ])
+        self.limactl_status_with_timeout(
+            [
+                OsStr::new("copy"),
+                OsStr::new("--backend=scp"),
+                source.as_os_str(),
+                OsStr::new(&remote),
+            ],
+            VM_TRANSFER_TIMEOUT,
+        )
     }
 
     fn guest_json<T: for<'de> Deserialize<'de>, I, S>(&self, arguments: I) -> Result<T>
@@ -891,6 +912,16 @@ impl HostVm {
         self.guest_output(arguments).map(|_| ())
     }
 
+    fn guest_status_with_timeout<I, S>(&self, arguments: I, timeout: Duration) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.guest_unchecked_output_with_timeout(arguments, timeout)?;
+        ensure_status(&output, "Lima guest command")?;
+        Ok(())
+    }
+
     fn guest_output<I, S>(&self, arguments: I) -> Result<Output>
     where
         I: IntoIterator<Item = S>,
@@ -906,12 +937,28 @@ impl HostVm {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.guest_unchecked_output_with_timeout(arguments, VM_CONTROL_TIMEOUT)
+    }
+
+    fn guest_unchecked_output_with_timeout<I, S>(
+        &self,
+        arguments: I,
+        timeout: Duration,
+    ) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut command = Command::new(&self.limactl);
         command.args(["--tty=false", "shell", &self.instance]);
         command.args(arguments);
-        command
-            .output()
-            .context("failed to invoke Lima guest command")
+        bounded_output(
+            &mut command,
+            None,
+            timeout,
+            MAX_CONTROL_OUTPUT,
+            "Lima guest command",
+        )
     }
 
     fn limactl_output<I, S>(&self, arguments: I) -> Result<Output>
@@ -919,10 +966,15 @@ impl HostVm {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = Command::new(&self.limactl)
-            .args(arguments)
-            .output()
-            .context("failed to invoke limactl")?;
+        let mut command = Command::new(&self.limactl);
+        command.args(arguments);
+        let output = bounded_output(
+            &mut command,
+            None,
+            VM_MUTATION_TIMEOUT,
+            MAX_CONTROL_OUTPUT,
+            "limactl",
+        )?;
         ensure_status(&output, "limactl")?;
         Ok(output)
     }
@@ -935,26 +987,32 @@ impl HostVm {
         self.limactl_output(arguments).map(|_| ())
     }
 
+    fn limactl_status_with_timeout<I, S>(&self, arguments: I, timeout: Duration) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut command = Command::new(&self.limactl);
+        command.args(arguments);
+        let output = bounded_output(&mut command, None, timeout, MAX_CONTROL_OUTPUT, "limactl")?;
+        ensure_status(&output, "limactl")?;
+        Ok(())
+    }
+
     fn limactl_output_with_stdin<I, S>(&self, arguments: I, stdin: &[u8]) -> Result<Output>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut child = Command::new(&self.limactl)
-            .args(arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to invoke limactl")?;
-        child
-            .stdin
-            .take()
-            .context("limactl stdin is unavailable")?
-            .write_all(stdin)?;
-        let output = child
-            .wait_with_output()
-            .context("failed to wait for limactl")?;
+        let mut command = Command::new(&self.limactl);
+        command.args(arguments);
+        let output = bounded_output(
+            &mut command,
+            Some(stdin),
+            VM_MUTATION_TIMEOUT,
+            MAX_CONTROL_OUTPUT,
+            "limactl",
+        )?;
         ensure_status(&output, "limactl")?;
         Ok(output)
     }
@@ -967,19 +1025,18 @@ fn publish_staged_outputs(staged: Vec<StagedOutput>) -> Result<()> {
         if let Err(error) = output.temporary.persist_noclobber(&destination) {
             let publication_error = anyhow::Error::new(error.error)
                 .context(format!("cannot persist output {}", destination.display()));
-            let mut rollback_errors = Vec::new();
-            for path in published.iter().rev() {
-                if let Err(error) = fs::remove_file(path) {
-                    rollback_errors.push(format!("{}: {error}", path.display()));
-                }
+            if published.is_empty() {
+                return Err(publication_error);
             }
-            if !rollback_errors.is_empty() {
-                return Err(publication_error.context(format!(
-                    "output publication rollback failed: {}",
-                    rollback_errors.join("; ")
-                )));
-            }
-            return Err(publication_error);
+            return Err(publication_error.context(format!(
+                "{} preceding output(s) were already published and retained: {}",
+                published.len(),
+                published
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
         published.push(destination);
     }
@@ -1000,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_failure_rolls_back_every_preceding_destination() {
+    fn publication_failure_retains_preceding_destinations() {
         let directory = tempfile::tempdir().unwrap();
         let collision = directory.path().join("collision");
         fs::write(&collision, b"owner").unwrap();
@@ -1011,8 +1068,8 @@ mod tests {
         ];
 
         assert!(publish_staged_outputs(outputs).is_err());
-        assert!(!directory.path().join("first").exists());
-        assert!(!directory.path().join("second").exists());
+        assert_eq!(fs::read(directory.path().join("first")).unwrap(), b"one");
+        assert_eq!(fs::read(directory.path().join("second")).unwrap(), b"two");
         assert_eq!(fs::read(collision).unwrap(), b"owner");
     }
 
@@ -1027,5 +1084,32 @@ mod tests {
         publish_staged_outputs(outputs).unwrap();
         assert_eq!(fs::read(directory.path().join("first")).unwrap(), b"one");
         assert_eq!(fs::read(directory.path().join("second")).unwrap(), b"two");
+    }
+
+    #[test]
+    fn read_only_operation_requires_an_explicit_vm_start() {
+        let status = VmStatus {
+            schema_version: 1,
+            instance: "runlab".to_owned(),
+            status: "Stopped".to_owned(),
+            lima_version: LIMA_VERSION.to_owned(),
+            vm_type: "vz".to_owned(),
+            architecture: normalize_architecture(env::consts::ARCH).to_owned(),
+            plain: true,
+            mounts: 0,
+            image: VmImage {
+                location: "https://example.invalid/image".to_owned(),
+                digest: format!("sha256:{}", "0".repeat(64)).parse().unwrap(),
+            },
+            handshake: None,
+            handshake_error: None,
+            runc: None,
+            runc_error: None,
+            reference_profile: None,
+            reference_profile_error: None,
+        };
+
+        let error = ready_handshake(status).expect_err("stopped VM");
+        assert!(error.to_string().contains("runlab vm start"));
     }
 }

@@ -1,147 +1,42 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read, Seek, Write};
-use std::os::unix::ffi::OsStrExt as _;
-use std::path::{Path, PathBuf};
+use std::io::Seek;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use flate2::{Compression, GzBuilder};
-use sha2::{Digest as _, Sha256};
-use tar::{Builder, EntryType, Header, HeaderMode};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::NamedTempFile;
 
 use crate::core::{Digest, OCI_LAYER_GZIP, OciDescriptor};
-use crate::filesystem::{EntryKind, FsEntry, FsPath};
-use crate::oci::{OciLayout, digest_reader};
-use crate::pax::{self, DEFAULT_MAX_PAX_BYTES, PaxRecords};
+#[cfg(test)]
+use crate::filesystem::pax_timestamp;
+use crate::filesystem::{ContentStore, FilesystemTarWriter, FsPath};
+use crate::integrity::digest_reader;
+#[cfg(test)]
+use crate::oci::OciLayout;
 
 use super::ChangeSet;
 
 const MAX_PATH_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug)]
-pub(crate) struct ContentStore {
-    #[cfg_attr(
-        not(any(test, target_os = "linux")),
-        allow(dead_code, reason = "production filesystem capture is Linux-only")
-    )]
-    directory: Option<TempDir>,
-    paths: BTreeMap<Digest, PathBuf>,
-}
-
-impl ContentStore {
-    pub(crate) fn new() -> Result<Self> {
-        Self::create(tempfile::Builder::new().prefix("runlab-content-").tempdir())
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn new_in(parent: &Path) -> Result<Self> {
-        Self::create(
-            tempfile::Builder::new()
-                .prefix("content-")
-                .tempdir_in(parent),
-        )
-    }
-
-    fn create(directory: std::io::Result<TempDir>) -> Result<Self> {
-        Ok(Self {
-            directory: Some(directory.context("failed to create changeset content store")?),
-            paths: BTreeMap::new(),
-        })
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn digest_only() -> Self {
-        Self {
-            directory: None,
-            paths: BTreeMap::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn put_bytes(&mut self, bytes: &[u8]) -> Result<Digest> {
-        self.put_reader(bytes).map(|(digest, _)| digest)
-    }
-
-    #[cfg_attr(
-        not(any(test, target_os = "linux")),
-        allow(dead_code, reason = "production filesystem capture is Linux-only")
-    )]
-    pub(crate) fn put_reader(&mut self, mut reader: impl Read) -> Result<(Digest, u64)> {
-        let mut temporary = self
-            .directory
-            .as_ref()
-            .map(|directory| NamedTempFile::new_in(directory.path()))
-            .transpose()
-            .context("failed to stage changeset content")?;
-        let mut hasher = Sha256::new();
-        let mut size = 0_u64;
-        let mut buffer = vec![0_u8; 1024 * 1024];
-        loop {
-            let read = reader
-                .read(&mut buffer)
-                .context("failed to read changeset content")?;
-            if read == 0 {
-                break;
-            }
-            if let Some(temporary) = &mut temporary {
-                temporary
-                    .write_all(&buffer[..read])
-                    .context("failed to write changeset content")?;
-            }
-            hasher.update(&buffer[..read]);
-            size = size
-                .checked_add(u64::try_from(read).context("changeset content size overflow")?)
-                .context("changeset content size overflow")?;
-        }
-        let digest = crate::integrity::finish_sha256(hasher);
-        if self.paths.contains_key(&digest) {
-            return Ok((digest, size));
-        }
-        let Some(mut temporary) = temporary else {
-            return Ok((digest, size));
-        };
-        temporary
-            .as_file_mut()
-            .sync_all()
-            .context("failed to fsync changeset content")?;
-        let path = self
-            .directory
-            .as_ref()
-            .expect("content-backed store has a directory")
-            .path()
-            .join(digest.hex());
-        temporary
-            .persist_noclobber(&path)
-            .map_err(|error| error.error)
-            .context("failed to publish changeset content")?;
-        self.paths.insert(digest.clone(), path);
-        Ok((digest, size))
-    }
-
-    pub(crate) fn open(&self, digest: &Digest, expected_size: u64) -> Result<File> {
-        let path = self
-            .paths
-            .get(digest)
-            .with_context(|| format!("changeset content is unavailable: {digest}"))?;
-        let mut file = File::open(path)
-            .with_context(|| format!("failed to open changeset content: {digest}"))?;
-        let (actual, size) = digest_reader(&mut file)?;
-        if &actual != digest || size != expected_size {
-            bail!(
-                "changeset content failed verification for {digest}: size {size}, expected {expected_size}"
-            );
-        }
-        file.rewind()?;
-        Ok(file)
-    }
-}
-
-#[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct EncodedLayer {
     pub(crate) descriptor: OciDescriptor,
     pub(crate) diff_id: Digest,
+}
+
+#[derive(Debug)]
+pub(crate) struct StagedLayer {
+    pub(crate) descriptor: OciDescriptor,
+    pub(crate) diff_id: Digest,
+    compressed: NamedTempFile,
+}
+
+impl StagedLayer {
+    pub(crate) fn reader(&mut self) -> &mut File {
+        self.compressed.as_file_mut()
+    }
 }
 
 #[derive(Debug)]
@@ -158,33 +53,46 @@ impl Default for LayerEncoder {
 }
 
 impl LayerEncoder {
+    #[cfg(test)]
     pub(crate) fn encode(
         &self,
         layout: &OciLayout,
         changes: &ChangeSet,
         contents: &ContentStore,
     ) -> Result<EncodedLayer> {
-        self.encode_with(layout, changes, contents, None)
+        let mut staged = self.stage_with(changes, contents, None)?;
+        let expected = staged.descriptor.clone();
+        let descriptor = layout.put_reader(staged.reader(), OCI_LAYER_GZIP, Some(&expected))?;
+        Ok(EncodedLayer {
+            descriptor,
+            diff_id: staged.diff_id,
+        })
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn encode_in(
+    pub(crate) fn stage_in(
         &self,
-        layout: &OciLayout,
         changes: &ChangeSet,
         contents: &ContentStore,
         staging_parent: &Path,
-    ) -> Result<EncodedLayer> {
-        self.encode_with(layout, changes, contents, Some(staging_parent))
+    ) -> Result<StagedLayer> {
+        self.stage_with(changes, contents, Some(staging_parent))
     }
 
-    fn encode_with(
+    pub(crate) fn stage(
         &self,
-        layout: &OciLayout,
+        changes: &ChangeSet,
+        contents: &ContentStore,
+    ) -> Result<StagedLayer> {
+        self.stage_with(changes, contents, None)
+    }
+
+    fn stage_with(
+        &self,
         changes: &ChangeSet,
         contents: &ContentStore,
         staging_parent: Option<&Path>,
-    ) -> Result<EncodedLayer> {
+    ) -> Result<StagedLayer> {
         let mut uncompressed = temporary_in(staging_parent)
             .context("failed to create uncompressed changeset Layer")?;
         Self::write_tar(uncompressed.as_file_mut(), changes, contents)?;
@@ -213,10 +121,16 @@ impl LayerEncoder {
             .sync_all()
             .context("failed to fsync compressed changeset Layer")?;
         compressed.rewind()?;
-        let descriptor = layout.put_reader(compressed.as_file_mut(), OCI_LAYER_GZIP, None)?;
-        Ok(EncodedLayer {
-            descriptor,
+        let (digest, size) = digest_reader(compressed.as_file_mut())?;
+        compressed.rewind()?;
+        Ok(StagedLayer {
+            descriptor: OciDescriptor {
+                digest,
+                size,
+                media_type: OCI_LAYER_GZIP.to_owned(),
+            },
             diff_id,
+            compressed,
         })
     }
 
@@ -242,241 +156,22 @@ impl LayerEncoder {
             }
         }
 
-        {
-            let mut builder = Builder::new(destination);
-            builder.mode(HeaderMode::Deterministic);
-            if let Some(metadata) = changes.root() {
-                append_metadata_extensions(&mut builder, metadata)?;
-                append_directory(&mut builder, Path::new("."), "/", metadata)?;
-            }
-            for path in whiteouts {
-                let mut header = header(0, 0, 0, 0, 0, EntryType::Regular)?;
-                builder
-                    .append_data(&mut header, path_buf(&path), std::io::empty())
-                    .with_context(|| format!("failed to write whiteout {}", path.display()))?;
-            }
-            for (path, entry) in changes.entries() {
-                append_entry(&mut builder, path, entry, contents)?;
-            }
-            builder
-                .finish()
-                .context("failed to finish changeset Layer")?;
+        let mut writer = FilesystemTarWriter::new(destination);
+        if let Some(metadata) = changes.root() {
+            writer.append_root(metadata)?;
         }
-        Ok(())
+        for path in whiteouts {
+            writer.append_empty_regular(&path)?;
+        }
+        for (path, entry) in changes.entries() {
+            writer.append_entry(path, entry, contents)?;
+        }
+        writer.finish()
     }
 }
 
 fn temporary_in(parent: Option<&Path>) -> std::io::Result<NamedTempFile> {
     parent.map_or_else(NamedTempFile::new, NamedTempFile::new_in)
-}
-
-fn append_entry(
-    builder: &mut Builder<&mut File>,
-    path: &FsPath,
-    entry: &FsEntry,
-    contents: &ContentStore,
-) -> Result<()> {
-    append_metadata_extensions(builder, &entry.metadata)?;
-    let mtime = base_mtime(entry.metadata.mtime);
-    match &entry.kind {
-        EntryKind::Regular {
-            digest,
-            size,
-            hardlink: None,
-        } => {
-            let mut file = contents.open(digest, *size)?;
-            let mut header = header(
-                *size,
-                entry.metadata.mode,
-                entry.metadata.uid,
-                entry.metadata.gid,
-                mtime,
-                EntryType::Regular,
-            )?;
-            builder
-                .append_data(&mut header, path_buf(path), &mut file)
-                .with_context(|| format!("failed to write regular file {}", path.display()))?;
-        }
-        EntryKind::Directory => {
-            append_directory(builder, &path_buf(path), &path.display(), &entry.metadata)?;
-        }
-        EntryKind::Regular {
-            hardlink: Some(target),
-            ..
-        } => {
-            let mut header = header(
-                0,
-                entry.metadata.mode,
-                entry.metadata.uid,
-                entry.metadata.gid,
-                mtime,
-                EntryType::Link,
-            )?;
-            append_link(builder, &mut header, path, target.as_bytes())
-                .with_context(|| format!("failed to write hardlink {}", path.display()))?;
-        }
-        EntryKind::Symlink { target } => {
-            if target.contains(&0) {
-                bail!("symlink target contains NUL: {}", path.display());
-            }
-            let mut header = header(
-                0,
-                entry.metadata.mode,
-                entry.metadata.uid,
-                entry.metadata.gid,
-                mtime,
-                EntryType::Symlink,
-            )?;
-            append_link(builder, &mut header, path, target)
-                .with_context(|| format!("failed to write symlink {}", path.display()))?;
-        }
-        EntryKind::Fifo => {
-            append_special(builder, path, entry, EntryType::Fifo, None)?;
-        }
-        EntryKind::Character { major, minor } => {
-            append_special(
-                builder,
-                path,
-                entry,
-                EntryType::Char,
-                Some((*major, *minor)),
-            )?;
-        }
-        EntryKind::Block { major, minor } => {
-            append_special(
-                builder,
-                path,
-                entry,
-                EntryType::Block,
-                Some((*major, *minor)),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn append_directory(
-    builder: &mut Builder<&mut File>,
-    archive_path: &Path,
-    display: &str,
-    metadata: &crate::filesystem::Metadata,
-) -> Result<()> {
-    let mut header = header(
-        0,
-        metadata.mode,
-        metadata.uid,
-        metadata.gid,
-        base_mtime(metadata.mtime),
-        EntryType::Directory,
-    )?;
-    builder
-        .append_data(&mut header, archive_path, std::io::empty())
-        .with_context(|| format!("failed to write directory {display}"))
-}
-
-fn append_special(
-    builder: &mut Builder<&mut File>,
-    path: &FsPath,
-    entry: &FsEntry,
-    entry_type: EntryType,
-    device: Option<(u32, u32)>,
-) -> Result<()> {
-    let mut header = header(
-        0,
-        entry.metadata.mode,
-        entry.metadata.uid,
-        entry.metadata.gid,
-        base_mtime(entry.metadata.mtime),
-        entry_type,
-    )?;
-    if let Some((major, minor)) = device {
-        header.set_device_major(major)?;
-        header.set_device_minor(minor)?;
-        header.set_cksum();
-    }
-    builder
-        .append_data(&mut header, path_buf(path), std::io::empty())
-        .with_context(|| format!("failed to write special entry {}", path.display()))
-}
-
-fn append_link(
-    builder: &mut Builder<&mut File>,
-    header: &mut Header,
-    path: &FsPath,
-    target: &[u8],
-) -> Result<()> {
-    if header.set_link_name_literal(target).is_err() {
-        append_gnu_long_link(builder, target)?;
-    }
-    builder
-        .append_data(header, path_buf(path), std::io::empty())
-        .map_err(Into::into)
-}
-
-fn append_gnu_long_link(builder: &mut Builder<&mut File>, target: &[u8]) -> Result<()> {
-    let size = u64::try_from(target.len())?
-        .checked_add(1)
-        .context("GNU long-link target size overflow")?;
-    let mut header = header(0, 0o644, 0, 0, 0, EntryType::GNULongLink)?;
-    header.set_path("././@LongLink")?;
-    header.set_size(size);
-    header.set_cksum();
-    let data = target.iter().copied().chain(std::iter::once(0));
-    builder
-        .append(&header, data.collect::<Vec<_>>().as_slice())
-        .context("failed to write GNU long-link extension")
-}
-
-fn append_metadata_extensions(
-    builder: &mut Builder<&mut File>,
-    metadata: &crate::filesystem::Metadata,
-) -> Result<()> {
-    let mut records = PaxRecords::default();
-    if metadata.mtime.seconds < 0 || metadata.mtime.nanos != 0 {
-        let mtime = pax_timestamp(metadata.mtime);
-        records.insert(b"mtime", mtime.as_bytes())?;
-    }
-    pax::insert_xattrs(&mut records, &metadata.xattrs)?;
-    pax::append_header(builder, &records, DEFAULT_MAX_PAX_BYTES)
-        .context("failed to write PAX metadata")
-}
-
-fn base_mtime(timestamp: crate::filesystem::Timestamp) -> u64 {
-    u64::try_from(timestamp.seconds).unwrap_or(0)
-}
-
-fn pax_timestamp(timestamp: crate::filesystem::Timestamp) -> String {
-    let nanos = i128::from(timestamp.seconds) * 1_000_000_000 + i128::from(timestamp.nanos);
-    let negative = nanos < 0;
-    let absolute = nanos.unsigned_abs();
-    let seconds = absolute / 1_000_000_000;
-    let fraction = absolute % 1_000_000_000;
-    if fraction == 0 {
-        return format!("{}{seconds}", if negative { "-" } else { "" });
-    }
-    let fraction = format!("{fraction:09}").trim_end_matches('0').to_owned();
-    format!("{}{seconds}.{fraction}", if negative { "-" } else { "" })
-}
-
-fn header(
-    size: u64,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    mtime: u64,
-    entry_type: EntryType,
-) -> Result<Header> {
-    let mut header = Header::new_gnu();
-    header.set_size(size);
-    header.set_mode(mode);
-    header.set_uid(u64::from(uid));
-    header.set_gid(u64::from(gid));
-    header.set_mtime(mtime);
-    header.set_entry_type(entry_type);
-    header.set_username("")?;
-    header.set_groupname("")?;
-    header.set_cksum();
-    Ok(header)
 }
 
 fn whiteout_path(path: &FsPath) -> Result<FsPath> {
@@ -504,20 +199,17 @@ fn reject_reserved_name(path: &FsPath) -> Result<()> {
     Ok(())
 }
 
-fn path_buf(path: &FsPath) -> PathBuf {
-    Path::new(OsStr::from_bytes(path.as_bytes())).to_path_buf()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::io::Read as _;
 
     use flate2::read::MultiGzDecoder;
-    use tar::Archive;
+    use tar::{Archive, EntryType};
 
     use super::*;
-    use crate::filesystem::{Inventory, Metadata, Timestamp};
+    use crate::filesystem::pax::DEFAULT_MAX_PAX_BYTES;
+    use crate::filesystem::{EntryKind, FsEntry, Inventory, Metadata, Timestamp};
 
     #[test]
     fn layer_encoding_is_deterministic_and_raw_path_sorted() {
@@ -590,9 +282,9 @@ mod tests {
         MultiGzDecoder::new(compressed.as_slice())
             .read_to_end(&mut uncompressed)
             .expect("gzip");
-        let index = crate::pax::scan_tar(
+        let index = crate::filesystem::pax::scan_tar(
             uncompressed.as_slice(),
-            crate::pax::TarPaxLimits {
+            crate::filesystem::pax::TarPaxLimits {
                 entries: 1,
                 total_bytes: u64::try_from(uncompressed.len()).expect("tar length"),
                 pax_bytes: DEFAULT_MAX_PAX_BYTES,
@@ -602,7 +294,10 @@ mod tests {
         .expect("PAX scan");
         let records = index.get(0).expect("file records").expect("PAX records");
         assert_eq!(records.get(b"mtime"), Some(b"-0.5".as_slice()));
-        assert_eq!(crate::pax::decode_xattrs(records).expect("xattrs"), xattrs);
+        assert_eq!(
+            crate::filesystem::pax::decode_xattrs(records).expect("xattrs"),
+            xattrs
+        );
 
         let mut archive = Archive::new(uncompressed.as_slice());
         let entry = archive

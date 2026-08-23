@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use tar::{Builder, EntryType, Header};
 use thiserror::Error;
 
-use crate::filesystem::{Timestamp, Xattrs};
+use super::{Timestamp, Xattrs};
 
 pub(crate) const DEFAULT_MAX_PAX_BYTES: u64 = 1024 * 1024;
 const BLOCK_BYTES: u64 = 512;

@@ -841,9 +841,9 @@ mod tests {
 
     use tar::{EntryType, Header};
 
-    use crate::changeset::{ContentStore, LayerEncoder, compare};
+    use crate::changeset::{LayerEncoder, compare};
     use crate::core::{Architecture, Digest, OCI_IMAGE_CONFIG, OCI_LAYER_TAR, Platform};
-    use crate::filesystem::{EntryKind, FsEntry, Inventory, TreeCapture};
+    use crate::filesystem::{ContentStore, EntryKind, FsEntry, Inventory, TreeCapture};
     use crate::integrity::digest_bytes;
     use crate::render::{materialization_content_passes, reset_materialization_content_passes};
 

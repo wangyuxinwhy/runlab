@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -11,11 +11,12 @@ use tempfile::NamedTempFile;
 
 use crate::core::{Digest, OCI_IMAGE_INDEX, OCI_IMAGE_MANIFEST, OciDescriptor, Platform};
 use crate::integrity::{
-    canonical_json, ensure_private_directory, finish_sha256, open_regular_lock,
+    canonical_json, digest_reader, ensure_private_directory, finish_sha256, open_regular_lock,
 };
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_LAYERS: usize = 1024;
 const MAX_STORE_ENTRIES: usize = 1_000_000;
 const REFERENCE_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 
@@ -624,27 +625,6 @@ fn open_regular_nofollow(path: &Path) -> Result<File> {
         bail!("OCI blob is not a regular file: {}", path.display());
     }
     Ok(file)
-}
-
-pub fn digest_reader(reader: impl Read) -> Result<(Digest, u64)> {
-    let mut reader = BufReader::with_capacity(COPY_BUFFER_BYTES, reader);
-    let mut hasher = Sha256::new();
-    let mut size = 0_u64;
-    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .context("failed to read bytes for digest")?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        size = size
-            .checked_add(u64::try_from(read).context("digest size overflow")?)
-            .context("digest size overflow")?;
-    }
-    let digest = finish_sha256(hasher);
-    Ok((digest, size))
 }
 
 fn copy_and_digest(mut reader: impl Read, destination: &mut File) -> Result<(Digest, u64)> {

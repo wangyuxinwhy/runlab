@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +19,25 @@ pub fn digest_bytes(bytes: &[u8]) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     finish_sha256(hasher)
+}
+
+pub fn digest_reader(mut reader: impl Read) -> Result<(Digest, u64)> {
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .context("failed to read bytes for digest")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size
+            .checked_add(u64::try_from(read).context("digest size overflow")?)
+            .context("digest size overflow")?;
+    }
+    Ok((finish_sha256(hasher), size))
 }
 
 pub fn finish_sha256(hasher: Sha256) -> Digest {

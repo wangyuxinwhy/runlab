@@ -16,7 +16,7 @@ use crate::core::{
     OCI_LAYER_TAR, OCI_LAYER_ZSTD, OciDescriptor, Platform,
 };
 use crate::integrity::digest_bytes;
-use crate::oci::OciLayout;
+use crate::oci::{MAX_IMAGE_LAYERS, OciLayout};
 
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -26,7 +26,6 @@ const MAX_ARCHIVE_PATH_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INDEX_DEPTH: u32 = 32;
 const MAX_GRAPH_DESCRIPTORS: usize = 100_000;
 const MAX_IMAGE_MANIFESTS: usize = 1024;
-const MAX_IMAGE_LAYERS: usize = 1024;
 const TAR_BLOCK_BYTES: u64 = 512;
 const TAR_BLOCK_LENGTH: usize = 512;
 const REFERENCE_ANNOTATION: &str = "org.opencontainers.image.ref.name";
@@ -1160,10 +1159,11 @@ fn validate_archive_header(
     let size = header
         .entry_size()
         .context("OCI archive header has an invalid entry size")?;
-    if entry_type.is_pax_local_extensions() && size > crate::pax::DEFAULT_MAX_PAX_BYTES {
+    if entry_type.is_pax_local_extensions() && size > crate::filesystem::pax::DEFAULT_MAX_PAX_BYTES
+    {
         bail!(
             "OCI archive PAX payload exceeds the {}-byte limit",
-            crate::pax::DEFAULT_MAX_PAX_BYTES
+            crate::filesystem::pax::DEFAULT_MAX_PAX_BYTES
         );
     }
     if entry_type.is_pax_local_extensions() {
@@ -1171,7 +1171,10 @@ fn validate_archive_header(
         let mut payload = vec![0_u8; size];
         file.read_exact(&mut payload)
             .context("failed to read OCI archive PAX payload")?;
-        let records = crate::pax::PaxRecords::parse(&payload, crate::pax::DEFAULT_MAX_PAX_BYTES)?;
+        let records = crate::filesystem::pax::PaxRecords::parse(
+            &payload,
+            crate::filesystem::pax::DEFAULT_MAX_PAX_BYTES,
+        )?;
         if records.contains_key(b"size") {
             bail!("OCI archive PAX size overrides are unsupported");
         }

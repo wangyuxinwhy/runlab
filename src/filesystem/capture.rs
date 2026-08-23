@@ -11,7 +11,7 @@ use rustix::fs::{
     llistxattr, major, minor, open, openat, readlinkat, statat,
 };
 
-use crate::changeset::ContentStore;
+use crate::filesystem::ContentStore;
 
 use super::inventory::{Timestamp, Xattrs};
 use super::{EntryKind, FilesystemOwnership, FsEntry, FsPath, Inventory, Metadata};
@@ -711,7 +711,10 @@ mod tests {
         assert_eq!(*size, 14);
         assert_eq!(*digest, crate::integrity::digest_bytes(b"captured bytes"));
         let file = captured.contents.open(digest, *size).expect("content");
-        assert_eq!(crate::oci::digest_reader(file).expect("digest").0, *digest);
+        assert_eq!(
+            crate::integrity::digest_reader(file).expect("digest").0,
+            *digest
+        );
     }
 
     #[test]

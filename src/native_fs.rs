@@ -240,6 +240,9 @@ impl Drop for OverlayRootfs {
         if !self.mounted {
             return;
         }
+        // Durable recovery calls preserve(), which clears mounted before Drop. This lazy detach is
+        // only rollback for a still locally owned mount during unwinding; it never proves cleanup
+        // to the recovery journal and never replaces the checked unmount path.
         let _ = unmount(&self.target, UnmountFlags::DETACH);
     }
 }
@@ -258,6 +261,12 @@ fn read_mountinfo() -> Result<Vec<MountInfo>> {
         .filter(|line| !line.is_empty())
         .map(parse_mountinfo)
         .collect()
+}
+
+pub(crate) fn mounted_as(mountpoint: &Path, filesystem: &str) -> Result<bool> {
+    Ok(read_mountinfo()?.into_iter().any(|mount| {
+        mount.mountpoint == mountpoint && mount.filesystem.as_bytes() == filesystem.as_bytes()
+    }))
 }
 
 fn parse_mountinfo(line: &[u8]) -> Result<MountInfo> {

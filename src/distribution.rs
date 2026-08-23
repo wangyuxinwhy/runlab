@@ -16,7 +16,7 @@ use crate::core::{
     OCI_LAYER_TAR, OCI_LAYER_ZSTD, OciDescriptor, Platform,
 };
 use crate::integrity::digest_bytes;
-use crate::oci::OciLayout;
+use crate::oci::{MAX_IMAGE_LAYERS, OciLayout};
 
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOKEN_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -435,6 +435,7 @@ struct TokenResponse {
     access_token: Option<String>,
 }
 
+#[derive(Debug)]
 struct ManifestContent {
     config: OciDescriptor,
     layers: Vec<OciDescriptor>,
@@ -492,6 +493,9 @@ fn parse_image_manifest(value: &Value) -> Result<ManifestContent> {
         .enumerate()
         .map(|(index, value)| parse_descriptor(value, &format!("layers[{index}]")))
         .collect::<Result<Vec<_>>>()?;
+    if layers.len() > MAX_IMAGE_LAYERS {
+        bail!("remote OCI Image exceeds the {MAX_IMAGE_LAYERS}-Layer limit");
+    }
     for layer in &layers {
         if !matches!(
             layer.media_type.as_str(),
@@ -852,6 +856,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_excessive_layer_count_before_blob_requests() {
+        let layer = json!({
+            "mediaType": OCI_LAYER_GZIP,
+            "digest": format!("sha256:{}", "1".repeat(64)),
+            "size": 1
+        });
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST,
+            "config": {
+                "mediaType": OCI_IMAGE_CONFIG,
+                "digest": format!("sha256:{}", "2".repeat(64)),
+                "size": 1
+            },
+            "layers": vec![layer; MAX_IMAGE_LAYERS + 1]
+        });
+
+        let error = parse_image_manifest(&manifest).expect_err("Layer limit");
+        assert!(error.to_string().contains("Layer limit"));
+    }
+
+    #[test]
     fn pulls_bearer_protected_index_by_exact_platform_and_updates_catalog_last() {
         let fixture = RegistryFixture::new();
         let registry = MockRegistry::start(fixture.clone(), false);
@@ -859,8 +885,8 @@ mod tests {
         let layout = OciLayout::open(state.path()).expect("layout");
         let images = ImageService::new(layout.clone());
         let remote = format!("{}/team/agent@{}", registry.address, fixture.index.digest);
-        let result = images
-            .pull_image_with(
+        let result = crate::image_ingress::ImageIngress::new(&images)
+            .pull_with(
                 &DistributionClient::plain_http_for_tests().expect("client"),
                 &remote,
                 Platform::linux(Architecture::Arm64),
@@ -921,8 +947,8 @@ mod tests {
         let layout = OciLayout::open(state.path()).expect("layout");
         let images = ImageService::new(layout.clone());
         let remote = format!("{}/team/agent:latest", registry.address);
-        let error = images
-            .pull_image_with(
+        let error = crate::image_ingress::ImageIngress::new(&images)
+            .pull_with(
                 &DistributionClient::plain_http_for_tests().expect("client"),
                 &remote,
                 Platform::linux(Architecture::Arm64),

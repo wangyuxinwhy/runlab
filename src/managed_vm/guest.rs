@@ -52,15 +52,15 @@ pub fn guest_start(operation_id: Uuid) -> Result<()> {
     if !operation.runtime_config_inputs.is_empty() {
         let binary = guest_binary_path();
         let operation_id_text = operation_id.to_string();
-        let output = Command::new("/usr/bin/sudo")
-            .args([
+        let output = guest_control_output(
+            Command::new("/usr/bin/sudo").args([
                 binary.as_str(),
                 "__internal-vm-seal-inputs",
                 "--operation-id",
                 operation_id_text.as_str(),
-            ])
-            .output()
-            .context("cannot seal guest OCI Runtime Config inputs")?;
+            ]),
+            "guest OCI Runtime Config input sealing",
+        )?;
         ensure_status(&output, "guest OCI Runtime Config input sealing")?;
     }
     let argv = rewrite_file_tokens(
@@ -71,10 +71,10 @@ pub fn guest_start(operation_id: Uuid) -> Result<()> {
     )?;
     let state = guest_state_path(&operation.namespace)?;
     let state = state.to_str().context("guest state path is not UTF-8")?;
-    let created = Command::new("/usr/bin/sudo")
-        .args(["/usr/bin/install", "-d", "-m", "0700", state])
-        .output()
-        .context("cannot create guest state namespace")?;
+    let created = guest_control_output(
+        Command::new("/usr/bin/sudo").args(["/usr/bin/install", "-d", "-m", "0700", state]),
+        "guest state namespace creation",
+    )?;
     ensure_status(&created, "guest state namespace creation")?;
     let unit = unit_name(operation_id);
     let stdout = root.join("stdout");
@@ -97,9 +97,7 @@ pub fn guest_start(operation_id: Uuid) -> Result<()> {
         state,
     ]);
     command.args(argv);
-    let output = command
-        .output()
-        .context("cannot start guest RunLab operation")?;
+    let output = guest_control_output(&mut command, "systemd-run")?;
     ensure_status(&output, "systemd-run")
 }
 
@@ -110,8 +108,8 @@ pub fn guest_seal_inputs(operation_id: Uuid) -> Result<()> {
 pub fn guest_status(operation_id: Uuid) -> Result<VmOperationStatus> {
     ensure_guest_linux()?;
     let operation = load_guest_operation(operation_id)?;
-    let output = Command::new("/usr/bin/sudo")
-        .args([
+    let output = guest_control_output(
+        Command::new("/usr/bin/sudo").args([
             "/usr/bin/systemctl",
             "show",
             &unit_name(operation_id),
@@ -122,9 +120,9 @@ pub fn guest_status(operation_id: Uuid) -> Result<VmOperationStatus> {
             "--property=Result",
             "--property=ExecMainCode",
             "--property=ExecMainStatus",
-        ])
-        .output()
-        .context("cannot inspect guest RunLab operation")?;
+        ]),
+        "systemctl show",
+    )?;
     ensure_status(&output, "systemctl show")?;
     parse_systemd_status(
         operation_id,
@@ -140,16 +138,16 @@ pub fn guest_cancel(operation_id: Uuid) -> Result<VmCancelResult> {
     let signal_sent = if before.terminal {
         false
     } else {
-        let output = Command::new("/usr/bin/sudo")
-            .args([
+        let output = guest_control_output(
+            Command::new("/usr/bin/sudo").args([
                 "/usr/bin/systemctl",
                 "kill",
                 "--kill-whom=main",
                 "--signal=SIGINT",
                 &unit_name(operation_id),
-            ])
-            .output()
-            .context("cannot cancel guest RunLab operation")?;
+            ]),
+            "systemctl kill",
+        )?;
         ensure_status(&output, "systemctl kill")?;
         true
     };
@@ -208,20 +206,24 @@ pub fn guest_remove(operation_id: Uuid) -> Result<()> {
         Ok(status)
     })?;
     let unit = unit_name(operation_id);
-    let _ = Command::new("/usr/bin/sudo")
-        .args(["/usr/bin/systemctl", "stop", &unit])
-        .status();
-    let _ = Command::new("/usr/bin/sudo")
-        .args(["/usr/bin/systemctl", "reset-failed", &unit])
-        .status();
+    let stopped = guest_control_output(
+        Command::new("/usr/bin/sudo").args(["/usr/bin/systemctl", "stop", &unit]),
+        "systemctl stop",
+    )?;
+    ensure_status(&stopped, "systemctl stop")?;
+    let reset = guest_control_output(
+        Command::new("/usr/bin/sudo").args(["/usr/bin/systemctl", "reset-failed", &unit]),
+        "systemctl reset-failed",
+    )?;
+    ensure_status(&reset, "systemctl reset-failed")?;
     remove_operation_directories(operation_id)
 }
 
 fn remove_operation_directories(operation_id: Uuid) -> Result<()> {
     let root = operation_path(operation_id);
     let sealed = sealed_operation_path(operation_id);
-    let output = Command::new("/usr/bin/sudo")
-        .args([
+    let output = guest_control_output(
+        Command::new("/usr/bin/sudo").args([
             "/usr/bin/rm",
             "-r",
             "-f",
@@ -230,9 +232,9 @@ fn remove_operation_directories(operation_id: Uuid) -> Result<()> {
             sealed
                 .to_str()
                 .context("sealed guest input path is not UTF-8")?,
-        ])
-        .output()
-        .context("cannot remove guest operation")?;
+        ]),
+        "guest operation removal",
+    )?;
     ensure_status(&output, "guest operation removal")
 }
 
@@ -245,16 +247,16 @@ pub fn guest_discard(operation_id: Uuid) -> Result<VmDiscardResult> {
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let output = Command::new("/usr/bin/sudo")
-                .args([
+            let output = guest_control_output(
+                Command::new("/usr/bin/sudo").args([
                     "/usr/bin/systemctl",
                     "show",
                     &unit_name(operation_id),
                     "--no-pager",
                     "--property=LoadState",
-                ])
-                .output()
-                .context("cannot inspect discarded guest operation")?;
+                ]),
+                "systemctl show",
+            )?;
             ensure_status(&output, "systemctl show")?;
             ensure!(
                 output.stdout == b"LoadState=not-found\n",
@@ -274,20 +276,30 @@ pub fn guest_discard(operation_id: Uuid) -> Result<VmDiscardResult> {
 pub fn guest_abandon(operation_id: Uuid) -> Result<()> {
     ensure_guest_linux()?;
     let _ = load_guest_operation(operation_id)?;
-    let output = Command::new("/usr/bin/sudo")
-        .args([
+    let output = guest_control_output(
+        Command::new("/usr/bin/sudo").args([
             "/usr/bin/systemctl",
             "show",
             &unit_name(operation_id),
             "--no-pager",
             "--property=LoadState",
-        ])
-        .output()
-        .context("cannot inspect prepared guest operation")?;
+        ]),
+        "systemctl show",
+    )?;
     ensure_status(&output, "systemctl show")?;
     ensure!(
         output.stdout == b"LoadState=not-found\n",
         "cannot abandon an operation after its systemd unit exists"
     );
     remove_operation_directories(operation_id)
+}
+
+fn guest_control_output(command: &mut Command, operation: &str) -> Result<Output> {
+    bounded_output(
+        command,
+        None,
+        VM_CONTROL_TIMEOUT,
+        MAX_CONTROL_OUTPUT,
+        operation,
+    )
 }
