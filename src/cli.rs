@@ -24,10 +24,10 @@ use crate::core::{
 };
 use crate::docker::DockerBackend;
 use crate::image::{ImageService, ImageStructureDiff};
-use crate::image_ingress::{
+use crate::ingress::local::ImportSourceKind;
+use crate::ingress::{
     ImageImportResult as IngressImportResult, ImagePullResult as IngressPullResult,
 };
-use crate::ingress::ImportSourceKind;
 use crate::integrity::ensure_private_directory;
 use crate::managed_vm::HostVm;
 use crate::oci::OciLayout;

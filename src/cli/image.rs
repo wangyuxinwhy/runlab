@@ -23,7 +23,7 @@ use super::{
 
 pub(super) fn run_image(state: &Path, command: ImageCommand) -> Result<u8> {
     if let ImageCommand::Import { source, .. } = &command {
-        crate::ingress::validate_source_destination(source, &state.join("oci"))?;
+        crate::ingress::local::validate_source_destination(source, &state.join("oci"))?;
     }
     let _operation = enter_image_state(state, &command)?;
     match command {
@@ -40,7 +40,7 @@ pub(super) fn run_image(state: &Path, command: ImageCommand) -> Result<u8> {
                 None => host_platform()?,
             };
             let images = image_service(state)?;
-            let result = crate::image_ingress::ImageIngress::new(&images).import(
+            let result = crate::ingress::ImageIngress::new(&images).import(
                 &source,
                 platform,
                 manifest.as_ref(),
@@ -61,7 +61,7 @@ pub(super) fn run_image(state: &Path, command: ImageCommand) -> Result<u8> {
                 None => host_platform()?,
             };
             let images = image_service(state)?;
-            let result = crate::image_ingress::ImageIngress::new(&images).pull(
+            let result = crate::ingress::ImageIngress::new(&images).pull(
                 &remote_reference,
                 platform,
                 name.as_deref(),

@@ -2,7 +2,7 @@
 //! platform selection from an index, and blob download.
 //!
 //! Downloaded bytes go straight into the OCI Layout and are verified there.
-//! This module never decides what a local reference means; `image_ingress`
+//! This module never decides what a local reference means; the `ingress` root
 //! composes it with the catalog.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -892,7 +892,7 @@ mod tests {
         let layout = OciLayout::open(state.path()).expect("layout");
         let images = ImageService::new(layout.clone());
         let remote = format!("{}/team/agent@{}", registry.address, fixture.index.digest);
-        let result = crate::image_ingress::ImageIngress::new(&images)
+        let result = crate::ingress::ImageIngress::new(&images)
             .pull_with(
                 &DistributionClient::plain_http_for_tests().expect("client"),
                 &remote,
@@ -954,7 +954,7 @@ mod tests {
         let layout = OciLayout::open(state.path()).expect("layout");
         let images = ImageService::new(layout.clone());
         let remote = format!("{}/team/agent:latest", registry.address);
-        let error = crate::image_ingress::ImageIngress::new(&images)
+        let error = crate::ingress::ImageIngress::new(&images)
             .pull_with(
                 &DistributionClient::plain_http_for_tests().expect("client"),
                 &remote,

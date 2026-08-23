@@ -12,7 +12,7 @@
 //! cli                     argument shapes, JSON output, exit status
 //! execution               acceptance -> execute -> terminal Run Record
 //! native  docker          the two execution backends
-//! image  storage          Images in the Layout, Run Records in SQLite
+//! image  ingress  storage Images in the Layout, Run Records in SQLite
 //! oci  runtime  render    exact-byte Layout, Runtime config, Layer views
 //! integrity               digests, canonical JSON, durable private writes
 //! core                    the Run Protocol vocabulary
@@ -40,12 +40,10 @@ mod catalog;
 mod changeset;
 mod cli;
 mod core;
-mod distribution;
 mod docker;
 mod execution;
 mod filesystem;
 mod image;
-mod image_ingress;
 mod ingress;
 mod integrity;
 mod maintenance;

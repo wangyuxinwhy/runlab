@@ -1,10 +1,13 @@
 //! Getting an Image into the local Layout and giving it a local reference.
 //!
-//! Two sources, one shape: `pull` speaks OCI Distribution through
-//! `distribution`, `import` reads a local Layout or archive through `ingress`.
-//! Both verify the result against the Layout after the fact and only then
-//! publish the reference, so a failed acquisition never leaves a name pointing
-//! at content that was not verified.
+//! Two sources, one shape: `registry` speaks OCI Distribution, `local` reads a
+//! read-only Layout or `oci-archive`. This module composes either with the
+//! catalog: it verifies the result against the Layout after the fact and only
+//! then publishes the reference, so a failed acquisition never leaves a name
+//! pointing at content that was not verified.
+
+pub(crate) mod local;
+pub(crate) mod registry;
 
 use std::path::Path;
 
@@ -12,9 +15,9 @@ use anyhow::{Result, bail};
 
 use crate::catalog::{CatalogMetadata, LocalImageCatalog, normalize_reference};
 use crate::core::{OciDescriptor, Platform};
-use crate::distribution::{DistributionClient, DistributionPullResult, RemoteReference};
 use crate::image::ImageService;
-use crate::ingress::{ImportSourceKind, ingest_image};
+use local::{ImportSourceKind, ingest_image};
+use registry::{DistributionClient, DistributionPullResult, RemoteReference};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImagePullResult {
