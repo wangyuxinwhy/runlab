@@ -373,8 +373,12 @@ fn write_input(
     Ok(())
 }
 
+/// Put a pipe in non-blocking mode.
+///
+/// Every capture thread in this crate polls rather than blocking in `read`, so
+/// a child that outlives its deadline cannot wedge one after it is killed.
 #[cfg(unix)]
-fn set_nonblocking(fd: impl std::os::fd::AsFd) -> std::io::Result<()> {
+pub(crate) fn set_nonblocking(fd: impl std::os::fd::AsFd) -> std::io::Result<()> {
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
     let flags = fcntl_getfl(&fd)?;
@@ -382,7 +386,7 @@ fn set_nonblocking(fd: impl std::os::fd::AsFd) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_nonblocking(_fd: impl std::os::fd::AsFd) -> std::io::Result<()> {
+pub(crate) fn set_nonblocking(_fd: impl std::os::fd::AsFd) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -402,7 +406,12 @@ fn join_capture(
         .map_err(|_| anyhow::anyhow!("{operation} {stream} reader panicked"))?
 }
 
-fn spawned_child_error(child: &mut std::process::Child, error: anyhow::Error) -> anyhow::Error {
+/// Reap a child this crate just spawned, keeping `error` as the reported
+/// failure unless the reap itself fails.
+pub(crate) fn spawned_child_error(
+    child: &mut std::process::Child,
+    error: anyhow::Error,
+) -> anyhow::Error {
     let kill = child.kill();
     match child.wait() {
         Ok(_) => error,

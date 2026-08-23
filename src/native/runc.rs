@@ -23,6 +23,7 @@ use crate::native::cgroup::PreparedNativeCgroup;
 use crate::native::network::NativeNetworkBinding;
 use crate::native::read_only_file::{VerifiedSourceFile, verify_all_sources};
 use crate::runtime::{RootlessMapping, RuntimeConfig};
+use crate::subprocess::{set_nonblocking, spawned_child_error};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CANCELLATION_GRACE: Duration = Duration::from_secs(2);
@@ -1678,26 +1679,6 @@ fn spawn_stream_drain(
     progress: Arc<StreamProgress>,
 ) -> thread::JoinHandle<StreamDrainResult> {
     thread::spawn(move || drain_pipe(reader, limit, &progress))
-}
-
-fn set_nonblocking(fd: impl std::os::fd::AsFd) -> std::io::Result<()> {
-    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-
-    let flags = fcntl_getfl(&fd)?;
-    Ok(fcntl_setfl(fd, flags | OFlags::NONBLOCK)?)
-}
-
-fn spawned_child_error(child: &mut Child, error: anyhow::Error) -> anyhow::Error {
-    let kill = child.kill();
-    match child.wait() {
-        Ok(_) => error,
-        Err(wait_error) => match kill {
-            Ok(()) => error.context(format!("failed to reap spawned child: {wait_error}")),
-            Err(kill_error) => error.context(format!(
-                "failed to kill spawned child: {kill_error}; failed to reap it: {wait_error}"
-            )),
-        },
-    }
 }
 
 fn drain_pipe(mut reader: impl Read, limit: u64, progress: &StreamProgress) -> StreamDrainResult {
