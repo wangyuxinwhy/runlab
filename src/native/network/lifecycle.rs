@@ -3,9 +3,11 @@ use std::fs;
 use std::io::{self, Read as _};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::core::RunId;
 
@@ -14,9 +16,8 @@ use crate::subprocess::NETWORK_HOLDER_COMMAND;
 use super::{
     EgressNetworkTools, HostNetworkLock, NETWORK_HOLDER_DIRECTORY, NativeNetworkIdentity,
     NativeNetworkTools, NetworkHolderHandle, NetworkHolderIdentity, POLL_INTERVAL, RunNetworkMode,
-    RunNetworkPlan, RunNetworkResources, contextual, deadline, force_reap, helper_failure,
-    invalid_data, invalid_input, join_capture, namespace_identity, other, read_bounded, remaining,
-    run_bounded, sleep_until, validate_executable,
+    RunNetworkPlan, RunNetworkResources, deadline, force_reap, helper_failure, join_capture,
+    namespace_identity, read_bounded, remaining, run_bounded, sleep_until, validate_executable,
 };
 
 #[derive(Debug)]
@@ -28,11 +29,11 @@ pub(crate) struct EgressNetworkAttachment {
 }
 
 impl EgressNetworkAttachment {
-    pub(crate) fn finish(mut self) -> io::Result<()> {
+    pub(crate) fn finish(mut self) -> Result<()> {
         self.shutdown()
     }
 
-    fn shutdown(&mut self) -> io::Result<()> {
+    fn shutdown(&mut self) -> Result<()> {
         if self.finished {
             return Ok(());
         }
@@ -63,12 +64,10 @@ impl RunNetwork {
         egress_tools: Option<EgressNetworkTools>,
         host_lock: Option<&HostNetworkLock>,
         helper_timeout: Duration,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         plan.validate()?;
         if plan.run_id() != holder.run_id {
-            return Err(invalid_input(
-                "Run network plan and holder handle belong to different Runs",
-            ));
+            bail!("Run network plan and holder handle belong to different Runs");
         }
         match (plan.mode(), egress_tools.as_ref(), host_lock) {
             (RunNetworkMode::LoopbackOnly, None, None) => {}
@@ -77,24 +76,16 @@ impl RunNetwork {
                 tools.preflight(helper_timeout)?;
             }
             (RunNetworkMode::LoopbackOnly, Some(_), _) => {
-                return Err(invalid_input(
-                    "loopback-only Run network plan must not receive egress tools",
-                ));
+                bail!("loopback-only Run network plan must not receive egress tools");
             }
             (RunNetworkMode::LoopbackOnly, None, Some(_)) => {
-                return Err(invalid_input(
-                    "loopback-only Run network plan must not receive a host network lock",
-                ));
+                bail!("loopback-only Run network plan must not receive a host network lock");
             }
             (RunNetworkMode::EgressIpv4, None, _) => {
-                return Err(invalid_input(
-                    "IPv4 egress Run network plan requires egress tools",
-                ));
+                bail!("IPv4 egress Run network plan requires egress tools");
             }
             (RunNetworkMode::EgressIpv4, Some(_), None) => {
-                return Err(invalid_input(
-                    "IPv4 egress Run network plan requires the allocation lock",
-                ));
+                bail!("IPv4 egress Run network plan requires the allocation lock");
             }
         }
         let mut shared =
@@ -121,18 +112,18 @@ impl RunNetwork {
         &self.resources
     }
 
-    pub(crate) fn binding(&mut self) -> io::Result<NativeNetworkBinding> {
+    pub(crate) fn binding(&mut self) -> Result<NativeNetworkBinding> {
         self.shared
             .as_mut()
-            .ok_or_else(|| other("Run network is already finished"))?
+            .context("Run network is already finished")?
             .binding()
     }
 
-    pub(crate) fn finish(mut self) -> io::Result<()> {
+    pub(crate) fn finish(mut self) -> Result<()> {
         self.shutdown()
     }
 
-    fn shutdown(&mut self) -> io::Result<()> {
+    fn shutdown(&mut self) -> Result<()> {
         let egress = self
             .egress
             .take()
@@ -144,9 +135,9 @@ impl RunNetwork {
         match (egress, shared) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(egress), Err(shared)) => Err(other(format!(
+            (Err(egress), Err(shared)) => Err(anyhow!(
                 "Run egress cleanup failed: {egress}; network namespace cleanup also failed: {shared}"
-            ))),
+            )),
         }
     }
 }
@@ -172,13 +163,6 @@ pub(super) enum TableOwnership {
     Foreign,
 }
 
-#[derive(Debug)]
-pub(crate) struct NativeNetworkHelperOutput {
-    pub status: ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct NativeNetworkBinding {
     nsenter: PathBuf,
@@ -187,7 +171,7 @@ pub(crate) struct NativeNetworkBinding {
 }
 
 impl NativeNetworkBinding {
-    pub(crate) fn entered_command(&self, executable: impl AsRef<Path>) -> io::Result<Command> {
+    pub(crate) fn entered_command(&self, executable: impl AsRef<Path>) -> Result<Command> {
         // The coordinator retains the holder until every command built from this binding exits.
         self.verify_identity()?;
         let executable = validate_executable(executable.as_ref())?;
@@ -204,7 +188,7 @@ impl NativeNetworkBinding {
         executable: impl AsRef<Path>,
         arguments: I,
         timeout: Duration,
-    ) -> io::Result<NativeNetworkHelperOutput>
+    ) -> Result<Output>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -214,13 +198,13 @@ impl NativeNetworkBinding {
         run_bounded(command, timeout)
     }
 
-    fn verify_identity(&self) -> io::Result<()> {
+    fn verify_identity(&self) -> Result<()> {
         let actual = namespace_identity(&self.namespace_path)
-            .map_err(|error| contextual(&error, "failed to inspect private network namespace"))?;
+            .context("failed to inspect private network namespace")?;
         if actual.device != self.identity.namespace_device
             || actual.inode != self.identity.namespace_inode
         {
-            return Err(other("private network namespace identity changed"));
+            bail!("private network namespace identity changed");
         }
         Ok(())
     }
@@ -232,7 +216,7 @@ pub(crate) struct SharedLoopbackNetwork {
     helper_timeout: Duration,
     holder: Child,
     holder_stdin: Option<ChildStdin>,
-    holder_stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    holder_stderr: Option<JoinHandle<Result<Vec<u8>>>>,
     identity: NativeNetworkIdentity,
     holder_start_time_ticks: u64,
     namespace_path: PathBuf,
@@ -243,14 +227,14 @@ pub(crate) struct SharedLoopbackNetwork {
 struct StartingNetworkHolder {
     child: Child,
     stdin: ChildStdin,
-    stderr: JoinHandle<io::Result<Vec<u8>>>,
+    stderr: JoinHandle<Result<Vec<u8>>>,
     start_time_ticks: u64,
     namespace_path: PathBuf,
 }
 
 impl SharedLoopbackNetwork {
     #[cfg(test)]
-    pub(crate) fn start(tools: NativeNetworkTools, helper_timeout: Duration) -> io::Result<Self> {
+    pub(crate) fn start(tools: NativeNetworkTools, helper_timeout: Duration) -> Result<Self> {
         Self::start_inner(tools, None, helper_timeout)
     }
 
@@ -258,16 +242,13 @@ impl SharedLoopbackNetwork {
         tools: NativeNetworkTools,
         holder: NetworkHolderHandle,
         helper_timeout: Duration,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         holder.validate_directory()?;
         if holder.stop_requested()? {
-            return Err(other("network holder already has a durable stop request"));
+            bail!("network holder already has a durable stop request");
         }
         if holder.read_identity()?.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "network holder identity already exists",
-            ));
+            bail!("network holder identity already exists");
         }
         Self::start_inner(tools, Some(holder), helper_timeout)
     }
@@ -276,7 +257,7 @@ impl SharedLoopbackNetwork {
         tools: NativeNetworkTools,
         durable_holder: Option<NetworkHolderHandle>,
         helper_timeout: Duration,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         let deadline = deadline(helper_timeout, "network helper timeout")?;
         let host_identity = namespace_identity(Path::new("/proc/self/ns/net"))?;
         let starting = start_network_holder(&tools, durable_holder.as_ref())?;
@@ -292,18 +273,17 @@ impl SharedLoopbackNetwork {
                 Err(error) => {
                     let _ = force_reap(&mut holder)?;
                     let _ = join_capture(holder_stderr);
-                    return Err(contextual(
-                        &error,
-                        "failed to poll private network holder during startup",
+                    return Err(anyhow!(
+                        "failed to poll private network holder during startup: {error}"
                     ));
                 }
             };
             if let Some(status) = status {
                 let stderr = join_capture(holder_stderr)?;
-                return Err(other(format!(
+                bail!(
                     "private network holder exited during startup with {status}; stderr: {}",
                     String::from_utf8_lossy(&stderr)
-                )));
+                );
             }
             match namespace_identity(&namespace_path) {
                 Ok(identity) if identity != host_identity => {
@@ -320,17 +300,15 @@ impl SharedLoopbackNetwork {
                             Some(_) => {
                                 let _ = force_reap(&mut holder)?;
                                 let _ = join_capture(holder_stderr);
-                                return Err(invalid_data(
-                                    "network holder sidecar does not match its live process",
-                                ));
+                                bail!("network holder sidecar does not match its live process");
                             }
                             None => {
                                 if Instant::now() >= deadline {
                                     let _ = force_reap(&mut holder)?;
                                     let _ = join_capture(holder_stderr);
-                                    return Err(other(
-                                        "network holder did not publish its durable identity before the helper timeout",
-                                    ));
+                                    bail!(
+                                        "network holder did not publish its durable identity before the helper timeout"
+                                    );
                                 }
                                 sleep_until(deadline);
                                 continue;
@@ -344,19 +322,18 @@ impl SharedLoopbackNetwork {
                 Err(error) => {
                     let _ = force_reap(&mut holder)?;
                     let _ = join_capture(holder_stderr);
-                    return Err(contextual(
-                        &error,
-                        "failed to inspect private network namespace during startup",
+                    return Err(anyhow!(
+                        "failed to inspect private network namespace during startup: {error}"
                     ));
                 }
             }
             if Instant::now() >= deadline {
                 let _ = force_reap(&mut holder)?;
                 let stderr = join_capture(holder_stderr)?;
-                return Err(other(format!(
+                bail!(
                     "private network holder did not create a distinct namespace before the helper timeout; stderr: {}",
                     String::from_utf8_lossy(&stderr)
-                )));
+                );
             }
             sleep_until(deadline);
         };
@@ -377,7 +354,7 @@ impl SharedLoopbackNetwork {
         Ok(network)
     }
 
-    fn enable_loopback(&mut self, deadline: Instant) -> io::Result<()> {
+    fn enable_loopback(&mut self, deadline: Instant) -> Result<()> {
         let ip = self.tools.ip.clone();
         let binding = self.binding()?;
         let output = binding.invoke(
@@ -400,7 +377,7 @@ impl SharedLoopbackNetwork {
         (self.holder.id(), self.holder_start_time_ticks)
     }
 
-    pub(crate) fn binding(&mut self) -> io::Result<NativeNetworkBinding> {
+    pub(crate) fn binding(&mut self) -> Result<NativeNetworkBinding> {
         self.verify_holder()?;
         Ok(NativeNetworkBinding {
             nsenter: self.tools.nsenter.clone(),
@@ -409,7 +386,7 @@ impl SharedLoopbackNetwork {
         })
     }
 
-    pub(crate) fn resources(&mut self, plan: RunNetworkPlan) -> io::Result<RunNetworkResources> {
+    pub(crate) fn resources(&mut self, plan: RunNetworkPlan) -> Result<RunNetworkResources> {
         self.verify_holder()?;
         let (holder_pid, holder_start_time_ticks) = self.holder_identity();
         Ok(RunNetworkResources {
@@ -426,15 +403,15 @@ impl SharedLoopbackNetwork {
         plan: RunNetworkPlan,
         host_lock: &HostNetworkLock,
         timeout: Duration,
-    ) -> io::Result<EgressNetworkAttachment> {
+    ) -> Result<EgressNetworkAttachment> {
         plan.egress()?;
         tools.preflight(timeout)?;
         if let Err(error) = tools.apply(plan.egress()?, self, timeout) {
             return match tools.cleanup_plan_locked(&plan, timeout, host_lock) {
                 Ok(()) => Err(error),
-                Err(cleanup) => Err(other(format!(
+                Err(cleanup) => Err(anyhow!(
                     "{error}; Run egress rollback also failed: {cleanup}"
-                ))),
+                )),
             };
         }
         Ok(EgressNetworkAttachment {
@@ -445,35 +422,33 @@ impl SharedLoopbackNetwork {
         })
     }
 
-    pub(crate) fn finish(mut self) -> io::Result<()> {
+    pub(crate) fn finish(mut self) -> Result<()> {
         self.shutdown()
     }
 
-    fn verify_holder(&mut self) -> io::Result<()> {
+    fn verify_holder(&mut self) -> Result<()> {
         if self.finished {
-            return Err(other("private network holder is already finished"));
+            bail!("private network holder is already finished");
         }
         // A live unreaped holder owns the PID while bindings use its procfs namespace path.
         if let Some(status) = self
             .holder
             .try_wait()
-            .map_err(|error| contextual(&error, "failed to poll private network holder"))?
+            .context("failed to poll private network holder")?
         {
-            return Err(other(format!(
-                "private network holder exited unexpectedly with {status}"
-            )));
+            bail!("private network holder exited unexpectedly with {status}");
         }
         let actual = namespace_identity(&self.namespace_path)
-            .map_err(|error| contextual(&error, "failed to inspect private network namespace"))?;
+            .context("failed to inspect private network namespace")?;
         if actual.device != self.identity.namespace_device
             || actual.inode != self.identity.namespace_inode
         {
-            return Err(other("private network namespace identity changed"));
+            bail!("private network namespace identity changed");
         }
         Ok(())
     }
 
-    fn shutdown(&mut self) -> io::Result<()> {
+    fn shutdown(&mut self) -> Result<()> {
         if self.finished {
             return Ok(());
         }
@@ -488,19 +463,19 @@ impl SharedLoopbackNetwork {
                 Ok(None) => {}
                 Err(error) => {
                     if let Err(cleanup_error) = force_reap(&mut self.holder) {
-                        return Err(other(format!(
+                        bail!(
                             "failed to poll private network holder during shutdown: {error}; cleanup also failed: {cleanup_error}"
-                        )));
+                        );
                     }
                     self.finished = true;
                     let stderr = match self.holder_stderr.take() {
                         Some(capture) => join_capture(capture)?,
                         None => Vec::new(),
                     };
-                    return Err(other(format!(
+                    bail!(
                         "failed to poll private network holder during shutdown: {error}; stderr: {}",
                         String::from_utf8_lossy(&stderr)
-                    )));
+                    );
                 }
             }
             if Instant::now() >= deadline {
@@ -514,10 +489,10 @@ impl SharedLoopbackNetwork {
             None => Vec::new(),
         };
         if !status.success() {
-            return Err(other(format!(
+            bail!(
                 "private network holder exited with {status}; stderr: {}",
                 String::from_utf8_lossy(&stderr)
-            )));
+            );
         }
         Ok(())
     }
@@ -532,7 +507,7 @@ impl Drop for SharedLoopbackNetwork {
 fn start_network_holder(
     tools: &NativeNetworkTools,
     durable: Option<&NetworkHolderHandle>,
-) -> io::Result<StartingNetworkHolder> {
+) -> Result<StartingNetworkHolder> {
     let mut command = Command::new(&tools.unshare);
     command.arg("--net").arg("--");
     match durable {
@@ -554,27 +529,23 @@ fn start_network_holder(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| contextual(&error, "failed to start private network holder"))?;
+        .context("failed to start private network holder")?;
     let pid = child.id();
     let start_time_ticks = match process_start_time_ticks(pid) {
         Ok(value) => value,
         Err(error) => {
             let _ = force_reap(&mut child)?;
-            return Err(error);
+            return Err(error.into());
         }
     };
     let Some(stdin) = child.stdin.take() else {
         let _ = force_reap(&mut child)?;
-        return Err(invalid_data(
-            "private network holder did not expose its stdin pipe",
-        ));
+        bail!("private network holder did not expose its stdin pipe");
     };
     let Some(stderr) = child.stderr.take() else {
         drop(stdin);
         let _ = force_reap(&mut child)?;
-        return Err(invalid_data(
-            "private network holder did not expose its stderr pipe",
-        ));
+        bail!("private network holder did not expose its stderr pipe");
     };
     Ok(StartingNetworkHolder {
         child,
@@ -585,25 +556,19 @@ fn start_network_holder(
     })
 }
 
-pub(crate) fn hold_network_namespace(directory: &Path, run_id: RunId) -> io::Result<()> {
+pub(crate) fn hold_network_namespace(directory: &Path, run_id: RunId) -> Result<()> {
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
     let workspace = directory
         .parent()
-        .ok_or_else(|| invalid_input("network holder directory has no attempt workspace"))?;
+        .context("network holder directory has no attempt workspace")?;
     if directory.file_name() != Some(OsStr::new(NETWORK_HOLDER_DIRECTORY)) {
-        return Err(invalid_input(
-            "network holder directory has an invalid name",
-        ));
+        bail!("network holder directory has an invalid name");
     }
-    let handle = NetworkHolderHandle::open(workspace, run_id)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "network holder directory is missing",
-        )
-    })?;
+    let handle = NetworkHolderHandle::open(workspace, run_id)?
+        .context("network holder directory is missing")?;
     if handle.directory != directory {
-        return Err(invalid_input("network holder directory is not canonical"));
+        bail!("network holder directory is not canonical");
     }
     disable_ipv6_in_current_namespace()?;
     let identity = NetworkHolderIdentity::current(run_id)?;
@@ -623,9 +588,8 @@ pub(crate) fn hold_network_namespace(directory: &Path, run_id: RunId) -> io::Res
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => {
-                return Err(contextual(
-                    &error,
-                    "failed to monitor network holder supervisor",
+                return Err(anyhow!(
+                    "failed to monitor network holder supervisor: {error}"
                 ));
             }
         }
@@ -633,7 +597,7 @@ pub(crate) fn hold_network_namespace(directory: &Path, run_id: RunId) -> io::Res
     }
 }
 
-fn disable_ipv6_in_current_namespace() -> io::Result<()> {
+fn disable_ipv6_in_current_namespace() -> Result<()> {
     for path in [
         "/proc/sys/net/ipv6/conf/default/disable_ipv6",
         "/proc/sys/net/ipv6/conf/all/disable_ipv6",
@@ -643,7 +607,7 @@ fn disable_ipv6_in_current_namespace() -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn disable_ipv6_for_interface(interface: &str) -> io::Result<()> {
+pub(super) fn disable_ipv6_for_interface(interface: &str) -> Result<()> {
     disable_ipv6_at(
         &Path::new("/proc/sys/net/ipv6/conf")
             .join(interface)
@@ -651,7 +615,7 @@ pub(super) fn disable_ipv6_for_interface(interface: &str) -> io::Result<()> {
     )
 }
 
-fn disable_ipv6_at(path: &Path) -> io::Result<()> {
+fn disable_ipv6_at(path: &Path) -> Result<()> {
     match fs::write(path, b"1\n") {
         Ok(()) => {}
         Err(error)
@@ -661,35 +625,32 @@ fn disable_ipv6_at(path: &Path) -> io::Result<()> {
             return Ok(());
         }
         Err(error) => {
-            return Err(contextual(
-                &error,
-                format!("failed to disable IPv6 at {}", path.display()),
+            return Err(anyhow!(
+                "failed to disable IPv6 at {}: {error}",
+                path.display()
             ));
         }
     }
-    let value = fs::read_to_string(path).map_err(|error| {
-        contextual(
-            &error,
-            format!("failed to verify IPv6 state at {}", path.display()),
-        )
-    })?;
+    let value = fs::read_to_string(path)
+        .with_context(|| format!("failed to verify IPv6 state at {}", path.display()))?;
     if value.trim() != "1" {
-        return Err(other(format!(
-            "IPv6 remained enabled at {}",
-            path.display()
-        )));
+        bail!("IPv6 remained enabled at {}", path.display());
     }
     Ok(())
 }
 
+/// Returns the raw `io::Error` so the readiness probe can tell "not listening
+/// yet" apart from a real failure by its `ErrorKind`.
 pub(crate) fn connect_loopback_tcp(port: u16, timeout: Duration) -> io::Result<()> {
     if port == 0 {
-        return Err(invalid_input(
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
             "TCP readiness port must be greater than zero",
         ));
     }
     if timeout.is_zero() {
-        return Err(invalid_input(
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
             "TCP readiness timeout must be greater than zero",
         ));
     }
@@ -697,21 +658,41 @@ pub(crate) fn connect_loopback_tcp(port: u16, timeout: Duration) -> io::Result<(
     TcpStream::connect_timeout(&address, timeout).map(|_| ())
 }
 
+/// Returns the raw `io::Error` so a caller can tell a vanished process apart
+/// from a malformed one by its `ErrorKind`.
 pub(super) fn process_start_time_ticks(pid: u32) -> io::Result<u64> {
     let path = PathBuf::from(format!("/proc/{pid}/stat"));
-    let value = fs::read_to_string(&path)
-        .map_err(|error| contextual(&error, "failed to read network holder process identity"))?;
-    let closing = value
-        .rfind(')')
-        .ok_or_else(|| invalid_data("network holder process identity is malformed"))?;
+    let value = fs::read_to_string(&path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read network holder process identity: {error}"),
+        )
+    })?;
+    let closing = value.rfind(')').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "network holder process identity is malformed",
+        )
+    })?;
     let start_time = value[closing + 1..]
         .split_whitespace()
         .nth(19)
-        .ok_or_else(|| invalid_data("network holder process identity has no start time"))?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "network holder process identity has no start time",
+            )
+        })?
         .parse::<u64>()
-        .map_err(|_| invalid_data("network holder process start time is invalid"))?;
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "network holder process start time is invalid",
+            )
+        })?;
     if start_time == 0 {
-        return Err(invalid_data(
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "network holder process start time must be positive",
         ));
     }

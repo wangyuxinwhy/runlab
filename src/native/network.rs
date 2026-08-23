@@ -18,15 +18,17 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::core::{RunId, RunNetworkFacts, RunNetworkRealization, RunResolverFacts};
+use crate::subprocess::bounded_output;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_HELPER_OUTPUT_BYTES: usize = 64 * 1024;
@@ -47,8 +49,8 @@ const HOST_NETWORK_LOCK_FILE: &str = "network-allocation.lock";
 mod lifecycle;
 
 use lifecycle::{
-    LinkOwnership, NativeNetworkHelperOutput, SharedLoopbackNetwork, TableOwnership,
-    disable_ipv6_for_interface, process_start_time_ticks,
+    LinkOwnership, SharedLoopbackNetwork, TableOwnership, disable_ipv6_for_interface,
+    process_start_time_ticks,
 };
 pub(crate) use lifecycle::{
     NativeNetworkBinding, RunNetwork, connect_loopback_tcp, hold_network_namespace,
@@ -87,11 +89,9 @@ impl RunNetworkPlan {
         }
     }
 
-    pub(crate) fn egress_ipv4(run_id: RunId, subnet_slot: u16) -> io::Result<Self> {
+    pub(crate) fn egress_ipv4(run_id: RunId, subnet_slot: u16) -> Result<Self> {
         if subnet_slot >= EGRESS_SUBNET_COUNT {
-            return Err(invalid_input(format!(
-                "egress subnet slot must be less than {EGRESS_SUBNET_COUNT}"
-            )));
+            bail!("egress subnet slot must be less than {EGRESS_SUBNET_COUNT}");
         }
         Ok(Self {
             schema_version: EGRESS_PLAN_SCHEMA_VERSION,
@@ -116,36 +116,36 @@ impl RunNetworkPlan {
         EGRESS_SUBNET_COUNT
     }
 
-    pub(crate) fn validate(&self) -> io::Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.schema_version != EGRESS_PLAN_SCHEMA_VERSION {
-            return Err(invalid_data(format!(
+            bail!(
                 "unsupported Run network plan schema version: {}",
                 self.schema_version
-            )));
+            );
         }
         match (self.mode, self.egress.as_ref()) {
             (RunNetworkMode::LoopbackOnly, None) => Ok(()),
             (RunNetworkMode::EgressIpv4, Some(plan)) => {
                 if plan.subnet_slot >= EGRESS_SUBNET_COUNT {
-                    return Err(invalid_data("Run network plan subnet slot is invalid"));
+                    bail!("Run network plan subnet slot is invalid");
                 }
                 if plan != &EgressIpv4Plan::new(self.run_id, plan.subnet_slot) {
-                    return Err(invalid_data(
-                        "Run network plan resources do not match its Run identity and subnet slot",
-                    ));
+                    bail!(
+                        "Run network plan resources do not match its Run identity and subnet slot"
+                    );
                 }
                 Ok(())
             }
-            _ => Err(invalid_data("Run network plan mode and resources disagree")),
+            _ => Err(anyhow!("Run network plan mode and resources disagree")),
         }
     }
 
-    pub(crate) fn egress(&self) -> io::Result<&EgressIpv4Plan> {
+    pub(crate) fn egress(&self) -> Result<&EgressIpv4Plan> {
         self.validate()?;
         match (self.mode, self.egress.as_ref()) {
             (RunNetworkMode::EgressIpv4, Some(plan)) => Ok(plan),
-            (RunNetworkMode::LoopbackOnly, None) => Err(invalid_input(
-                "loopback-only Run network plan has no egress resources",
+            (RunNetworkMode::LoopbackOnly, None) => Err(anyhow!(
+                "loopback-only Run network plan has no egress resources"
             )),
             _ => unreachable!("Run network plan shape was validated"),
         }
@@ -305,19 +305,16 @@ pub(crate) struct RunNetworkResources {
 }
 
 impl RunNetworkResources {
-    pub(crate) fn facts(&self, resolver: Option<RunResolverFacts>) -> io::Result<RunNetworkFacts> {
+    pub(crate) fn facts(&self, resolver: Option<RunResolverFacts>) -> Result<RunNetworkFacts> {
         let realization = match self.plan.mode() {
             RunNetworkMode::LoopbackOnly => {
                 if resolver.is_some() {
-                    return Err(invalid_input(
-                        "loopback-only Run network cannot have resolver facts",
-                    ));
+                    bail!("loopback-only Run network cannot have resolver facts");
                 }
                 RunNetworkRealization::LoopbackOnly
             }
             RunNetworkMode::EgressIpv4 => {
-                let resolver = resolver
-                    .ok_or_else(|| invalid_input("IPv4 egress network requires resolver facts"))?;
+                let resolver = resolver.context("IPv4 egress network requires resolver facts")?;
                 let egress = self.plan.egress()?;
                 RunNetworkRealization::Ipv4NatEgress {
                     guest_address: egress.guest_address().to_string(),
@@ -352,7 +349,7 @@ struct NetworkHolderIdentity {
 }
 
 impl NetworkHolderIdentity {
-    fn current(run_id: RunId) -> io::Result<Self> {
+    fn current(run_id: RunId) -> Result<Self> {
         let pid = std::process::id();
         let namespace = namespace_identity(Path::new("/proc/self/ns/net"))?;
         Ok(Self {
@@ -367,41 +364,39 @@ impl NetworkHolderIdentity {
         })
     }
 
-    fn validate(&self, run_id: RunId) -> io::Result<()> {
+    fn validate(&self, run_id: RunId) -> Result<()> {
         if self.schema_version != NETWORK_HOLDER_SCHEMA_VERSION {
-            return Err(invalid_data(format!(
+            bail!(
                 "unsupported network holder identity schema version: {}",
                 self.schema_version
-            )));
+            );
         }
         if self.run_id != run_id {
-            return Err(invalid_data(
-                "network holder identity belongs to a different Run",
-            ));
+            bail!("network holder identity belongs to a different Run");
         }
         if self.pid == 0
             || self.start_time_ticks == 0
             || self.namespace.namespace_device == 0
             || self.namespace.namespace_inode == 0
         {
-            return Err(invalid_data("network holder identity is incomplete"));
+            bail!("network holder identity is incomplete");
         }
         Ok(())
     }
 
-    fn matches_live_process(&self) -> io::Result<bool> {
+    fn matches_live_process(&self) -> Result<bool> {
         match process_start_time_ticks(self.pid) {
             Ok(actual) if actual == self.start_time_ticks => {}
             Ok(_) => return Ok(false),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
         let path = PathBuf::from(format!("/proc/{}/ns/net", self.pid));
         match namespace_identity(&path) {
             Ok(actual) => Ok(actual.device == self.namespace.namespace_device
                 && actual.inode == self.namespace.namespace_inode),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -413,18 +408,15 @@ pub(crate) struct NetworkHolderHandle {
 }
 
 impl NetworkHolderHandle {
-    pub(crate) fn prepare(attempt_workspace: &Path, run_id: RunId) -> io::Result<Self> {
+    pub(crate) fn prepare(attempt_workspace: &Path, run_id: RunId) -> Result<Self> {
         validate_private_directory(attempt_workspace)?;
         let directory = attempt_workspace.join(NETWORK_HOLDER_DIRECTORY);
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
-        builder.create(&directory).map_err(|error| {
-            contextual(
-                &error,
-                format!(
-                    "failed to create network holder directory {}",
-                    directory.display()
-                ),
+        builder.create(&directory).with_context(|| {
+            format!(
+                "failed to create network holder directory {}",
+                directory.display()
             )
         })?;
         sync_directory(attempt_workspace)?;
@@ -433,7 +425,7 @@ impl NetworkHolderHandle {
         Ok(handle)
     }
 
-    pub(crate) fn open(attempt_workspace: &Path, run_id: RunId) -> io::Result<Option<Self>> {
+    pub(crate) fn open(attempt_workspace: &Path, run_id: RunId) -> Result<Option<Self>> {
         validate_private_directory(attempt_workspace)?;
         let directory = attempt_workspace.join(NETWORK_HOLDER_DIRECTORY);
         match fs::symlink_metadata(&directory) {
@@ -443,14 +435,13 @@ impl NetworkHolderHandle {
                 Ok(Some(handle))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(contextual(
-                &error,
-                "failed to inspect network holder directory",
+            Err(error) => Err(anyhow!(
+                "failed to inspect network holder directory: {error}"
             )),
         }
     }
 
-    pub(crate) fn request_stop(&self, timeout: Duration) -> io::Result<()> {
+    pub(crate) fn request_stop(&self, timeout: Duration) -> Result<()> {
         // The caller owns the native-attempt lock, so publishing this tombstone orders before any possible future holder spawn for the same attempt.
         self.validate_directory()?;
         self.publish_stop()?;
@@ -463,65 +454,55 @@ impl NetworkHolderHandle {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "network holder did not stop after its durable stop request",
-                ));
+                bail!("network holder did not stop after its durable stop request");
             }
             sleep_until(deadline);
         }
     }
 
-    fn publish_identity(&self, identity: &NetworkHolderIdentity) -> io::Result<()> {
+    fn publish_identity(&self, identity: &NetworkHolderIdentity) -> Result<()> {
         self.validate_directory()?;
         identity.validate(self.run_id)?;
-        let bytes = serde_json::to_vec(identity).map_err(|error| {
-            invalid_data(format!("failed to encode network holder identity: {error}"))
-        })?;
+        let bytes = serde_json::to_vec(identity)
+            .map_err(|error| anyhow!("failed to encode network holder identity: {error}"))?;
         let path = self.identity_path();
         let mut temporary = NamedTempFile::new_in(&self.directory).map_err(|error| {
-            contextual(
-                &error,
-                "failed to create network holder identity staging file",
-            )
+            anyhow!("failed to create network holder identity staging file: {error}")
         })?;
         temporary
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))?;
         temporary.write_all(&bytes)?;
         temporary.as_file_mut().sync_all()?;
-        temporary.persist_noclobber(&path).map_err(|error| {
-            contextual(&error.error, "failed to publish network holder identity")
-        })?;
+        temporary
+            .persist_noclobber(&path)
+            .map_err(|error| error.error)
+            .context("failed to publish network holder identity")?;
         sync_directory(&self.directory)
     }
 
-    fn read_identity(&self) -> io::Result<Option<NetworkHolderIdentity>> {
+    fn read_identity(&self) -> Result<Option<NetworkHolderIdentity>> {
         let path = self.identity_path();
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(contextual(
-                    &error,
-                    "failed to inspect network holder identity",
+                return Err(anyhow!(
+                    "failed to inspect network holder identity: {error}"
                 ));
             }
         };
         validate_private_file(&path, &metadata)?;
         if metadata.len() > MAX_NETWORK_HOLDER_IDENTITY_BYTES {
-            return Err(invalid_data(format!(
-                "network holder identity exceeds {MAX_NETWORK_HOLDER_IDENTITY_BYTES} bytes"
-            )));
+            bail!("network holder identity exceeds {MAX_NETWORK_HOLDER_IDENTITY_BYTES} bytes");
         }
-        let identity = serde_json::from_slice::<NetworkHolderIdentity>(&fs::read(&path)?).map_err(
-            |error| invalid_data(format!("network holder identity is invalid: {error}")),
-        )?;
+        let identity = serde_json::from_slice::<NetworkHolderIdentity>(&fs::read(&path)?)
+            .map_err(|error| anyhow!("network holder identity is invalid: {error}"))?;
         identity.validate(self.run_id)?;
         Ok(Some(identity))
     }
 
-    fn stop_requested(&self) -> io::Result<bool> {
+    fn stop_requested(&self) -> Result<bool> {
         let path = self.stop_path();
         match fs::symlink_metadata(&path) {
             Ok(metadata) => {
@@ -529,14 +510,13 @@ impl NetworkHolderHandle {
                 Ok(true)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(contextual(
-                &error,
-                "failed to inspect network holder stop request",
+            Err(error) => Err(anyhow!(
+                "failed to inspect network holder stop request: {error}"
             )),
         }
     }
 
-    fn publish_stop(&self) -> io::Result<()> {
+    fn publish_stop(&self) -> Result<()> {
         let path = self.stop_path();
         let file = match OpenOptions::new()
             .create_new(true)
@@ -551,9 +531,8 @@ impl NetworkHolderHandle {
                 return Ok(());
             }
             Err(error) => {
-                return Err(contextual(
-                    &error,
-                    "failed to publish network holder stop request",
+                return Err(anyhow!(
+                    "failed to publish network holder stop request: {error}"
                 ));
             }
         };
@@ -561,7 +540,7 @@ impl NetworkHolderHandle {
         sync_directory(&self.directory)
     }
 
-    fn validate_directory(&self) -> io::Result<()> {
+    fn validate_directory(&self) -> Result<()> {
         validate_private_directory(&self.directory)
     }
 
@@ -584,14 +563,13 @@ pub(crate) struct NativeNetworkTools {
 }
 
 impl NativeNetworkTools {
-    pub(crate) fn discover() -> io::Result<Self> {
+    pub(crate) fn discover() -> Result<Self> {
         Self::from_paths_with_holder(
             find_executable("unshare")?,
             find_executable("nsenter")?,
             find_executable("ip")?,
             find_executable("cat")?,
-            std::env::current_exe()
-                .map_err(|error| contextual(&error, "failed to locate the RunLab executable"))?,
+            std::env::current_exe().context("failed to locate the RunLab executable")?,
         )
     }
 
@@ -601,9 +579,9 @@ impl NativeNetworkTools {
         nsenter: impl AsRef<Path>,
         ip: impl AsRef<Path>,
         cat: impl AsRef<Path>,
-    ) -> io::Result<Self> {
-        let holder_executable = std::env::current_exe()
-            .map_err(|error| contextual(&error, "failed to locate the RunLab executable"))?;
+    ) -> Result<Self> {
+        let holder_executable =
+            std::env::current_exe().context("failed to locate the RunLab executable")?;
         Self::from_paths_with_holder(unshare, nsenter, ip, cat, holder_executable)
     }
 
@@ -613,7 +591,7 @@ impl NativeNetworkTools {
         ip: impl AsRef<Path>,
         cat: impl AsRef<Path>,
         holder_executable: impl AsRef<Path>,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         Ok(Self {
             unshare: validate_executable(unshare.as_ref())?,
             nsenter: validate_executable(nsenter.as_ref())?,
@@ -648,7 +626,7 @@ struct Ipv4Prefix {
 }
 
 impl EgressNetworkTools {
-    pub(crate) fn discover() -> io::Result<Self> {
+    pub(crate) fn discover() -> Result<Self> {
         Self::from_paths(
             find_executable("ip")?,
             find_executable("nft")?,
@@ -660,7 +638,7 @@ impl EgressNetworkTools {
         ip: impl AsRef<Path>,
         nft: impl AsRef<Path>,
         conntrack: impl AsRef<Path>,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         Ok(Self {
             ip: validate_executable(ip.as_ref())?,
             nft: validate_executable(nft.as_ref())?,
@@ -668,12 +646,12 @@ impl EgressNetworkTools {
         })
     }
 
-    pub(crate) fn preflight(&self, timeout: Duration) -> io::Result<()> {
+    pub(crate) fn preflight(&self, timeout: Duration) -> Result<()> {
         deadline(timeout, "network helper timeout")?;
         let forwarding = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
-            .map_err(|error| contextual(&error, "failed to inspect IPv4 forwarding"))?;
+            .context("failed to inspect IPv4 forwarding")?;
         if forwarding.trim() != "1" {
-            return Err(other("rootful IPv4 egress requires net.ipv4.ip_forward=1"));
+            bail!("rootful IPv4 egress requires net.ipv4.ip_forward=1");
         }
         let mut ip = Command::new(&self.ip);
         ip.arg("-Version");
@@ -690,7 +668,7 @@ impl EgressNetworkTools {
         Ok(())
     }
 
-    pub(crate) fn cleanup_plan(&self, plan: &RunNetworkPlan, timeout: Duration) -> io::Result<()> {
+    pub(crate) fn cleanup_plan(&self, plan: &RunNetworkPlan, timeout: Duration) -> Result<()> {
         let deadline = deadline(timeout, "network cleanup timeout")?;
         let host_lock = acquire_host_network_lock(remaining(deadline, "network cleanup timeout")?)?;
         self.cleanup_plan_locked(
@@ -705,15 +683,15 @@ impl EgressNetworkTools {
         plan: &RunNetworkPlan,
         timeout: Duration,
         _host_lock: &HostNetworkLock,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let plan = plan.egress()?;
         let deadline = deadline(timeout, "network cleanup timeout")?;
         let link = self.inspect_link(plan, remaining(deadline, "network cleanup timeout")?)?;
         if link == LinkOwnership::Foreign {
-            return Err(other(format!(
+            bail!(
                 "refusing to clean network resources while interface is not owned by this Run: {}",
                 plan.host_interface()
-            )));
+            );
         }
         self.cleanup_nft(plan, remaining(deadline, "network cleanup timeout")?)?;
         let remove_conntrack = match link {
@@ -732,7 +710,7 @@ impl EgressNetworkTools {
         self.cleanup_link(plan, remaining(deadline, "network cleanup timeout")?)
     }
 
-    pub(crate) fn route_snapshot(&self, timeout: Duration) -> io::Result<EgressRouteSnapshot> {
+    pub(crate) fn route_snapshot(&self, timeout: Duration) -> Result<EgressRouteSnapshot> {
         let mut command = Command::new(&self.ip);
         command.args(["-4", "-json", "route", "show", "table", "all"]);
         let output = run_bounded(command, timeout)?;
@@ -745,7 +723,7 @@ impl EgressNetworkTools {
         plan: &RunNetworkPlan,
         routes: &EgressRouteSnapshot,
         timeout: Duration,
-    ) -> io::Result<bool> {
+    ) -> Result<bool> {
         let plan = plan.egress()?;
         if routes.overlaps(plan)? {
             return Ok(false);
@@ -758,7 +736,7 @@ impl EgressNetworkTools {
         plan: &EgressIpv4Plan,
         network: &mut SharedLoopbackNetwork,
         timeout: Duration,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let deadline = deadline(timeout, "network setup timeout")?;
         self.require_absent(plan, remaining(deadline, "network setup timeout")?)?;
         let binding = network.binding()?;
@@ -773,12 +751,7 @@ impl EgressNetworkTools {
         )
     }
 
-    fn apply_host(
-        &self,
-        plan: &EgressIpv4Plan,
-        holder_pid: u32,
-        deadline: Instant,
-    ) -> io::Result<()> {
+    fn apply_host(&self, plan: &EgressIpv4Plan, holder_pid: u32, deadline: Instant) -> Result<()> {
         self.ip(
             [
                 "link",
@@ -859,7 +832,7 @@ impl EgressNetworkTools {
         plan: &EgressIpv4Plan,
         binding: &NativeNetworkBinding,
         deadline: Instant,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         self.ip_in_namespace(
             binding,
             [
@@ -907,26 +880,20 @@ impl EgressNetworkTools {
         )
     }
 
-    fn require_absent(&self, plan: &EgressIpv4Plan, timeout: Duration) -> io::Result<()> {
+    fn require_absent(&self, plan: &EgressIpv4Plan, timeout: Duration) -> Result<()> {
         if self.inspect_link(plan, timeout)? != LinkOwnership::Absent {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "Run egress interface already exists: {}",
-                    plan.host_interface()
-                ),
-            ));
+            bail!(
+                "Run egress interface already exists: {}",
+                plan.host_interface()
+            );
         }
         if self.inspect_table(plan, timeout)? != TableOwnership::Absent {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("Run egress nft table already exists: {}", plan.nft_table()),
-            ));
+            bail!("Run egress nft table already exists: {}", plan.nft_table());
         }
         Ok(())
     }
 
-    fn cleanup_nft(&self, plan: &EgressIpv4Plan, timeout: Duration) -> io::Result<()> {
+    fn cleanup_nft(&self, plan: &EgressIpv4Plan, timeout: Duration) -> Result<()> {
         match self.inspect_table(plan, timeout)? {
             TableOwnership::Absent => Ok(()),
             TableOwnership::Owned => self.nft_batch(
@@ -934,14 +901,14 @@ impl EgressNetworkTools {
                 timeout,
                 "failed to delete Run egress firewall",
             ),
-            TableOwnership::Foreign => Err(other(format!(
+            TableOwnership::Foreign => Err(anyhow!(
                 "refusing to delete nft table not owned by this Run: {}",
                 plan.nft_table()
-            ))),
+            )),
         }
     }
 
-    fn cleanup_link(&self, plan: &EgressIpv4Plan, timeout: Duration) -> io::Result<()> {
+    fn cleanup_link(&self, plan: &EgressIpv4Plan, timeout: Duration) -> Result<()> {
         match self.inspect_link(plan, timeout)? {
             LinkOwnership::Absent => Ok(()),
             LinkOwnership::Owned | LinkOwnership::CreatePending => self.ip(
@@ -949,14 +916,14 @@ impl EgressNetworkTools {
                 timeout,
                 "failed to delete Run egress veth",
             ),
-            LinkOwnership::Foreign => Err(other(format!(
+            LinkOwnership::Foreign => Err(anyhow!(
                 "refusing to delete interface not owned by this Run: {}",
                 plan.host_interface()
-            ))),
+            )),
         }
     }
 
-    fn cleanup_conntrack(&self, plan: &EgressIpv4Plan, timeout: Duration) -> io::Result<()> {
+    fn cleanup_conntrack(&self, plan: &EgressIpv4Plan, timeout: Duration) -> Result<()> {
         let deadline = deadline(timeout, "conntrack cleanup timeout")?;
         if self.conntrack_is_empty(plan, remaining(deadline, "conntrack cleanup timeout")?)? {
             return Ok(());
@@ -977,7 +944,7 @@ impl EgressNetworkTools {
         ))
     }
 
-    fn conntrack_is_empty(&self, plan: &EgressIpv4Plan, timeout: Duration) -> io::Result<bool> {
+    fn conntrack_is_empty(&self, plan: &EgressIpv4Plan, timeout: Duration) -> Result<bool> {
         let mut command = Command::new(&self.conntrack);
         command.env("LC_ALL", "C").args([
             "-L",
@@ -991,7 +958,7 @@ impl EgressNetworkTools {
         Ok(output.stdout.iter().all(u8::is_ascii_whitespace))
     }
 
-    fn inspect_link(&self, plan: &EgressIpv4Plan, timeout: Duration) -> io::Result<LinkOwnership> {
+    fn inspect_link(&self, plan: &EgressIpv4Plan, timeout: Duration) -> Result<LinkOwnership> {
         let sysfs = Path::new("/sys/class/net").join(plan.host_interface());
         if !sysfs.exists() {
             return Ok(LinkOwnership::Absent);
@@ -1018,11 +985,7 @@ impl EgressNetworkTools {
         classify_link(plan, &output.stdout)
     }
 
-    fn inspect_table(
-        &self,
-        plan: &EgressIpv4Plan,
-        timeout: Duration,
-    ) -> io::Result<TableOwnership> {
+    fn inspect_table(&self, plan: &EgressIpv4Plan, timeout: Duration) -> Result<TableOwnership> {
         let deadline = deadline(timeout, "network firewall inspection timeout")?;
         let mut command = Command::new(&self.nft);
         command.args(["--json", "list", "table", "ip", plan.nft_table()]);
@@ -1057,7 +1020,7 @@ impl EgressNetworkTools {
         classify_table(plan, &output.stdout, &text_output.stdout)
     }
 
-    fn ip<I, S>(&self, arguments: I, timeout: Duration, operation: &str) -> io::Result<()>
+    fn ip<I, S>(&self, arguments: I, timeout: Duration, operation: &str) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1073,7 +1036,7 @@ impl EgressNetworkTools {
         arguments: I,
         timeout: Duration,
         operation: &str,
-    ) -> io::Result<()>
+    ) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1081,7 +1044,7 @@ impl EgressNetworkTools {
         require_success(&binding.invoke(&self.ip, arguments, timeout)?, operation)
     }
 
-    fn nft_batch(&self, input: &[u8], timeout: Duration, operation: &str) -> io::Result<()> {
+    fn nft_batch(&self, input: &[u8], timeout: Duration, operation: &str) -> Result<()> {
         let mut command = Command::new(&self.nft);
         command.args(["--check", "--file", "-"]);
         require_success(
@@ -1094,13 +1057,10 @@ impl EgressNetworkTools {
     }
 }
 
-pub(crate) fn acquire_host_network_lock(timeout: Duration) -> io::Result<HostNetworkLock> {
+pub(crate) fn acquire_host_network_lock(timeout: Duration) -> Result<HostNetworkLock> {
     {
         if !rustix::process::geteuid().is_root() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "host network lock requires root",
-            ));
+            bail!("host network lock requires root");
         }
         let directory = Path::new(HOST_NETWORK_LOCK_DIRECTORY);
         prepare_host_network_lock_directory(directory)?;
@@ -1108,16 +1068,15 @@ pub(crate) fn acquire_host_network_lock(timeout: Duration) -> io::Result<HostNet
     }
 }
 
-fn prepare_host_network_lock_directory(directory: &Path) -> io::Result<()> {
+fn prepare_host_network_lock_directory(directory: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
     match builder.create(directory) {
         Ok(()) => fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => {
-            return Err(contextual(
-                &error,
-                "failed to create host network lock directory",
+            return Err(anyhow!(
+                "failed to create host network lock directory: {error}"
             ));
         }
     }
@@ -1128,7 +1087,7 @@ fn acquire_host_network_lock_in(
     directory: &Path,
     expected_owner: (u32, u32),
     timeout: Duration,
-) -> io::Result<HostNetworkLock> {
+) -> Result<HostNetworkLock> {
     use rustix::fs::{Mode, OFlags, open};
 
     verify_host_network_lock_directory(directory, expected_owner)?;
@@ -1146,10 +1105,7 @@ fn acquire_host_network_lock_in(
         || (metadata.uid(), metadata.gid()) != expected_owner
         || metadata.permissions().mode() & 0o777 != 0o600
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "host network lock is not an owner-controlled 0600 regular file",
-        ));
+        bail!("host network lock is not an owner-controlled 0600 regular file");
     }
     let current = fs::symlink_metadata(&path)?;
     if current.file_type().is_symlink()
@@ -1157,10 +1113,7 @@ fn acquire_host_network_lock_in(
         || current.dev() != metadata.dev()
         || current.ino() != metadata.ino()
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "host network lock identity changed while opening it",
-        ));
+        bail!("host network lock identity changed while opening it");
     }
     let deadline = deadline(timeout, "host network allocation timeout")?;
     loop {
@@ -1170,202 +1123,95 @@ fn acquire_host_network_lock_in(
                 thread::sleep(POLL_INTERVAL);
             }
             Err(TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "host network lock timed out",
-                ));
+                bail!("host network lock timed out");
             }
             Err(TryLockError::Error(error)) => {
-                return Err(contextual(&error, "failed to acquire host network lock"));
+                return Err(anyhow!("failed to acquire host network lock: {error}"));
             }
         }
     }
 }
 
-fn verify_host_network_lock_directory(
-    directory: &Path,
-    expected_owner: (u32, u32),
-) -> io::Result<()> {
+fn verify_host_network_lock_directory(directory: &Path, expected_owner: (u32, u32)) -> Result<()> {
     let metadata = fs::symlink_metadata(directory)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
         || (metadata.uid(), metadata.gid()) != expected_owner
         || metadata.permissions().mode() & 0o777 != 0o700
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "host network lock directory is not owner-controlled mode 0700",
-        ));
+        bail!("host network lock directory is not owner-controlled mode 0700");
     }
     Ok(())
 }
 
-fn run_bounded(command: Command, timeout: Duration) -> io::Result<NativeNetworkHelperOutput> {
+fn run_bounded(command: Command, timeout: Duration) -> Result<Output> {
     run_bounded_command(command, None, timeout)
 }
 
-fn run_bounded_with_input(
-    command: Command,
-    input: &[u8],
-    timeout: Duration,
-) -> io::Result<NativeNetworkHelperOutput> {
+fn run_bounded_with_input(command: Command, input: &[u8], timeout: Duration) -> Result<Output> {
     if input.len() > MAX_HELPER_INPUT_BYTES {
-        return Err(invalid_input(format!(
-            "network helper input exceeds {MAX_HELPER_INPUT_BYTES} bytes"
-        )));
+        bail!("network helper input exceeds {MAX_HELPER_INPUT_BYTES} bytes");
     }
     run_bounded_command(command, Some(input), timeout)
 }
 
+/// Run a network helper under a bound.
+///
+/// `LC_ALL=C` keeps helper diagnostics parseable regardless of the host locale.
 fn run_bounded_command(
     mut command: Command,
     input: Option<&[u8]>,
     timeout: Duration,
-) -> io::Result<NativeNetworkHelperOutput> {
-    let deadline = deadline(timeout, "network helper timeout")?;
+) -> Result<Output> {
     command.env("LC_ALL", "C");
-    let mut child = command
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| contextual(&error, "failed to start network helper"))?;
-    let input_writer = match input {
-        Some(input) => {
-            let Some(mut stdin) = child.stdin.take() else {
-                let _ = force_reap(&mut child)?;
-                return Err(invalid_data("network helper did not expose stdin"));
-            };
-            let input = input.to_vec();
-            Some(thread::spawn(move || stdin.write_all(&input)))
-        }
-        None => None,
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = force_reap(&mut child)?;
-        return Err(invalid_data("network helper did not expose stdout"));
-    };
-    let Some(stderr) = child.stderr.take() else {
-        let _ = force_reap(&mut child)?;
-        return Err(invalid_data("network helper did not expose stderr"));
-    };
-    let stdout = thread::spawn(move || read_bounded(stdout));
-    let stderr = thread::spawn(move || read_bounded(stderr));
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => {
-                if let Err(cleanup_error) = force_reap(&mut child) {
-                    return Err(other(format!(
-                        "failed to poll network helper: {error}; cleanup also failed: {cleanup_error}"
-                    )));
-                }
-                let input_error = join_input(input_writer);
-                let stdout = join_capture(stdout)?;
-                let stderr = join_capture(stderr)?;
-                return Err(other(format!(
-                    "failed to poll network helper: {error}; input: {}; stdout: {}; stderr: {}",
-                    input_result(&input_error),
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                )));
-            }
-        }
-        if Instant::now() >= deadline {
-            if let Err(cleanup_error) = force_reap(&mut child) {
-                return Err(other(format!(
-                    "network helper exceeded {timeout:?}; cleanup also failed: {cleanup_error}"
-                )));
-            }
-            let input_error = join_input(input_writer);
-            let stdout = join_capture(stdout)?;
-            let stderr = join_capture(stderr)?;
-            return Err(other(format!(
-                "network helper exceeded {timeout:?}; input: {}; stdout: {}; stderr: {}",
-                input_result(&input_error),
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr)
-            )));
-        }
-        sleep_until(deadline);
-    };
-    let input_error = join_input(input_writer);
-    let output = NativeNetworkHelperOutput {
-        status,
-        stdout: join_capture(stdout)?,
-        stderr: join_capture(stderr)?,
-    };
-    if output.status.success()
-        && let Err(error) = input_error
-    {
-        return Err(contextual(&error, "failed to write network helper input"));
-    }
-    Ok(output)
+    bounded_output(
+        &mut command,
+        input,
+        timeout,
+        MAX_HELPER_OUTPUT_BYTES,
+        "network helper",
+    )
 }
 
-fn join_input(handle: Option<JoinHandle<io::Result<()>>>) -> io::Result<()> {
-    handle.map_or(Ok(()), |handle| {
-        handle
-            .join()
-            .map_err(|_| other("network helper input writer panicked"))?
-    })
-}
-
-fn input_result(result: &io::Result<()>) -> String {
-    match result {
-        Ok(()) => "complete".to_owned(),
-        Err(error) => format!("failed: {error}"),
-    }
-}
-
-fn read_bounded(mut reader: impl Read) -> io::Result<Vec<u8>> {
+fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .by_ref()
         .take(u64::try_from(MAX_HELPER_OUTPUT_BYTES).unwrap_or(u64::MAX) + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_HELPER_OUTPUT_BYTES {
-        return Err(other(format!(
-            "network helper output exceeds {MAX_HELPER_OUTPUT_BYTES} bytes"
-        )));
+        bail!("network helper output exceeds {MAX_HELPER_OUTPUT_BYTES} bytes");
     }
     Ok(bytes)
 }
 
-fn join_capture(handle: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+fn join_capture(handle: JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
     handle
         .join()
-        .map_err(|_| other("network helper output reader panicked"))?
+        .map_err(|_| anyhow!("network helper output reader panicked"))?
 }
 
-fn force_reap(child: &mut Child) -> io::Result<ExitStatus> {
+fn force_reap(child: &mut Child) -> Result<ExitStatus> {
     if let Some(status) = child
         .try_wait()
-        .map_err(|error| contextual(&error, "failed to poll child before forced cleanup"))?
+        .context("failed to poll child before forced cleanup")?
     {
         return Ok(status);
     }
     if let Err(kill_error) = child.kill() {
         if let Some(status) = child
             .try_wait()
-            .map_err(|error| contextual(&error, "failed to repoll child during forced cleanup"))?
+            .context("failed to repoll child during forced cleanup")?
         {
             return Ok(status);
         }
-        return Err(contextual(
-            &kill_error,
-            "failed to kill child during forced cleanup",
+        return Err(anyhow!(
+            "failed to kill child during forced cleanup: {kill_error}"
         ));
     }
     child
         .wait()
-        .map_err(|error| contextual(&error, "failed to reap child during forced cleanup"))
+        .context("failed to reap child during forced cleanup")
 }
 
 fn namespace_identity(path: &Path) -> io::Result<NamespaceFileIdentity> {
@@ -1382,100 +1228,82 @@ struct NamespaceFileIdentity {
     inode: u64,
 }
 
-fn find_executable(name: &str) -> io::Result<PathBuf> {
-    let path = std::env::var_os("PATH").ok_or_else(|| invalid_input("PATH is not set"))?;
+fn find_executable(name: &str) -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").context("PATH is not set")?;
     for directory in std::env::split_paths(&path) {
         let candidate = directory.join(name);
         if candidate.is_file() {
             return validate_executable(&candidate);
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("executable is not available in PATH: {name}"),
-    ))
+    bail!("executable is not available in PATH: {name}")
 }
 
-fn validate_executable(path: &Path) -> io::Result<PathBuf> {
+fn validate_executable(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
-        return Err(invalid_input(format!(
+        bail!(
             "helper executable path must be absolute: {}",
             path.display()
-        )));
+        );
     }
-    let path = path.canonicalize().map_err(|error| {
-        contextual(
-            &error,
-            format!("failed to resolve helper executable {}", path.display()),
-        )
-    })?;
-    let metadata = path.metadata().map_err(|error| {
-        contextual(
-            &error,
-            format!("failed to inspect helper executable {}", path.display()),
-        )
-    })?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve helper executable {}", path.display()))?;
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("failed to inspect helper executable {}", path.display()))?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err(invalid_input(format!(
+        bail!(
             "helper executable is not an executable regular file: {}",
             path.display()
-        )));
+        );
     }
     Ok(path)
 }
 
-fn validate_private_directory(path: &Path) -> io::Result<()> {
+fn validate_private_directory(path: &Path) -> Result<()> {
     if !path.is_absolute() {
-        return Err(invalid_input(format!(
-            "network holder path must be absolute: {}",
-            path.display()
-        )));
+        bail!("network holder path must be absolute: {}", path.display());
     }
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        contextual(
-            &error,
-            format!("failed to inspect network holder path {}", path.display()),
-        )
-    })?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect network holder path {}", path.display()))?;
     if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o777 != 0o700 {
-        return Err(invalid_data(format!(
+        bail!(
             "network holder path must be a real 0700 directory: {}",
             path.display()
-        )));
+        );
     }
     Ok(())
 }
 
-fn validate_private_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+fn validate_private_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
     if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
-        return Err(invalid_data(format!(
+        bail!(
             "network holder file must be a real 0600 file: {}",
             path.display()
-        )));
+        );
     }
     Ok(())
 }
 
-fn sync_directory(path: &Path) -> io::Result<()> {
-    fs::File::open(path)?.sync_all()
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
 }
 
-fn deadline(timeout: Duration, name: &str) -> io::Result<Instant> {
+fn deadline(timeout: Duration, name: &str) -> Result<Instant> {
     if timeout.is_zero() {
-        return Err(invalid_input(format!("{name} must be greater than zero")));
+        bail!("{name} must be greater than zero");
     }
     Instant::now()
         .checked_add(timeout)
-        .ok_or_else(|| invalid_input(format!("{name} is too large")))
+        .with_context(|| format!("{name} is too large"))
 }
 
-fn remaining(deadline: Instant, name: &str) -> io::Result<Duration> {
+fn remaining(deadline: Instant, name: &str) -> Result<Duration> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{name} elapsed"),
-        ));
+        bail!("{name} elapsed");
     }
     Ok(remaining)
 }
@@ -1484,16 +1312,16 @@ fn sleep_until(deadline: Instant) {
     thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
 }
 
-fn helper_failure(operation: &str, output: &NativeNetworkHelperOutput) -> io::Error {
-    other(format!(
+fn helper_failure(operation: &str, output: &Output) -> anyhow::Error {
+    anyhow!(
         "{operation}: {}; stdout: {}; stderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    ))
+    )
 }
 
-fn require_success(output: &NativeNetworkHelperOutput, operation: &str) -> io::Result<()> {
+fn require_success(output: &Output, operation: &str) -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
@@ -1502,7 +1330,7 @@ fn require_success(output: &NativeNetworkHelperOutput, operation: &str) -> io::R
 }
 
 impl EgressRouteSnapshot {
-    fn overlaps(&self, plan: &EgressIpv4Plan) -> io::Result<bool> {
+    fn overlaps(&self, plan: &EgressIpv4Plan) -> Result<bool> {
         let candidate = parse_ipv4_prefix(&plan.subnet_cidr())?;
         Ok(self
             .prefixes
@@ -1519,9 +1347,9 @@ impl Ipv4Prefix {
     }
 }
 
-fn parse_route_snapshot(bytes: &[u8]) -> io::Result<EgressRouteSnapshot> {
-    let routes: Vec<serde_json::Value> = serde_json::from_slice(bytes)
-        .map_err(|error| invalid_data(format!("invalid ip route JSON: {error}")))?;
+fn parse_route_snapshot(bytes: &[u8]) -> Result<EgressRouteSnapshot> {
+    let routes: Vec<serde_json::Value> =
+        serde_json::from_slice(bytes).map_err(|error| anyhow!("invalid ip route JSON: {error}"))?;
     let mut prefixes = Vec::with_capacity(routes.len());
     for route in routes {
         let Some(destination) = route.get("dst") else {
@@ -1529,7 +1357,7 @@ fn parse_route_snapshot(bytes: &[u8]) -> io::Result<EgressRouteSnapshot> {
         };
         let destination = destination
             .as_str()
-            .ok_or_else(|| invalid_data("ip route destination is not a string"))?;
+            .context("ip route destination is not a string")?;
         if destination == "default" {
             continue;
         }
@@ -1538,16 +1366,16 @@ fn parse_route_snapshot(bytes: &[u8]) -> io::Result<EgressRouteSnapshot> {
     Ok(EgressRouteSnapshot { prefixes })
 }
 
-fn parse_ipv4_prefix(value: &str) -> io::Result<Ipv4Prefix> {
+fn parse_ipv4_prefix(value: &str) -> Result<Ipv4Prefix> {
     let (address, prefix_length) = value.split_once('/').map_or((value, "32"), |parts| parts);
     let address = address
         .parse::<Ipv4Addr>()
-        .map_err(|_| invalid_data(format!("invalid IPv4 route prefix: {value}")))?;
+        .map_err(|_| anyhow!("invalid IPv4 route prefix: {value}"))?;
     let prefix_length = prefix_length
         .parse::<u8>()
         .ok()
         .filter(|length| *length <= 32)
-        .ok_or_else(|| invalid_data(format!("invalid IPv4 route prefix: {value}")))?;
+        .with_context(|| format!("invalid IPv4 route prefix: {value}"))?;
     let mask = prefix_mask(prefix_length);
     Ok(Ipv4Prefix {
         network: u32::from(address) & mask,
@@ -1563,7 +1391,7 @@ fn prefix_mask(prefix_length: u8) -> u32 {
     }
 }
 
-fn classify_link(plan: &EgressIpv4Plan, bytes: &[u8]) -> io::Result<LinkOwnership> {
+fn classify_link(plan: &EgressIpv4Plan, bytes: &[u8]) -> Result<LinkOwnership> {
     #[derive(Deserialize)]
     struct LinkInfo {
         info_kind: Option<String>,
@@ -1577,12 +1405,10 @@ fn classify_link(plan: &EgressIpv4Plan, bytes: &[u8]) -> io::Result<LinkOwnershi
         linkinfo: Option<LinkInfo>,
     }
 
-    let links: Vec<Link> = serde_json::from_slice(bytes)
-        .map_err(|error| invalid_data(format!("invalid ip link JSON: {error}")))?;
+    let links: Vec<Link> =
+        serde_json::from_slice(bytes).map_err(|error| anyhow!("invalid ip link JSON: {error}"))?;
     let [link] = links.as_slice() else {
-        return Err(invalid_data(
-            "ip link inspection did not return exactly one interface",
-        ));
+        bail!("ip link inspection did not return exactly one interface");
     };
     if link.ifname != plan.host_interface
         || !link
@@ -1608,16 +1434,16 @@ fn classify_table(
     plan: &EgressIpv4Plan,
     json_bytes: &[u8],
     text_bytes: &[u8],
-) -> io::Result<TableOwnership> {
+) -> Result<TableOwnership> {
     let value: serde_json::Value = serde_json::from_slice(json_bytes)
-        .map_err(|error| invalid_data(format!("invalid nft table JSON: {error}")))?;
+        .map_err(|error| anyhow!("invalid nft table JSON: {error}"))?;
     let entries = value
         .get("nftables")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| invalid_data("nft table JSON has no nftables array"))?;
+        .context("nft table JSON has no nftables array")?;
     let mut tables = entries.iter().filter_map(|entry| entry.get("table"));
     let Some(table) = tables.next() else {
-        return Err(invalid_data("nft table JSON has no table object"));
+        bail!("nft table JSON has no table object");
     };
     if tables.next().is_some()
         || table.get("family").and_then(serde_json::Value::as_str) != Some("ip")
@@ -1633,7 +1459,7 @@ fn classify_table(
         return Ok(TableOwnership::Foreign);
     }
     let text = std::str::from_utf8(text_bytes)
-        .map_err(|error| invalid_data(format!("invalid nft table text: {error}")))?;
+        .map_err(|error| anyhow!("invalid nft table text: {error}"))?;
     let expected = format!("comment {}", nft_string(plan.owner()));
     Ok(
         if text
@@ -1687,22 +1513,6 @@ fn nft_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
-}
-
-fn contextual(error: &io::Error, context: impl AsRef<str>) -> io::Error {
-    io::Error::new(error.kind(), format!("{}: {error}", context.as_ref()))
-}
-
-fn invalid_data(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
-
-fn invalid_input(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
-}
-
-fn other(message: impl Into<String>) -> io::Error {
-    io::Error::other(message.into())
 }
 
 #[cfg(test)]
@@ -1776,36 +1586,40 @@ mod tests {
 
     #[test]
     fn network_plan_rejects_invalid_shape_and_subnet_slot() {
-        assert_eq!(
-            RunNetworkPlan::egress_ipv4(RunId::new(), EGRESS_SUBNET_COUNT)
-                .expect_err("out-of-range slot")
-                .kind(),
-            io::ErrorKind::InvalidInput
+        assert!(
+            format!(
+                "{:#}",
+                RunNetworkPlan::egress_ipv4(RunId::new(), EGRESS_SUBNET_COUNT)
+                    .expect_err("out-of-range slot")
+            )
+            .contains(&format!("slot must be less than {EGRESS_SUBNET_COUNT}"))
         );
         let loopback = RunNetworkPlan::loopback(RunId::new());
         assert_eq!(loopback.mode(), RunNetworkMode::LoopbackOnly);
-        assert_eq!(
-            loopback.egress().expect_err("egress resources").kind(),
-            io::ErrorKind::InvalidInput
+        assert!(
+            format!("{:#}", loopback.egress().expect_err("egress resources"))
+                .contains("loopback-only Run network plan has no egress resources")
         );
 
         let mut value = serde_json::to_value(egress_plan()).expect("plan JSON");
         value["mode"] = serde_json::json!("loopback_only");
         let inconsistent: RunNetworkPlan = serde_json::from_value(value).expect("structural JSON");
-        assert_eq!(
-            inconsistent.egress().expect_err("mode mismatch").kind(),
-            io::ErrorKind::InvalidData
+        assert!(
+            format!("{:#}", inconsistent.egress().expect_err("mode mismatch"))
+                .contains("Run network plan mode and resources disagree")
         );
 
         let mut value = serde_json::to_value(egress_plan()).expect("plan JSON");
         value["egress"]["host_interface"] = serde_json::json!("eth0");
         let redirected: RunNetworkPlan = serde_json::from_value(value).expect("structural JSON");
-        assert_eq!(
-            redirected
-                .validate()
-                .expect_err("derived resource mismatch")
-                .kind(),
-            io::ErrorKind::InvalidData
+        assert!(
+            format!(
+                "{:#}",
+                redirected
+                    .validate()
+                    .expect_err("derived resource mismatch")
+            )
+            .contains("Run network plan resources do not match its Run identity and subnet slot")
         );
     }
 
@@ -1957,11 +1771,16 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect_err("oversized helper input");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            format!("{error:#}").contains(&format!("input exceeds {MAX_HELPER_INPUT_BYTES} bytes"))
+        );
 
         let output = vec![0_u8; MAX_HELPER_OUTPUT_BYTES + 1];
         let error = read_bounded(Cursor::new(output)).expect_err("oversized helper output");
-        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            format!("{error:#}")
+                .contains(&format!("output exceeds {MAX_HELPER_OUTPUT_BYTES} bytes"))
+        );
     }
 
     #[test]
@@ -1977,11 +1796,13 @@ mod tests {
             let snapshot = parse_route_snapshot(&bytes).expect("occupied routes");
             assert!(snapshot.overlaps(egress).expect("occupied subnet"));
         }
-        assert_eq!(
-            parse_route_snapshot(br#"{"dst":"10.240.8.4/30"}"#)
-                .expect_err("non-array route result")
-                .kind(),
-            io::ErrorKind::InvalidData
+        assert!(
+            format!(
+                "{:#}",
+                parse_route_snapshot(br#"{"dst":"10.240.8.4/30"}"#)
+                    .expect_err("non-array route result")
+            )
+            .contains("invalid ip route JSON")
         );
     }
 
@@ -2022,11 +1843,13 @@ mod tests {
             0o600
         );
 
-        assert_eq!(
-            NetworkHolderHandle::prepare(workspace.path(), run_id)
-                .expect_err("holder cannot be recreated")
-                .kind(),
-            io::ErrorKind::AlreadyExists
+        assert!(
+            format!(
+                "{:#}",
+                NetworkHolderHandle::prepare(workspace.path(), run_id)
+                    .expect_err("holder cannot be recreated")
+            )
+            .contains("failed to create network holder directory")
         );
     }
 
@@ -2058,14 +1881,16 @@ mod tests {
             .request_stop(Duration::from_secs(1))
             .expect("stale holder is already stopped");
 
-        assert_eq!(
-            NetworkHolderHandle::open(workspace.path(), RunId::new())
-                .expect("open handle")
-                .expect("existing handle")
-                .read_identity()
-                .expect_err("cross-Run identity")
-                .kind(),
-            io::ErrorKind::InvalidData
+        assert!(
+            format!(
+                "{:#}",
+                NetworkHolderHandle::open(workspace.path(), RunId::new())
+                    .expect("open handle")
+                    .expect("existing handle")
+                    .read_identity()
+                    .expect_err("cross-Run identity")
+            )
+            .contains("network holder identity belongs to a different Run")
         );
     }
 
@@ -2100,7 +1925,7 @@ mod tests {
     fn helper_paths_must_be_absolute_executable_files() {
         let error = NativeNetworkTools::from_paths("unshare", "nsenter", "ip", "cat")
             .expect_err("relative helpers");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(format!("{error:#}").contains("helper executable path must be absolute"));
 
         let executable = std::env::current_exe().expect("test executable");
         NativeNetworkTools::from_paths(&executable, &executable, &executable, &executable)
@@ -2149,7 +1974,10 @@ mod tests {
         let error =
             acquire_host_network_lock_in(directory.path(), (uid, gid), Duration::from_millis(20))
                 .expect_err("unsafe directory must fail");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            format!("{error:#}")
+                .contains("host network lock directory is not owner-controlled mode 0700")
+        );
 
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
             .expect("secure permissions");
@@ -2159,7 +1987,7 @@ mod tests {
         let error =
             acquire_host_network_lock_in(directory.path(), (uid, gid), Duration::from_millis(20))
                 .expect_err("concurrent holder must wait");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(format!("{error:#}").contains("host network lock timed out"));
         drop(first);
         acquire_host_network_lock_in(directory.path(), (uid, gid), Duration::from_secs(1))
             .expect("released lock can be reacquired");
@@ -2205,10 +2033,7 @@ mod tests {
         assert!(binding.entered_command(ip).is_err());
     }
 
-    fn inspect_loopback(
-        binding: &NativeNetworkBinding,
-        ip: &Path,
-    ) -> io::Result<NativeNetworkHelperOutput> {
+    fn inspect_loopback(binding: &NativeNetworkBinding, ip: &Path) -> Result<Output> {
         binding.invoke(
             ip,
             [
