@@ -11,8 +11,11 @@
 - 打包: `cargo package --no-verify`
 - 真 Docker 端到端（opt-in）: `RUNLAB_TEST_IMAGE=alpine:3.20 cargo test --test docker_e2e -- --ignored`
 
-当前基线（全部通过）：两平台 clippy 零告警；macOS 137 单测 + 21 契约测试；
-Linux 232 单测 + 21 契约测试；MSRV 1.95 通过；打包 74 文件；真 Docker e2e 1 passed / 49s。
+当前基线（全部通过）：两平台 clippy 零告警；macOS 140 单测 + 21 契约测试；
+Linux 237 单测 + 21 契约测试；MSRV 1.95 通过；打包 76 文件；真 Docker e2e 1 passed / 46.79s。
+
+真 Docker e2e 首次运行失败，原因是本机 `alpine:3.20` 镜像不在了
+（`No such image`），不是代码缺陷；`docker image pull` 后重跑通过。两次结果都记录在此。
 
 ## 已完成（已提交）
 
@@ -65,6 +68,53 @@ fake runc fixture 用同样方式等过 `ETXTBSY`。
   以及两个**故意**保留原始 `ErrorKind` 的函数（`connect_loopback_tcp`、`process_start_time_ticks`），
   它们的调用方需要区分「还没就绪」和「真的失败」，代码里已写明理由。
 
+## 第二轮审阅（5 项）
+
+外部审阅提出 5 项，逐条对代码核过后**事实全部成立**，但严重度和补救建议有三处调整：
+
+- **#1 pre-acceptance 遗留**：降为「中」。`reconcile_pre_acceptance` + 公开状态 `DiscardedPreAcceptance`
+  说明这是被设计过的一等状态，不是无人认领的泄漏；真实问题是单 participant 与 managed 两条路径策略不一致。
+  另外，急切清理覆盖不了 SIGKILL，所以 journal + reconcile 这条路本来就必须存在，急切清理是优化不是正确性修复。
+- **#2 BackendFacts**：核心问题改为「冗余编码与校验漂移」，不强调防篡改；且指出改 tagged enum 是破坏
+  `TerminalRunRecord` schema 7 的变更，因此只收敛校验、不动 schema。
+- **#3 CLI coordinator**：撤回「VM transport 难以复用」的论据——`vm exec` 转发的是 argv，guest 里跑的就是同一个 CLI。
+  也不引入 `RunApplication`：那是为尚不存在的消费者建层。实际问题是模块文档不诚实。
+- **#4 / #5**：维持原判。
+
+| commit | 内容 |
+|---|---|
+| `cc78d27` | #5 + #1：capture/attach 错误归属参与者自身 scope（同类缺陷共 3 处）；单 participant 未被 accept 时显式丢弃 recovery attempt |
+| `28602a8` | #4：`execution/native.rs` 1873 行拆成 `scope` / `participant` / `managed` 三个边界，root 52 行 |
+| `16e0bcc` | #2 + #3：共享 backend 不变量收敛到 `BackendFacts::validate`；CLI 模块文档改为诚实的 composition-root 描述 |
+
+### #4 的结构性结果
+
+依赖变成有向无环，且是**声明式的**：
+
+```
+managed  ->  participant  ->  scope
+```
+
+- `scope` 不依赖 `native` 内的任何东西
+- `participant` 只依赖 `scope` 的 `RunScope` 一个类型
+- `managed` 从「向父模块伸手拿 27 个私有符号」变成「向两个兄弟模块具名依赖 13 个符号」
+
+`execute_native_primary` 不再解构 `RunScope`；scope 提供一次 `ScopedExecution` 借用，
+把「native Run 一定有取消标志和 recovery attempt」这条不变量留在建立它的类型里。
+
+可见性是收窄过的声明面，不是子树内 `pub(super)` 全开：`PreparedNativeBackend` 暴露 4 个字段，
+`NativeProcessObservation` 1 个，`NativeExecution` 全部（因为 topology 要为每个 participant 各造一个）。
+
+**注意**：导入数从 27 降到 13 是症状不是判据——它可以用 `use super::*` 或一个 facade struct 绕过。
+真正的判据是上面那条有向依赖，以及 root 里已经没有任何逻辑。
+
+### 测试覆盖的诚实边界
+
+- #5 的测试经变异验证：把 `state.scope` 改回 `OperationErrorScope::Primary`，测试失败（`left: Primary, right: ManagedService`）。
+- #2 的测试经变异验证：短路掉 name/details 对应检查，测试失败。
+- **#1 的覆盖不完整**：新测试钉住的是 `abort_pre_acceptance` 的契约，
+  没有钉住 `run_selected` 确实调用了它。要覆盖后者需要一次注入 acceptance 失败的真实 native Run，依赖 runc。
+
 ## 待办
 
-无。审阅第四节的 8 项已全部处理（第 7 项按上述复核结论定为「无需改动」）。
+无。第一轮 8 项与第二轮 5 项均已处理。
