@@ -2,9 +2,13 @@
 //! its records.
 //!
 //! `run start` is the only command here that creates a Run; everything else
-//! reads or maintains what a Run left behind. Lifecycle decisions belong to
-//! `execution` and durability to `storage`; this module decides only what a
-//! caller may ask for and what the answer looks like.
+//! reads or maintains what a Run left behind.
+//!
+//! `run start` assembles the accepted inputs of a Run: it validates the limits
+//! a caller may ask for, reads the Runtime Config and stdin bytes, resolves the
+//! Images, and selects the backend and the topology. All of that is assembly.
+//! What a Run means once it starts -- acceptance, execution, terminalization --
+//! belongs to `execution`, and what survives it to `storage`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

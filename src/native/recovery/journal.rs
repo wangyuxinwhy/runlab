@@ -86,12 +86,17 @@ pub(super) fn write_sidecar(path: &Path, bytes: Option<&[u8]>) -> Result<()> {
     sync_directory(parent)
 }
 
+/// The constraints only native recovery can state.
+///
+/// The invariants every Run Record shares -- name matching its facts, a
+/// non-empty version, a positive runtime artifact, Run network facts matching
+/// the requested control -- belong to `BackendFacts::validate` and are checked
+/// there once. What remains here is what recovery alone knows: it can only
+/// resume a native Linux Run, only under a runtime it supports, and only when
+/// the runtime and filesystem realizations describe the same execution mode.
 pub(super) fn validate_backend(backend: &BackendFacts) -> Result<()> {
-    if backend.name != "native_linux" || backend.version.is_empty() {
-        bail!("native recovery backend identity is incomplete");
-    }
+    backend.validate()?;
     let BackendDetails::NativeLinux {
-        runtime_size,
         runtime_invocation,
         runtime_config,
         filesystem,
@@ -100,9 +105,6 @@ pub(super) fn validate_backend(backend: &BackendFacts) -> Result<()> {
     else {
         bail!("native recovery requires native Linux backend facts");
     };
-    if *runtime_size == 0 {
-        bail!("native recovery backend runtime artifact size must be positive");
-    }
     if let NativeRuntimeInvocation::ApparmorProfile { profile } = runtime_invocation
         && profile != "runc"
     {
@@ -127,9 +129,6 @@ pub(super) fn validate_backend(backend: &BackendFacts) -> Result<()> {
             }
         }
         _ => bail!("native recovery backend has inconsistent runtime and filesystem realization"),
-    }
-    if let Some(network) = &backend.run_network {
-        network.validate(backend.network)?;
     }
     Ok(())
 }

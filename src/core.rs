@@ -546,8 +546,41 @@ pub struct BackendFacts {
     pub details: BackendDetails,
 }
 
+impl BackendDetails {
+    /// The backend name these facts belong to.
+    ///
+    /// `name` is the identity a consumer reads and `details` are the facts
+    /// behind it, so one determines the other. Deriving it here is what lets
+    /// every producer and every validator agree on the correspondence instead
+    /// of each restating it.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Docker { .. } => "docker",
+            Self::NativeLinux { .. } => "native_linux",
+        }
+    }
+}
+
 impl BackendFacts {
+    /// The invariants every consumer of a public Run Record may rely on.
+    ///
+    /// These are protocol invariants, not backend policy: a record whose name
+    /// contradicts its own facts describes no backend that exists, and a
+    /// record with no version identifies nothing. Constraints that only one
+    /// backend can state -- which runtime realizations pair, which profiles
+    /// are supported -- stay with that backend.
     pub fn validate(&self) -> Result<()> {
+        if self.name != self.details.name() {
+            bail!(
+                "backend name is {} but its facts describe {}",
+                self.name,
+                self.details.name()
+            );
+        }
+        if self.version.is_empty() {
+            bail!("backend version must not be empty");
+        }
         if let Some(network) = &self.run_network {
             network.validate(self.network)?;
         }
@@ -993,6 +1026,88 @@ pub enum RunRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn docker_details() -> BackendDetails {
+        BackendDetails::Docker {
+            context: "default".to_owned(),
+            endpoint_kind: "unix_socket".to_owned(),
+            engine_id: "engine".to_owned(),
+        }
+    }
+
+    fn native_details(runtime_size: u64) -> BackendDetails {
+        BackendDetails::NativeLinux {
+            runtime_name: "runc".to_owned(),
+            runtime_version: "1.5.1".to_owned(),
+            runtime_commit: "fixture".to_owned(),
+            runtime_spec: "1.3.0".to_owned(),
+            runtime_digest: Digest::of(b"runc"),
+            runtime_size,
+            kernel_release: "fixture".to_owned(),
+            runtime_invocation: NativeRuntimeInvocation::Direct,
+            runtime_config: NativeRuntimeConfigRealization::Accepted,
+            filesystem: NativeFilesystemRealization::OverlayFs {
+                profile: "index=on".to_owned(),
+            },
+        }
+    }
+
+    fn facts(name: &str, version: &str, details: BackendDetails) -> BackendFacts {
+        BackendFacts {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            platform: Platform::linux(Architecture::Arm64),
+            network: NetworkControl::None,
+            run_network: None,
+            details,
+        }
+    }
+
+    /// A public record whose name contradicts its own facts describes no
+    /// backend that exists, whichever way the two were swapped.
+    #[test]
+    fn backend_name_and_facts_cannot_disagree() {
+        facts("docker", "29.7.2", docker_details())
+            .validate()
+            .expect("docker facts");
+        facts("native_linux", "0.2.0", native_details(12))
+            .validate()
+            .expect("native facts");
+
+        for (name, details) in [
+            ("docker", native_details(12)),
+            ("native_linux", docker_details()),
+            ("", docker_details()),
+            ("runc", native_details(12)),
+        ] {
+            let error = facts(name, "1.0", details)
+                .validate()
+                .expect_err("mismatched backend identity must fail closed");
+            assert!(
+                error.to_string().contains("but its facts describe"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_facts_require_a_version_and_a_real_runtime_artifact() {
+        let error = facts("docker", "", docker_details())
+            .validate()
+            .expect_err("an unversioned backend identifies nothing");
+        assert!(
+            error.to_string().contains("version must not be empty"),
+            "unexpected error: {error:#}"
+        );
+
+        let error = facts("native_linux", "0.2.0", native_details(0))
+            .validate()
+            .expect_err("a zero-size runtime artifact is not a runtime artifact");
+        assert!(
+            error.to_string().contains("runtime artifact size"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     #[test]
     fn service_name_is_a_bounded_lowercase_dns_label() {

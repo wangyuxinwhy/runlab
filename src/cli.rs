@@ -1,15 +1,21 @@
 //! The noun-verb command surface: parse arguments, print one JSON document on
 //! stdout, and return an exit status.
 //!
-//! This layer owns argument shapes and output shapes and nothing else. Lifecycle
-//! decisions belong to `execution`, Image decisions to `image`, and durability to
-//! `storage`; a handler here reads inputs, calls one of those, and emits the
-//! result. Errors go to stderr as plain text so stdout stays machine-readable.
+//! This module is the composition root. It resolves which state a command
+//! operates on, opens the Image service and the Run database over it, enters
+//! the state barrier a mutating command needs, and dispatches. A subcommand
+//! that needs a backend discovers it here too, because choosing between the
+//! concrete backends this binary was built with is wiring, not policy.
 //!
-//! This module is the composition root: `Cli`, the top-level `Command`, and the
-//! few helpers every subcommand needs. Each submodule owns one subcommand
-//! completely -- the arguments it accepts, the handler that runs it, and the
-//! shape it prints -- so a change to one command touches one file.
+//! What it does not own is meaning. Lifecycle decisions belong to `execution`,
+//! Image decisions to `image`, durability to `storage`, and protocol rules to
+//! `core`; a handler here reads files, converts arguments into domain types,
+//! calls one of those, and emits the result. Errors go to stderr as plain text
+//! so stdout stays machine-readable.
+//!
+//! Each submodule owns one subcommand completely -- the arguments it accepts,
+//! the handler that runs it, and the shape it prints -- so a change to one
+//! command touches one file.
 
 use std::env;
 use std::io::Write;
