@@ -8,7 +8,9 @@ use crate::core::{
     ManagedServiceCondition, ManagedServiceFacts, NetworkControl, RunControls, RunId,
     TERMINAL_RUN_RECORD_SCHEMA_VERSION, TerminalLifecycle, TerminalRunRecord,
 };
-use crate::native::backend::{NativeBackend, NativeExecutionMode, RuncRunner};
+use crate::native::backend::{
+    NativeBackend, NativeExecutionMode, RuncRunner, verify_resolver_target,
+};
 use crate::native::network::{NativeNetworkBinding, RunNetwork};
 use crate::native::recovery::{
     ManagedTerminalCheckpoint, NativeAttempt, NativeParticipant, NativeRecoveryStore,
@@ -163,8 +165,8 @@ impl Runner<'_> {
         if controls.network == NetworkControl::Egress {
             runtime.validate_native_resolver_destination()?;
             service.runtime.validate_native_resolver_destination()?;
-            self.images.verify_native_resolver_target(&primary_image)?;
-            self.images.verify_native_resolver_target(&service_image)?;
+            verify_resolver_target(self.images, &primary_image)?;
+            verify_resolver_target(self.images, &service_image)?;
         }
         let preflight =
             backend.preflight_managed(runtime, service.runtime, controls, &state_root)?;

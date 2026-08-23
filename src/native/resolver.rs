@@ -16,6 +16,7 @@ use tempfile::NamedTempFile;
 
 use crate::core::{Digest, RunResolverFacts, RunResolverSource};
 use crate::integrity::{digest_bytes, sync_directory};
+use crate::native::network::is_egress_pool_address;
 
 const ETC_RESOLV_CONF: &str = "/etc/resolv.conf";
 const SYSTEMD_RESOLVED_UPLINK: &str = "/run/systemd/resolve/resolv.conf";
@@ -240,10 +241,7 @@ pub(crate) struct ResolverSourceCheckpoint {
 impl ResolverSourceCheckpoint {
     pub(crate) fn validate_against_facts(&self, facts: &RunResolverFacts) -> Result<()> {
         self.identity.validate_source()?;
-        let canonical = facts.canonical_bytes()?;
-        if digest_bytes(&canonical) != facts.content_digest {
-            bail!("Run resolver content digest differs from its canonical bytes");
-        }
+        facts.canonical_bytes()?;
         if self.content_digest != facts.content_digest || self.content_size != facts.content_size {
             bail!("native resolver source checkpoint differs from Run resolver facts");
         }
@@ -608,14 +606,15 @@ fn parse_nameservers(bytes: &[u8], path: &Path) -> Result<ResolverCandidates> {
     })
 }
 
+/// A nameserver the guest can actually reach. Addresses inside this backend's
+/// own egress pool are excluded: one would be another Run, not a DNS server.
 fn is_usable_nameserver(address: Ipv4Addr) -> bool {
-    let octets = address.octets();
     !(address.is_unspecified()
         || address.is_loopback()
         || address.is_link_local()
         || address.is_multicast()
         || address == Ipv4Addr::BROADCAST
-        || (octets[0] == 10 && octets[1] == 240))
+        || is_egress_pool_address(address))
 }
 
 /// Read a host resolver file and bind the bytes to the inode and size observed

@@ -10,10 +10,11 @@ pub(crate) use super::runc::{
 };
 
 use crate::core::{
-    Architecture, BackendDetails, BackendFacts, NativeFilesystemRealization,
+    Architecture, BackendDetails, BackendFacts, ImageView, NativeFilesystemRealization,
     NativeRuntimeConfigRealization, NetworkControl, Platform, RunControls,
 };
-use crate::filesystem::FilesystemOwnership;
+use crate::filesystem::{FilesystemOwnership, TreeCapture};
+use crate::image::ImageService;
 use crate::integrity::digest_bytes;
 use crate::native::cgroup::PreparedNativeCgroup;
 use crate::native::network::{EgressNetworkTools, NativeNetworkTools};
@@ -24,6 +25,40 @@ use crate::runtime::{RootlessMapping, RuntimeConfig};
 const SUPPORTED_RUNC_VERSION: &str = "1.5.1";
 const SUPPORTED_RUNC_COMMIT: &str = "v1.5.1-0-g8f2685a47";
 const SUPPORTED_RUNC_SPEC: &str = "1.3.0";
+
+/// The path the native resolver bind-mounts over. A bind mount needs a real
+/// regular file at the destination, so an Image that ships a symlink there
+/// cannot be given egress.
+const RESOLVER_TARGET: &[u8] = b"/etc/resolv.conf";
+
+/// Whether this Image can host the Run resolver projection.
+pub(crate) fn verify_resolver_target(images: &ImageService, image: &ImageView) -> Result<()> {
+    images.verify_regular_path_without_symlinks(image, RESOLVER_TARGET)
+}
+
+/// Whether this Image survives being materialized and re-read under a rootless
+/// single-ID mapping. Some ownership and mode combinations cannot be
+/// represented, and finding that out during the Run is too late.
+pub(crate) fn verify_rootless_image(
+    images: &ImageService,
+    image: &ImageView,
+    state_root: &Path,
+    ownership: FilesystemOwnership,
+) -> Result<()> {
+    let probe = tempfile::Builder::new()
+        .prefix("runlab-rootless-image-probe-")
+        .tempdir_in(state_root)
+        .context("failed to create rootless Image preflight workspace")?;
+    let materialized = images.materialize_rootfs_at(
+        &image.manifest.digest,
+        &probe.path().join("materialize"),
+        ownership,
+    )?;
+    TreeCapture::with_ownership(ownership)
+        .capture_inventory(materialized.path())
+        .context("rootless Image filesystem profile is unsupported")?;
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeBackend {

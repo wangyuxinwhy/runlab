@@ -1,10 +1,12 @@
 use std::fmt;
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 pub const OCI_IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -126,6 +128,22 @@ impl<'de> Deserialize<'de> for ServiceName {
 pub struct Digest(String);
 
 impl Digest {
+    /// The SHA-256 identity of `bytes`. Constructing an identity from content
+    /// is the identity type's own job, which lets protocol types state
+    /// invariants about their own digests without depending on `integrity`.
+    /// `integrity` still owns streaming digests, canonical JSON, and every
+    /// exact-byte read and write.
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let mut hexadecimal = String::with_capacity(64);
+        for byte in hasher.finalize() {
+            write!(&mut hexadecimal, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Self(format!("sha256:{hexadecimal}"))
+    }
+
     pub fn parse(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         let Some(hex) = value.strip_prefix("sha256:") else {
@@ -423,6 +441,15 @@ impl ProcessSlot {
             Self::Unavailable { .. } => Ok(()),
         }
     }
+
+    /// Whether the slot positively records that no process ever started. An
+    /// unavailable slot says nothing either way and answers `false`.
+    #[must_use]
+    pub fn was_not_started(&self) -> bool {
+        self.facts().is_some_and(|facts| {
+            facts.terminal_outcome == ProcessOutcome::NotStarted && facts.started_at.is_none()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -460,6 +487,20 @@ pub struct BackendFacts {
     pub details: BackendDetails,
 }
 
+impl BackendFacts {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(network) = &self.run_network {
+            network.validate(self.network)?;
+        }
+        if let BackendDetails::NativeLinux { runtime_size, .. } = &self.details
+            && *runtime_size == 0
+        {
+            bail!("native backend runtime artifact size must be positive");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RunNetworkFacts {
     pub namespace_device: u64,
@@ -483,7 +524,26 @@ pub struct RunResolverFacts {
 }
 
 impl RunResolverFacts {
+    /// The exact `/etc/resolv.conf` bytes this record describes, checked
+    /// against the digest and size the record claims for them. A record whose
+    /// digest does not cover its own nameservers is not a record of anything,
+    /// so this is verified wherever the record is validated rather than only
+    /// on the path that produced it.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        let bytes = self.render()?;
+        if self.content_size != bytes.len() as u64 {
+            bail!("Run resolver content size differs from its canonical bytes");
+        }
+        if self.content_digest != Digest::of(&bytes) {
+            bail!("Run resolver content digest differs from its canonical bytes");
+        }
+        Ok(bytes)
+    }
+
+    /// Render the nameservers this record carries. Rules here hold for any
+    /// conforming implementation; which addresses a particular host allocator
+    /// reserves is that backend's concern, not the record's.
+    fn render(&self) -> Result<Vec<u8>> {
         if self.nameservers.is_empty() || self.nameservers.len() > 3 {
             bail!("Run resolver must contain between one and three nameservers");
         }
@@ -493,15 +553,13 @@ impl RunResolverFacts {
             let address = nameserver
                 .parse::<std::net::Ipv4Addr>()
                 .map_err(|_| anyhow::anyhow!("Run resolver nameserver is not an IPv4 address"))?;
-            let octets = address.octets();
             if address.is_unspecified()
                 || address.is_loopback()
                 || address.is_link_local()
                 || address.is_multicast()
                 || address == std::net::Ipv4Addr::BROADCAST
-                || (octets[0] == 10 && octets[1] == 240)
             {
-                bail!("Run resolver nameserver is not reachable by the IPv4 egress profile");
+                bail!("Run resolver nameserver cannot answer queries");
             }
             if !seen.insert(address) || nameserver != &address.to_string() {
                 bail!("Run resolver nameservers must be unique canonical IPv4 addresses");
@@ -509,9 +567,6 @@ impl RunResolverFacts {
             bytes.extend_from_slice(b"nameserver ");
             bytes.extend_from_slice(nameserver.as_bytes());
             bytes.push(b'\n');
-        }
-        if self.content_size != bytes.len() as u64 {
-            bail!("Run resolver content size differs from its canonical bytes");
         }
         Ok(bytes)
     }
@@ -794,6 +849,73 @@ pub struct TerminalRunRecord {
     pub managed_service: Option<ManagedServiceFacts>,
 }
 
+impl TerminalRunRecord {
+    /// Every rule a terminal Run Record must satisfy to be a coherent account
+    /// of one Run. Producers and the persistence layer both check it, so an
+    /// unpersisted record is held to the same contract as a stored one.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != TERMINAL_RUN_RECORD_SCHEMA_VERSION {
+            bail!(
+                "unsupported terminal Run Record schema version: expected {TERMINAL_RUN_RECORD_SCHEMA_VERSION}, received {}",
+                self.schema_version
+            );
+        }
+        if let Some(service) = &self.managed_service {
+            service.validate()?;
+        }
+        self.process.validate()?;
+        if self
+            .operation_errors
+            .iter()
+            .any(|error| error.scope == OperationErrorScope::ManagedService)
+        {
+            bail!("top-level operation error has Managed Service scope");
+        }
+        if let Some(backend) = &self.backend {
+            backend.validate()?;
+        }
+        self.validate_network_participation()
+    }
+
+    /// A Run network is shared by every participant, so a Managed Service Run
+    /// that started anything must record one. A single-participant Run only has
+    /// network facts when egress was requested.
+    fn validate_network_participation(&self) -> Result<()> {
+        match (&self.managed_service, &self.backend) {
+            (Some(_), Some(backend)) if backend.run_network.is_some() => Ok(()),
+            (Some(service), Some(_))
+                if self.process.was_not_started() && service.process.was_not_started() =>
+            {
+                Ok(())
+            }
+            (Some(_), _) => bail!(
+                "Managed Service terminal facts require Run network facts unless both processes were not started"
+            ),
+            (None, Some(backend))
+                if backend.run_network.is_some() && backend.network != NetworkControl::Egress =>
+            {
+                bail!("single-participant Run network facts require network=egress")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl AcceptedRunRecord {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != ACCEPTED_RUN_RECORD_SCHEMA_VERSION {
+            bail!(
+                "unsupported accepted Run Record schema version: expected {ACCEPTED_RUN_RECORD_SCHEMA_VERSION}, received {}",
+                self.schema_version
+            );
+        }
+        if let Some(service) = &self.managed_service {
+            service.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalLifecycle {
@@ -894,15 +1016,16 @@ mod tests {
 
     #[test]
     fn resolver_facts_reconstruct_only_canonical_ipv4_nameserver_lines() {
+        let expected = b"nameserver 192.0.2.53\nnameserver 198.51.100.7\n";
         let facts = RunResolverFacts {
             source: RunResolverSource::SystemdResolvedUplink,
             nameservers: vec!["192.0.2.53".to_owned(), "198.51.100.7".to_owned()],
-            content_digest: Digest::parse(format!("sha256:{}", "0".repeat(64))).expect("digest"),
-            content_size: 46,
+            content_digest: Digest::of(expected),
+            content_size: expected.len() as u64,
         };
         assert_eq!(
             facts.canonical_bytes().expect("canonical resolver"),
-            b"nameserver 192.0.2.53\nnameserver 198.51.100.7\n"
+            expected
         );
 
         for address in [
@@ -911,12 +1034,28 @@ mod tests {
             "169.254.1.1",
             "224.0.0.1",
             "255.255.255.255",
-            "10.240.0.1",
         ] {
+            let line = format!("nameserver {address}\n");
             let mut invalid = facts.clone();
             invalid.nameservers = vec![address.to_owned()];
-            invalid.content_size = format!("nameserver {address}\n").len() as u64;
+            invalid.content_size = line.len() as u64;
+            invalid.content_digest = Digest::of(line.as_bytes());
             assert!(invalid.canonical_bytes().is_err(), "accepted {address}");
         }
+    }
+
+    #[test]
+    fn resolver_facts_reject_a_digest_that_does_not_cover_the_nameservers() {
+        let facts = RunResolverFacts {
+            source: RunResolverSource::EtcResolvConf,
+            nameservers: vec!["192.0.2.53".to_owned()],
+            content_digest: Digest::of(b"nameserver 198.51.100.7\n"),
+            content_size: b"nameserver 192.0.2.53\n".len() as u64,
+        };
+        let error = facts.canonical_bytes().expect_err("mismatched digest");
+        assert!(
+            format!("{error:#}").contains("content digest differs"),
+            "unexpected error: {error:#}"
+        );
     }
 }

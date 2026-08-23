@@ -31,7 +31,7 @@ use crate::oci::{MAX_IMAGE_LAYERS, OciLayout};
 use crate::render::{FilesystemDiff, ImageRenderer, layer_diff_id};
 #[cfg(target_os = "linux")]
 use crate::{
-    filesystem::{CapturedTree, FilesystemOwnership, Inventory, TreeCapture},
+    filesystem::{CapturedTree, FilesystemOwnership, Inventory},
     materialize::MaterializedRootfs,
 };
 
@@ -173,10 +173,16 @@ impl ImageService {
         Ok(view)
     }
 
+    /// Whether `path` resolves to a regular file in this Image without
+    /// traversing a symbolic link. Callers that need to bind-mount over a path
+    /// ask this; why they need it is their concern.
     #[cfg(target_os = "linux")]
-    pub(crate) fn verify_native_resolver_target(&self, image: &ImageView) -> Result<()> {
-        ImageRenderer::new(self.layout.clone())
-            .verify_regular_path_without_symlinks(image, b"/etc/resolv.conf")
+    pub(crate) fn verify_regular_path_without_symlinks(
+        &self,
+        image: &ImageView,
+        path: &[u8],
+    ) -> Result<()> {
+        ImageRenderer::new(self.layout.clone()).verify_regular_path_without_symlinks(image, path)
     }
 
     pub fn image_config(&self, manifest_digest: &Digest) -> Result<Value> {
@@ -212,32 +218,9 @@ impl ImageService {
         })
     }
 
+    /// Write this Image's filesystem into `workspace` under `ownership`.
     #[cfg(target_os = "linux")]
-    pub(crate) fn verify_rootless_image(
-        &self,
-        image: &ImageView,
-        state_root: &Path,
-        ownership: FilesystemOwnership,
-    ) -> Result<()> {
-        let probe = tempfile::Builder::new()
-            .prefix("runlab-rootless-image-probe-")
-            .tempdir_in(state_root)
-            .context("failed to create rootless Image preflight workspace")?;
-        let materialized = crate::materialize::materialize_at_with_ownership(
-            &self.layout,
-            image,
-            crate::render::RenderLimits::default(),
-            &probe.path().join("materialize"),
-            ownership,
-        )?;
-        TreeCapture::with_ownership(ownership)
-            .capture_inventory(materialized.path())
-            .context("rootless Image filesystem profile is unsupported")?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn materialize_rootfs_at_with_ownership(
+    pub(crate) fn materialize_rootfs_at(
         &self,
         manifest_digest: &Digest,
         workspace: &Path,

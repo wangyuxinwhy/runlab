@@ -339,10 +339,7 @@ pub(super) fn validate_resolver_journal(journal: &NativeRecoveryJournal) -> Resu
             bail!("network=none recovery journal has resolver resources")
         }
         (Some(resolver), NetworkControl::Egress) => {
-            let bytes = resolver.facts.canonical_bytes()?;
-            if digest_bytes(&bytes) != resolver.facts.content_digest {
-                bail!("native resolver facts have an invalid canonical digest");
-            }
+            resolver.facts.canonical_bytes()?;
             resolver.source.validate_against_facts(&resolver.facts)?;
             if let Some(network) = journal.backend.run_network.as_ref() {
                 let RunNetworkRealization::Ipv4NatEgress {
@@ -637,10 +634,7 @@ pub(super) fn validate_network_facts_for_plan(
             {
                 bail!("Run network realization differs from the durable network plan");
             }
-            let resolver_bytes = resolver.canonical_bytes()?;
-            if digest_bytes(&resolver_bytes) != resolver.content_digest {
-                bail!("Run resolver digest differs from its canonical bytes");
-            }
+            resolver.canonical_bytes()?;
             Ok(())
         }
         _ => bail!("Run network realization differs from the durable network plan"),

@@ -10,8 +10,7 @@ use rusqlite::{
 };
 
 use crate::core::{
-    ACCEPTED_RUN_RECORD_SCHEMA_VERSION, AcceptedRunRecord, BackendDetails, BackendFacts, ImageSlot,
-    MAX_CAPTURED_STREAM_BYTES, RunId, RunRecord, StoredBytes, TERMINAL_RUN_RECORD_SCHEMA_VERSION,
+    AcceptedRunRecord, ImageSlot, MAX_CAPTURED_STREAM_BYTES, RunId, RunRecord, StoredBytes,
     TerminalRunRecord,
 };
 use crate::integrity::{canonical_json, digest_bytes, ensure_private_directory};
@@ -223,7 +222,7 @@ impl RunDatabase {
         stdin: &[u8],
         managed_service_runtime_config: Option<&[u8]>,
     ) -> Result<()> {
-        verify_accepted_schema(record)?;
+        record.validate()?;
         verify_stored_bytes(&record.runtime_config, runtime_config, "Runtime Config")?;
         verify_stored_bytes(&record.controls.stdin, stdin, "stdin")?;
         verify_managed_service_runtime(
@@ -300,7 +299,7 @@ impl RunDatabase {
         managed_service_stdout: Option<&[u8]>,
         managed_service_stderr: Option<&[u8]>,
     ) -> Result<()> {
-        verify_terminal_schema(record)?;
+        record.validate()?;
         verify_optional_stored_bytes(&record.stdout, stdout, "stdout")?;
         verify_optional_stored_bytes(&record.stderr, stderr, "stderr")?;
         verify_managed_service_streams(
@@ -353,7 +352,7 @@ impl RunDatabase {
             })?;
         let accepted: AcceptedRunRecord =
             serde_json::from_slice(&accepted_json).context("stored accepted Run is invalid")?;
-        verify_accepted_schema(&accepted)?;
+        accepted.validate()?;
         verify_terminal_identity(&accepted, record)?;
         let rows = transaction
             .execute(
@@ -812,7 +811,7 @@ fn query_verified_runs(
 fn verify_retained_run(row: &StoredRunRow) -> Result<VerifiedRunRetention> {
     let accepted: AcceptedRunRecord = serde_json::from_slice(&row.accepted_record_json)
         .context("stored accepted Run Record is invalid")?;
-    verify_accepted_schema(&accepted)?;
+    accepted.validate()?;
     verify_common_projections(row, &accepted)?;
 
     let mut verified_bytes = VerifiedBytes::default();
@@ -833,7 +832,7 @@ fn verify_retained_run(row: &StoredRunRow) -> Result<VerifiedRunRetention> {
         ("terminal", Some(terminal_json)) => {
             let terminal: TerminalRunRecord = serde_json::from_slice(terminal_json)
                 .context("stored terminal Run Record is invalid")?;
-            verify_terminal_schema(&terminal)?;
+            terminal.validate()?;
             verify_terminal_identity(&accepted, &terminal)?;
             verify_terminal_projections(row, &terminal)?;
             verify_terminal_bytes(row, &terminal, &mut verified_bytes)?;
@@ -1043,13 +1042,13 @@ fn decode_record(row: (String, Vec<u8>, Option<Vec<u8>>)) -> Result<RunRecord> {
         (lifecycle, accepted, None) if lifecycle == "accepted" => {
             let record: AcceptedRunRecord = serde_json::from_slice(&accepted)
                 .context("stored accepted Run Record is invalid")?;
-            verify_accepted_schema(&record)?;
+            record.validate()?;
             Ok(RunRecord::Accepted(Box::new(record)))
         }
         (lifecycle, _, Some(terminal)) if lifecycle == "terminal" => {
             let record: TerminalRunRecord = serde_json::from_slice(&terminal)
                 .context("stored terminal Run Record is invalid")?;
-            verify_terminal_schema(&record)?;
+            record.validate()?;
             Ok(RunRecord::Terminal(Box::new(record)))
         }
         (lifecycle, _, _) => bail!("stored Run lifecycle and record are inconsistent: {lifecycle}"),
@@ -1090,78 +1089,6 @@ fn verify_terminal_identity(
         bail!("terminal Run does not preserve its accepted identity");
     }
     Ok(())
-}
-
-fn verify_accepted_schema(record: &AcceptedRunRecord) -> Result<()> {
-    if record.schema_version != ACCEPTED_RUN_RECORD_SCHEMA_VERSION {
-        bail!(
-            "unsupported accepted Run Record schema version: expected {ACCEPTED_RUN_RECORD_SCHEMA_VERSION}, received {}",
-            record.schema_version
-        );
-    }
-    if let Some(service) = &record.managed_service {
-        service.validate()?;
-    }
-    Ok(())
-}
-
-fn verify_terminal_schema(record: &TerminalRunRecord) -> Result<()> {
-    if record.schema_version != TERMINAL_RUN_RECORD_SCHEMA_VERSION {
-        bail!(
-            "unsupported terminal Run Record schema version: expected {TERMINAL_RUN_RECORD_SCHEMA_VERSION}, received {}",
-            record.schema_version
-        );
-    }
-    if let Some(service) = &record.managed_service {
-        service.validate()?;
-    }
-    record.process.validate()?;
-    if record
-        .operation_errors
-        .iter()
-        .any(|error| error.scope == crate::core::OperationErrorScope::ManagedService)
-    {
-        bail!("top-level operation error has Managed Service scope");
-    }
-    if let Some(backend) = &record.backend
-        && let Some(network) = &backend.run_network
-    {
-        network.validate(backend.network)?;
-    }
-    if let Some(BackendFacts {
-        details: BackendDetails::NativeLinux { runtime_size, .. },
-        ..
-    }) = &record.backend
-        && *runtime_size == 0
-    {
-        bail!("native backend runtime artifact size must be positive");
-    }
-    match (&record.managed_service, &record.backend) {
-        (Some(_), Some(backend)) if backend.run_network.is_some() => {}
-        (Some(service), Some(_))
-            if process_was_not_started(&record.process)
-                && process_was_not_started(&service.process) => {}
-        (Some(_), _) => {
-            bail!(
-                "Managed Service terminal facts require Run network facts unless both processes were not started"
-            );
-        }
-        (None, Some(backend))
-            if backend.run_network.is_some()
-                && backend.network != crate::core::NetworkControl::Egress =>
-        {
-            bail!("single-participant Run network facts require network=egress");
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn process_was_not_started(process: &crate::core::ProcessSlot) -> bool {
-    process.facts().is_some_and(|facts| {
-        facts.terminal_outcome == crate::core::ProcessOutcome::NotStarted
-            && facts.started_at.is_none()
-    })
 }
 
 fn managed_service_identity_matches(
@@ -1257,10 +1184,11 @@ mod tests {
 
     use super::*;
     use crate::core::{
-        AcceptedLifecycle, Architecture, BackendDetails, BackendFacts, Digest,
-        ManagedServiceCondition, ManagedServiceFacts, ManagedServiceReadiness, NetworkControl,
-        OciDescriptor, OperationError, OperationErrorScope, Platform, ProcessFacts, ProcessOutcome,
-        ProcessSlot, RunControls, RunNetworkFacts, RunNetworkRealization, ServiceName,
+        ACCEPTED_RUN_RECORD_SCHEMA_VERSION, AcceptedLifecycle, Architecture, BackendDetails,
+        BackendFacts, Digest, ManagedServiceCondition, ManagedServiceFacts,
+        ManagedServiceReadiness, NetworkControl, OciDescriptor, OperationError,
+        OperationErrorScope, Platform, ProcessFacts, ProcessOutcome, ProcessSlot, RunControls,
+        RunNetworkFacts, RunNetworkRealization, ServiceName, TERMINAL_RUN_RECORD_SCHEMA_VERSION,
         TcpReadinessCondition, TerminalLifecycle,
     };
 
@@ -1756,8 +1684,9 @@ mod tests {
         let fixture = ManagedFixture::new();
         let mut terminal = fixture.terminal;
         terminal.backend = None;
-        let error =
-            verify_terminal_schema(&terminal).expect_err("network identity must be present");
+        let error = terminal
+            .validate()
+            .expect_err("network identity must be present");
         assert!(
             error
                 .to_string()
@@ -1773,7 +1702,7 @@ mod tests {
         terminal.process = ProcessSlot::available(ProcessFacts::not_started());
         terminal.managed_service.as_mut().expect("service").process =
             ProcessSlot::available(ProcessFacts::not_started());
-        verify_terminal_schema(&terminal).expect("pre-start network failure");
+        terminal.validate().expect("pre-start network failure");
     }
 
     #[test]

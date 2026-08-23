@@ -16,9 +16,7 @@ pub fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>> {
 }
 
 pub fn digest_bytes(bytes: &[u8]) -> Digest {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    finish_sha256(hasher)
+    Digest::of(bytes)
 }
 
 pub fn digest_reader(mut reader: impl Read) -> Result<(Digest, u64)> {

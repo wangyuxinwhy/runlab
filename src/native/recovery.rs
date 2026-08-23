@@ -2612,7 +2612,7 @@ mod tests {
             .open_attempt(run_id)
             .expect_err("non-canonical top-level facts must fail");
         assert!(
-            format!("{error:#}").contains("native resolver facts have an invalid canonical digest"),
+            format!("{error:#}").contains("Run resolver content digest differs"),
             "unexpected error: {error:#}"
         );
 

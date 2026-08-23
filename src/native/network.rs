@@ -21,6 +21,8 @@ const MAX_HELPER_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_HELPER_INPUT_BYTES: usize = 64 * 1024;
 const EGRESS_PLAN_SCHEMA_VERSION: u32 = 1;
 const EGRESS_POOL_PREFIX: &str = "10.240.0.0/16";
+const EGRESS_POOL_FIRST_OCTET: u8 = 10;
+const EGRESS_POOL_SECOND_OCTET: u8 = 240;
 const EGRESS_SUBNET_COUNT: u16 = 16_384;
 const NETWORK_HOLDER_DIRECTORY: &str = "network-holder";
 const NETWORK_HOLDER_IDENTITY: &str = "identity.json";
@@ -39,6 +41,13 @@ use lifecycle::{
 pub(crate) use lifecycle::{
     NativeNetworkBinding, RunNetwork, connect_loopback_tcp, hold_network_namespace,
 };
+/// Whether `address` falls inside the pool this backend hands to Run networks.
+/// A host resolver in that range would be a Run address, never a real server.
+pub(crate) fn is_egress_pool_address(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    octets[0] == EGRESS_POOL_FIRST_OCTET && octets[1] == EGRESS_POOL_SECOND_OCTET
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunNetworkMode {

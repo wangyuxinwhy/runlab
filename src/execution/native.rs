@@ -33,7 +33,7 @@ use crate::materialize::MaterializedRootfs;
 use crate::native::backend::{
     NativeBackend, NativeExecutionMode, NativePreflight, PreparedRuncRun, RuncCaptureLimits,
     RuncExecution, RuncOperationErrorKind, RuncRunFailure, RuncRunResult, RuncRunner,
-    RuncStopReason,
+    RuncStopReason, verify_resolver_target, verify_rootless_image,
 };
 use crate::native::fs::OverlayRootfs;
 use crate::native::network::{
@@ -1171,7 +1171,7 @@ impl<'a> Runner<'a> {
         let rootless = !rustix::process::geteuid().is_root();
         if !rootless && controls.network == NetworkControl::Egress {
             runtime.validate_native_resolver_destination()?;
-            self.images.verify_native_resolver_target(initial)?;
+            verify_resolver_target(self.images, initial)?;
         }
         let state_root = self
             .database
@@ -1180,8 +1180,7 @@ impl<'a> Runner<'a> {
             .context("Run database path has no state root")?;
         let preflight = backend.preflight(runtime, controls, state_root)?;
         if preflight.mode.is_rootless() {
-            self.images
-                .verify_rootless_image(initial, state_root, preflight.mode.ownership())?;
+            verify_rootless_image(self.images, initial, state_root, preflight.mode.ownership())?;
         }
         Ok((
             preflight.facts,
@@ -1561,7 +1560,7 @@ impl<'a> Runner<'a> {
                 ))
             }
             NativeExecutionMode::Rootless { .. } => {
-                let writable = match self.images.materialize_rootfs_at_with_ownership(
+                let writable = match self.images.materialize_rootfs_at(
                     execution.initial_manifest,
                     filesystem_workspace,
                     execution.mode.ownership(),
@@ -1648,7 +1647,7 @@ impl<'a> Runner<'a> {
                 return None;
             }
         };
-        let materialized = match self.images.materialize_rootfs_at_with_ownership(
+        let materialized = match self.images.materialize_rootfs_at(
             execution.initial_manifest,
             &lower_workspace,
             execution.mode.ownership(),
