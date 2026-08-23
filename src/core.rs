@@ -751,6 +751,9 @@ pub(crate) const TERMINAL_RUN_RECORD_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AcceptedRunRecord {
+    /// Published as a JSON Schema `const` so consumers discover the expected
+    /// version instead of hardcoding it.
+    #[schemars(extend("const" = ACCEPTED_RUN_RECORD_SCHEMA_VERSION))]
     pub schema_version: u32,
     pub run_id: RunId,
     pub lifecycle: AcceptedLifecycle,
@@ -770,6 +773,9 @@ pub enum AcceptedLifecycle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TerminalRunRecord {
+    /// Published as a JSON Schema `const` so consumers discover the expected
+    /// version instead of hardcoding it.
+    #[schemars(extend("const" = TERMINAL_RUN_RECORD_SCHEMA_VERSION))]
     pub schema_version: u32,
     pub run_id: RunId,
     pub lifecycle: TerminalLifecycle,

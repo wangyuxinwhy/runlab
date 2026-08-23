@@ -32,6 +32,14 @@ fn public_schema(name: &str) -> Value {
     serde_json::from_slice(&output.stdout).expect("public JSON Schema")
 }
 
+/// Reads the record version the installed binary declares, so a protocol bump
+/// cannot leave this fixture silently describing an older record shape.
+fn declared_schema_version(schema_name: &str) -> u64 {
+    public_schema(schema_name)["properties"]["schema_version"]["const"]
+        .as_u64()
+        .expect("public schema declares its record version as a const")
+}
+
 fn assert_top_level_result_shape(result: &Value, schema_name: &str) {
     let schema = public_schema(schema_name);
     let actual = result
@@ -1294,7 +1302,7 @@ fn terminal_record(with_service: bool) -> Value {
         })
     });
     serde_json::json!({
-        "schema_version": 6,
+        "schema_version": declared_schema_version("terminal-run-record"),
         "run_id": RUN_ID,
         "lifecycle": "terminal",
         "accepted_at": "2026-08-21T00:00:00Z",

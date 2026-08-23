@@ -1358,12 +1358,13 @@ mod tests {
                 123,
             ))
             .expect("network checkpoint");
+        let started_at = Utc::now();
         let process = ProcessSlot::available(ProcessFacts {
             terminal_outcome: ProcessOutcome::ProcessExited,
             exit_code: Some(0),
-            started_at: None,
-            ended_at: None,
-            oom_killed: None,
+            started_at: Some(started_at),
+            ended_at: Some(started_at),
+            oom_killed: Some(false),
             backend_error: None,
         });
         let stdout = b"service stdout";
