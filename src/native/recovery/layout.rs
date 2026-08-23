@@ -1,4 +1,6 @@
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 use crate::integrity::{set_private_file, sync_directory};
 
@@ -15,13 +17,51 @@ use super::{
     MAX_JOURNAL_BYTES, NativeRecoveryJournal, NativeRecoveryPhase, NativeSharedNetworkPhase,
 };
 
-pub(super) fn try_lock(file: &File, run_id: RunId) -> Result<()> {
-    match file.try_lock() {
-        Ok(()) => Ok(()),
-        Err(TryLockError::WouldBlock) => bail!("native recovery attempt is active: {run_id}"),
-        Err(TryLockError::Error(error)) => {
-            Err(error).context("failed to lock native recovery attempt")
+/// How long a released lock is allowed to still look held before we believe it.
+///
+/// `fork` copies the file descriptor table, so a subprocess spawned by another
+/// thread inherits every descriptor this process has open -- recovery locks
+/// included -- and keeps their `flock` alive until `exec` closes them. A lock
+/// this process just dropped can therefore read as held for the length of one
+/// fork/exec elsewhere in the process.
+///
+/// Waiting cannot take a lock away from a real owner: an owner holds its lock
+/// for the whole attempt, so it still blocks us after the wait. It only stops a
+/// released lock from being reported as an active attempt.
+const LOCK_HANDOFF: Duration = Duration::from_millis(200);
+const LOCK_HANDOFF_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Take `file` exclusively, reporting whether it is held by someone else.
+fn take_exclusively(file: &File) -> Result<bool> {
+    let mut waited = Duration::ZERO;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(TryLockError::WouldBlock) if waited < LOCK_HANDOFF => {
+                thread::sleep(LOCK_HANDOFF_INTERVAL);
+                waited += LOCK_HANDOFF_INTERVAL;
+            }
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Error(error)) => {
+                return Err(error).context("failed to lock native recovery");
+            }
         }
+    }
+}
+
+pub(super) fn try_lock(file: &File, run_id: RunId) -> Result<()> {
+    if take_exclusively(file).context("failed to lock native recovery attempt")? {
+        Ok(())
+    } else {
+        bail!("native recovery attempt is active: {run_id}")
+    }
+}
+
+pub(super) fn try_lock_root(file: &File) -> Result<()> {
+    if take_exclusively(file).context("failed to lock native recovery root")? {
+        Ok(())
+    } else {
+        bail!("native recovery root is active")
     }
 }
 

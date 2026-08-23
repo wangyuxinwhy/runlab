@@ -2651,9 +2651,38 @@ raise SystemExit(97)
             }
         }
 
+        /// Probe the fake runc, waiting out `ETXTBSY`.
+        ///
+        /// A subprocess forked by another test thread inherits the descriptor
+        /// this fixture used to write the executable, and Linux refuses to
+        /// execute a file any process still holds open for writing until that
+        /// child reaches `exec` and closes it.
         fn runner(&self) -> RuncRunner {
-            RuncRunner::probe(&self.executable, Duration::from_secs(1)).expect("fake runc probe")
+            let mut waited = Duration::ZERO;
+            loop {
+                match RuncRunner::probe(&self.executable, Duration::from_secs(1)) {
+                    Ok(runner) => return runner,
+                    Err(error)
+                        if is_text_file_busy(&error) && waited < Duration::from_millis(200) =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                        waited += Duration::from_millis(10);
+                    }
+                    Err(error) => panic!("fake runc probe: {error:#}"),
+                }
+            }
         }
+    }
+
+    const ETXTBSY: i32 = 26;
+
+    fn is_text_file_busy(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(ETXTBSY)
+        })
     }
 
     fn test_runtime() -> RuntimeConfig {

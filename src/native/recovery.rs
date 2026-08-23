@@ -10,7 +10,7 @@
 //! resources are safe to remove.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, TryLockError};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -46,8 +46,9 @@ use journal::{
 use layout::{
     cleanup_staging_directory, create_private_directory_entry, create_private_file,
     ensure_real_private_directory, open_private_file, path_present, set_private_directory,
-    try_lock, validate_directory, validate_directory_metadata, validate_managed_workspace,
-    validate_recovery_workspace, validate_regular_file, validate_staging_directory, verify_mode,
+    try_lock, try_lock_root, validate_directory, validate_directory_metadata,
+    validate_managed_workspace, validate_recovery_workspace, validate_regular_file,
+    validate_staging_directory, verify_mode,
 };
 #[cfg(test)]
 use layout::{create_private_directory, validate_pristine_prepublication_journal};
@@ -697,13 +698,8 @@ impl NativeRecoveryStore {
     fn lock_root(&self) -> Result<File> {
         validate_directory(&self.root)?;
         let root = File::open(&self.root).context("failed to open native recovery root")?;
-        match root.try_lock() {
-            Ok(()) => Ok(root),
-            Err(TryLockError::WouldBlock) => bail!("native recovery root is active"),
-            Err(TryLockError::Error(error)) => {
-                Err(error).context("failed to lock native recovery root")
-            }
-        }
+        try_lock_root(&root)?;
+        Ok(root)
     }
 
     fn staging_path(&self, run_id: RunId) -> PathBuf {
@@ -2059,7 +2055,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unexpected native recovery entry")
+                .contains("unexpected native recovery entry"),
+            "unexpected error: {error:#}"
         );
     }
 
@@ -2234,7 +2231,10 @@ mod tests {
         let error = store
             .open_entry(run_id)
             .expect_err("post-acceptance staging must fail closed");
-        assert!(error.to_string().contains("published resource state"));
+        assert!(
+            error.to_string().contains("published resource state"),
+            "unexpected error: {error:#}"
+        );
         assert!(staging.exists());
     }
 
@@ -2440,7 +2440,10 @@ mod tests {
         let error = store
             .open_entry(run_id)
             .expect_err("bind-mounted staging must fail closed");
-        assert!(error.to_string().contains("crosses a mount boundary"));
+        assert!(
+            error.to_string().contains("crosses a mount boundary"),
+            "unexpected error: {error:#}"
+        );
     }
 
     struct TestBindMount {
@@ -3121,7 +3124,10 @@ mod tests {
         let error = attempt
             .advance_phase(NativeRecoveryPhase::Accepted)
             .expect_err("backward phase must fail");
-        assert!(error.to_string().contains("cannot move backward"));
+        assert!(
+            error.to_string().contains("cannot move backward"),
+            "unexpected error: {error:#}"
+        );
         assert_eq!(attempt.journal().generation(), 2);
     }
 
@@ -3134,7 +3140,10 @@ mod tests {
         let error = store
             .open_attempt(run_id)
             .expect_err("second owner must fail");
-        assert!(error.to_string().contains("is active"));
+        assert!(
+            error.to_string().contains("is active"),
+            "unexpected error: {error:#}"
+        );
         drop(attempt);
         assert!(store.open_attempt(run_id).expect("reopen").is_some());
     }
@@ -3175,7 +3184,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported native recovery journal version")
+                .contains("unsupported native recovery journal version"),
+            "unexpected error: {error:#}"
         );
 
         let inconsistent_id = RunId::new();
@@ -3196,7 +3206,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires process and stream facts")
+                .contains("requires process and stream facts"),
+            "unexpected error: {error:#}"
         );
 
         let oversized_id = RunId::new();
@@ -3211,7 +3222,10 @@ mod tests {
         let error = store
             .open_attempt(oversized_id)
             .expect_err("oversized journal must fail");
-        assert!(error.to_string().contains("exceeds"));
+        assert!(
+            error.to_string().contains("exceeds"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -3259,7 +3273,10 @@ mod tests {
         fs::remove_file(&journal).expect("remove journal");
         symlink(&outside, &journal).expect("symlink journal");
         let error = store.open_attempt(run_id).expect_err("symlink must fail");
-        assert!(error.to_string().contains("must not be a symbolic link"));
+        assert!(
+            error.to_string().contains("must not be a symbolic link"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -3280,7 +3297,10 @@ mod tests {
         let error = store
             .open_attempt(workspace_id)
             .expect_err("service workspace symlink must fail");
-        assert!(error.to_string().contains("must not be a symbolic link"));
+        assert!(
+            error.to_string().contains("must not be a symbolic link"),
+            "unexpected error: {error:#}"
+        );
 
         let sidecar_id = RunId::new();
         let sidecar_attempt = store
@@ -3295,7 +3315,10 @@ mod tests {
         let error = store
             .open_attempt(sidecar_id)
             .expect_err("service sidecar symlink must fail");
-        assert!(error.to_string().contains("must not be a symbolic link"));
+        assert!(
+            error.to_string().contains("must not be a symbolic link"),
+            "unexpected error: {error:#}"
+        );
         assert_eq!(fs::read(outside_file).expect("outside bytes"), b"unchanged");
     }
 
