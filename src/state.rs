@@ -1,3 +1,11 @@
+//! The lock on a `RunLab` state directory.
+//!
+//! Ordinary operations take it shared; maintenance takes it exclusively and so
+//! waits for them to finish. Read-only commands never create a state directory,
+//! which is what lets them be safe to run against a path that does not exist.
+//!
+//! This is about the directory. The Run Records inside it belong to `storage`.
+
 use std::fs::File;
 use std::path::Path;
 

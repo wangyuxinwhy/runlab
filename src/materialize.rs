@@ -1,3 +1,10 @@
+//! Writing verified Layers into a private rootfs on disk.
+//!
+//! Reproduces ownership, modes, timestamps and extended attributes as the
+//! Layers describe them, under either native ownership or a rootless single-ID
+//! mapping. Linux-only: the metadata this preserves has no faithful
+//! representation elsewhere.
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;

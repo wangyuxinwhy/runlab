@@ -1,3 +1,13 @@
+//! Filesystem primitives that treat paths and metadata as bytes.
+//!
+//! Paths are raw bytes, not `str`: an Image can legitimately contain names that
+//! are not UTF-8, and losing them silently would change what a Run sees. On top
+//! of that sit a semantic inventory, a content spool, a length-aware PAX codec,
+//! and a deterministic tar writer.
+//!
+//! Determinism is the point. The same tree always produces the same archive
+//! bytes, which is what makes a captured Layer content-addressable.
+
 mod archive;
 #[cfg(any(test, target_os = "linux"))]
 mod capture;

@@ -1,3 +1,11 @@
+//! The local Image reference grammar and the catalog that maps references to
+//! OCI Manifests.
+//!
+//! A reference is `name:tag`; the catalog records which Manifest a reference
+//! resolves to along with the metadata a person needs to recognize it. The
+//! catalog is an index over the OCI Layout, never a second copy of it: removing
+//! a reference never removes content.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 

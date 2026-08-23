@@ -1,3 +1,11 @@
+//! Getting an Image into the local Layout and giving it a local reference.
+//!
+//! Two sources, one shape: `pull` speaks OCI Distribution through
+//! `distribution`, `import` reads a local Layout or archive through `ingress`.
+//! Both verify the result against the Layout after the fact and only then
+//! publish the reference, so a failed acquisition never leaves a name pointing
+//! at content that was not verified.
+
 use std::path::Path;
 
 use anyhow::{Result, bail};

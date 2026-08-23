@@ -1,3 +1,34 @@
+//! `runlab` executes OCI Images and preserves immutable Run Records.
+//!
+//! One binary, one composition root. `main` parses nothing itself; it hands the
+//! process to `cli` and turns the result into an exit status.
+//!
+//! # Layering
+//!
+//! Dependencies run one way. Reading top to bottom, a module may use anything
+//! below it and nothing above:
+//!
+//! ```text
+//! cli                     argument shapes, JSON output, exit status
+//! execution               acceptance -> execute -> terminal Run Record
+//! native  docker          the two execution backends
+//! image  storage          Images in the Layout, Run Records in SQLite
+//! oci  runtime  render    exact-byte Layout, Runtime config, Layer views
+//! integrity               digests, canonical JSON, durable private writes
+//! core                    the Run Protocol vocabulary
+//! ```
+//!
+//! Two consequences worth keeping:
+//!
+//! - `core` states protocol invariants, so a Run Record is validated wherever it
+//!   is produced rather than only where it is stored.
+//! - `integrity` owns every exact-byte read and durable write, so "owner-only,
+//!   crash-atomic, fsynced" is decided once.
+//!
+//! Everything specific to running an OCI bundle through runc on this host is
+//! inside `native`, gated once at its `mod` declaration. No module outside
+//! `docker` knows that a `docker` process exists.
+
 use std::process::ExitCode;
 
 #[cfg_attr(

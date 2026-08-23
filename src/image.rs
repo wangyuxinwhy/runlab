@@ -1,3 +1,14 @@
+//! OCI Images: inspect, diff, export, and publish.
+//!
+//! `ImageService` is the one way to ask an Image a question or add one to the
+//! local Layout. It composes `render` for reading Layers, `changeset` for
+//! turning a before/after pair into a new Layer, and `oci` for exact-byte
+//! storage.
+//!
+//! Questions here are about Images. Whether a particular backend can realize an
+//! Image is that backend's question, asked with the primitives this module
+//! exposes.
+
 use std::fs::{self, File};
 use std::io::Seek as _;
 #[cfg(test)]

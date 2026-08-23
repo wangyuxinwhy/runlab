@@ -1,3 +1,12 @@
+//! The `SQLite` database of immutable Run Records.
+//!
+//! A Run is written twice: once when it is accepted, once when it becomes
+//! terminal. Neither write is ever amended. Captured stdout and stderr are
+//! stored beside the record and verified against the digests the record claims.
+//!
+//! Storage does not interpret what it stores. Whether a record is a coherent
+//! account of a Run is `core`'s question, asked here through `validate`.
+
 use std::fs;
 use std::fs::File;
 use std::io::Read as _;

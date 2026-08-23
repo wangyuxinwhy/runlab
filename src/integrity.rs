@@ -1,3 +1,12 @@
+//! Exact bytes: digests, canonical JSON, bounded reads, and durable private
+//! writes.
+//!
+//! Every artifact this crate persists goes through here, which is what makes
+//! "owner-only, crash-atomic, fsynced" one decision rather than a habit each
+//! module reimplements. `write_new_private` and `replace_private` publish
+//! through a temporary file and fsync the parent directory, so a reader sees
+//! either no file or all the bytes.
+
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Write};

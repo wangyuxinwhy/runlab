@@ -1,3 +1,15 @@
+//! The Run network: a private namespace per Run, with optional outbound-only
+//! IPv4 egress.
+//!
+//! `network=none` gets loopback and nothing else. `network=egress` gets a /30
+//! veth pair out of a fixed host pool, NAT to the host's uplink, and rules that
+//! stop one Run from reaching another. The namespace is held open by a separate
+//! holder process so it survives a supervisor crash and can be reclaimed by
+//! reconciliation.
+//!
+//! Host-wide resources — the address pool, the NAT table — are taken under a
+//! host lock, because concurrent Runs allocate from the same space.
+
 use std::ffi::OsStr;
 use std::fs::TryLockError;
 use std::fs::{self, File, OpenOptions};

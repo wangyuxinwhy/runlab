@@ -1,3 +1,10 @@
+//! The local OCI Image Layout: content-addressed blobs, the index, and the
+//! locking that keeps concurrent mutation safe.
+//!
+//! Blobs are published by digest through a temporary file, verified on the same
+//! descriptor they were written to. Typed JSON views never replace the retained
+//! bytes — content identity is always computed from what is on disk.
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, Write};

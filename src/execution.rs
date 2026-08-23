@@ -1,3 +1,11 @@
+//! One Run, from acceptance to a terminal Run Record.
+//!
+//! The order is fixed: accept the Run so an interrupted process still leaves a
+//! record, execute it, then terminalize. This file owns the part of that shape
+//! which is the same on every host — the records, the exit-status contract, and
+//! the choice of backend. Native mechanics live in `native`, behind one
+//! platform gate.
+
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};

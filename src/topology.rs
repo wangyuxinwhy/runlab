@@ -1,3 +1,9 @@
+//! The bounded declaration of a Run's one Managed Service participant.
+//!
+//! A service names an Image, a Runtime config, and a TCP readiness condition —
+//! nothing else. The shape is deliberately small: it is a description a person
+//! writes, not a configuration language.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};

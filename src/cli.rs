@@ -1,3 +1,11 @@
+//! The noun-verb command surface: parse arguments, print one JSON document on
+//! stdout, and return an exit status.
+//!
+//! This layer owns argument shapes and output shapes and nothing else. Lifecycle
+//! decisions belong to `execution`, Image decisions to `image`, and durability to
+//! `storage`; a handler here reads inputs, calls one of those, and emits the
+//! result. Errors go to stderr as plain text so stdout stays machine-readable.
+
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};

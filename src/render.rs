@@ -1,3 +1,13 @@
+//! Reading verified Layers into a filesystem view.
+//!
+//! Applies Layers in order with OCI whiteout semantics and resolves hardlinks,
+//! producing a view that can be listed, diffed, or streamed a file at a time
+//! without materializing anything. `materialize` is the separate step that
+//! writes such a view to disk.
+//!
+//! Every traversal is bounded: `RenderLimits` caps entry counts, path depth and
+//! sizes so a hostile Image cannot exhaust memory or time.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};

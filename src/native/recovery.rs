@@ -1,3 +1,14 @@
+//! The durable journal of a native Run attempt.
+//!
+//! Every host resource a Run acquires is written down before it is acquired and
+//! struck out after it is released, so a `runlab` that is killed mid-Run leaves
+//! behind an account of what still exists rather than an orphan nobody can name.
+//! `reconcile` is what reads that account.
+//!
+//! The journal is the crate's fail-closed boundary: a journal that does not
+//! validate stops reconciliation rather than allowing a guess about which host
+//! resources are safe to remove.
+
 use std::collections::BTreeMap;
 use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};

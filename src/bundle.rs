@@ -1,3 +1,10 @@
+//! A private OCI Runtime bundle: a directory holding one `rootfs/` and one
+//! canonical `config.json`, owned for the lifetime of one Run.
+//!
+//! The bundle is an OCI concept rather than a backend one, so it lives outside
+//! `native` even though only the native backend builds one today. It refuses
+//! symlinked and escaping paths and removes itself when dropped.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

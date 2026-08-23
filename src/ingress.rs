@@ -1,3 +1,10 @@
+//! Reading an Image out of a read-only OCI Layout or `oci-archive`.
+//!
+//! Selects one Manifest from the source graph for the requested platform,
+//! verifies every blob it reaches, and copies exact bytes into the local
+//! Layout. The source is never trusted: sizes, digests, media types, and graph
+//! shape are all checked before anything is published.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};

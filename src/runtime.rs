@@ -1,3 +1,11 @@
+//! OCI Runtime `config.json`: structural validation, canonical bytes, and
+//! authoring.
+//!
+//! One parse path, not two: a `RuntimeConfig` exists only after the document has
+//! passed unique-key checking, the typed OCI view, and the `RunLab` profile a
+//! backend requires. The exact bytes are retained, because the Run Record
+//! identifies the config by digest.
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

@@ -1,3 +1,10 @@
+//! Pulling Images over the OCI Distribution protocol: registry authentication,
+//! platform selection from an index, and blob download.
+//!
+//! Downloaded bytes go straight into the OCI Layout and are verified there.
+//! This module never decides what a local reference means; `image_ingress`
+//! composes it with the catalog.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::time::Duration;

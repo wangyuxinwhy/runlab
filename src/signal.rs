@@ -1,3 +1,10 @@
+//! A termination flag shared between the signal handler and the threads
+//! supervising a Run.
+//!
+//! Registering returns a guard; the flag stays armed until the guard is dropped,
+//! which is how a Run keeps responding to interruption right through its
+//! terminal write.
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 

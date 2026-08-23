@@ -1,3 +1,9 @@
+//! Verifying and reclaiming local state: checking that a Run Record still
+//! matches its stored bytes, and planning and applying garbage collection.
+//!
+//! Collection is two steps by design. A plan is a document you can read before
+//! anything is deleted, and applying one only removes what the plan named.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;

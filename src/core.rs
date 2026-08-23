@@ -1,3 +1,14 @@
+//! The Run Protocol vocabulary: identities, content slots, process and backend
+//! facts, and the two Run Record shapes.
+//!
+//! This is the crate's leaf. Everything depends on it and it depends on nothing,
+//! which is what lets a record state its own invariants — `validate` on these
+//! types is the single definition of what a coherent Run Record is, checked by
+//! producers and by the persistence layer alike.
+//!
+//! Rules here must hold for any conforming implementation. A rule that is true
+//! only of one backend's realization belongs with that backend.
+
 use std::fmt;
 use std::fmt::Write as _;
 use std::str::FromStr;

@@ -1,3 +1,12 @@
+//! The explicit Docker compatibility adapter.
+//!
+//! Docker is reached only through its CLI, behind this boundary: no module
+//! outside it knows that a `docker` process exists. It is opt-in — `--backend
+//! docker` — and the native backend is the reference path.
+//!
+//! The adapter can only realize Runtime configs Docker can represent faithfully.
+//! Where it cannot, it refuses rather than approximating.
+
 mod image;
 
 pub(crate) use image::DockerImageAdapter;
