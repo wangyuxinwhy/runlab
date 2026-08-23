@@ -1,30 +1,42 @@
+//! `runlab run` and `runlab state`: the Run lifecycle and the state that holds
+//! its records.
+//!
+//! `run start` is the only command here that creates a Run; everything else
+//! reads or maintains what a Run left behind. Lifecycle decisions belong to
+//! `execution` and durability to `storage`; this module decides only what a
+//! caller may ask for and what the answer looks like.
+
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use clap::{Args, Subcommand, ValueEnum};
+use schemars::JsonSchema;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::catalog::ImageSelector;
-use crate::core::{Digest, RunControls, RunId, StoredBytes};
+use crate::core::{
+    Digest, MAX_CAPTURED_STREAM_BYTES, NetworkControl, RunControls, RunId, StoredBytes,
+};
 use crate::docker::DockerBackend;
+#[cfg(target_os = "linux")]
+use crate::execution::{ManagedPrimaryInput, ManagedServiceInput};
 use crate::execution::{RunStartResult, Runner};
 use crate::image::ImageService;
 use crate::integrity::{digest_bytes, read_bounded_file, write_new_output};
 use crate::maintenance::{StateGcPlan, StateGcPlanResult};
 use crate::runtime::RuntimeConfig;
 use crate::state::{StateMaintenance, StateOperation};
-use crate::storage::RunDatabase;
+use crate::storage::{RunBytesField, RunDatabase};
 use crate::topology::ManagedServiceFile;
 
 use super::image::resolve_image;
-use super::{
-    LoadedManagedService, MAX_STDIN_BYTES, RunBackendArg, RunBytesCommand, RunCommand,
-    RunDiffResult, RunFieldDifference, RunFieldValue, RunLifecycleArg, RunListResult,
-    RunReconcileArgs, RunStartArgs, RunStream, RunStreamGetResult, StateCommand, StateGcCommand,
-    absolute_path, emit, image_service, run_database,
-};
-#[cfg(target_os = "linux")]
-use crate::execution::{ManagedPrimaryInput, ManagedServiceInput};
+use super::{absolute_path, emit, image_service, run_database};
+
+const DEFAULT_TIMEOUT_SECONDS: u64 = 3600;
+const DEFAULT_STREAM_LIMIT_BYTES: u64 = MAX_CAPTURED_STREAM_BYTES;
+const MAX_STDIN_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) fn run_run(state: &Path, command: RunCommand) -> Result<u8> {
     let command = match command {
@@ -423,4 +435,273 @@ pub(super) fn run_bytes(state: &Path, command: RunBytesCommand, stream: RunStrea
         output: absolute_path(&output)?,
     })?;
     Ok(0)
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum RunCommand {
+    /// Execute `INITIAL_MANIFEST` with one accepted Runtime Config and Run Controls.
+    Start(RunStartArgs),
+    /// Read one immutable `RUN_ID` projection from `SQLite`.
+    Get { run_id: RunId },
+    /// Verify one Run Record, its stored bytes, and all retained OCI Images.
+    Verify { run_id: RunId },
+    /// List Run Records in descending identity order.
+    List {
+        /// Maximum records returned in one response.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Continue strictly after this Run identity.
+        #[arg(long)]
+        after: Option<RunId>,
+        /// Restrict results to one persistent lifecycle.
+        #[arg(long, value_enum)]
+        lifecycle: Option<RunLifecycleArg>,
+    },
+    /// Compare two Run Records without reading stored stream bytes.
+    Diff {
+        left: RunId,
+        right: RunId,
+        /// Maximum field differences returned in one response.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+    /// Reconcile an interrupted native Run without re-executing its process.
+    Reconcile(RunReconcileArgs),
+    /// Read stdout stored in the `SQLite` Run Record.
+    Stdout {
+        #[command(subcommand)]
+        command: RunBytesCommand,
+    },
+    /// Read stderr stored in the `SQLite` Run Record.
+    Stderr {
+        #[command(subcommand)]
+        command: RunBytesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum StateCommand {
+    /// Verify Catalog, Run records, all OCI blobs, and complete rooted Image graphs.
+    Verify,
+    /// Plan or apply garbage collection for unreachable OCI blobs.
+    Gc {
+        #[command(subcommand)]
+        command: StateGcCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum StateGcCommand {
+    /// Write an inspectable, immutable plan without deleting content.
+    Plan {
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Apply exactly one previously written plan after rechecking reachability.
+    Apply {
+        #[arg(value_name = "PLAN")]
+        plan: PathBuf,
+    },
+}
+
+#[derive(Debug, Args)]
+pub(super) struct RunReconcileArgs {
+    #[arg(
+        value_name = "RUN_ID",
+        required_unless_present = "all",
+        conflicts_with = "all"
+    )]
+    run_id: Option<RunId>,
+
+    /// Discover and reconcile one bounded page of accepted Runs and recovery attempts.
+    #[arg(long, required_unless_present = "run_id", conflicts_with = "run_id")]
+    all: bool,
+
+    /// Maximum candidates processed with `--all`.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        requires = "all",
+        conflicts_with = "run_id"
+    )]
+    limit: Option<usize>,
+
+    /// Continue `--all` strictly after this Run identity.
+    #[arg(long, requires = "all", conflicts_with = "run_id")]
+    after: Option<RunId>,
+
+    /// Report required actions without changing Run or runtime state.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct RunStartArgs {
+    #[arg(value_name = "INITIAL_IMAGE")]
+    initial_image: ImageSelector,
+
+    /// Execution implementation; native requires Linux and the supported runc identity.
+    #[arg(long, value_enum, default_value_t = RunBackendArg::Native)]
+    backend: RunBackendArg,
+
+    #[arg(long, value_name = "FILE")]
+    runtime_config: PathBuf,
+
+    /// One required sidecar participant; supported by the native backend only.
+    #[arg(long, value_name = "FILE")]
+    managed_service: Option<PathBuf>,
+
+    /// File whose exact bytes become process stdin; omitted means empty bytes and EOF.
+    #[arg(long, value_name = "FILE")]
+    stdin: Option<PathBuf>,
+
+    /// Maximum process runtime after start.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS)]
+    timeout_seconds: u64,
+
+    /// Maximum persisted stdout prefix.
+    #[arg(long, default_value_t = DEFAULT_STREAM_LIMIT_BYTES)]
+    stdout_limit_bytes: u64,
+
+    /// Maximum persisted stderr prefix.
+    #[arg(long, default_value_t = DEFAULT_STREAM_LIMIT_BYTES)]
+    stderr_limit_bytes: u64,
+
+    /// Requested network provisioning; native supports `none|egress`, Docker supports `none`.
+    #[arg(long, value_enum, default_value_t = NetworkArg::None)]
+    network: NetworkArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(super) enum RunBackendArg {
+    Docker,
+    Native,
+}
+
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "native execution is rejected after portable input validation"
+    )
+)]
+pub(super) struct LoadedManagedService {
+    declaration: ManagedServiceFile,
+    image: ImageSelector,
+    runtime: RuntimeConfig,
+    runtime_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(super) enum NetworkArg {
+    None,
+    Egress,
+}
+
+impl From<NetworkArg> for NetworkControl {
+    fn from(value: NetworkArg) -> Self {
+        match value {
+            NetworkArg::None => Self::None,
+            NetworkArg::Egress => Self::Egress,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum RunBytesCommand {
+    /// Write captured bytes to a new --output file.
+    Get {
+        run_id: RunId,
+        /// Participant whose captured stream is read.
+        #[arg(long, value_enum, default_value_t = RunParticipantArg::Primary)]
+        participant: RunParticipantArg,
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RunParticipantArg {
+    Primary,
+    #[value(name = "managed-service")]
+    ManagedService,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(super) enum RunLifecycleArg {
+    Accepted,
+    Terminal,
+}
+
+impl RunLifecycleArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RunStream {
+    Stdout,
+    Stderr,
+}
+
+impl RunStream {
+    const fn storage_field(self, participant: RunParticipantArg) -> RunBytesField {
+        match (participant, self) {
+            (RunParticipantArg::Primary, Self::Stdout) => RunBytesField::Stdout,
+            (RunParticipantArg::Primary, Self::Stderr) => RunBytesField::Stderr,
+            (RunParticipantArg::ManagedService, Self::Stdout) => {
+                RunBytesField::ManagedServiceStdout
+            }
+            (RunParticipantArg::ManagedService, Self::Stderr) => {
+                RunBytesField::ManagedServiceStderr
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct RunListResult {
+    schema_version: u32,
+    runs: Vec<crate::core::RunRecord>,
+    next_after: Option<RunId>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct RunDiffResult {
+    schema_version: u32,
+    left_run_id: RunId,
+    right_run_id: RunId,
+    equal: bool,
+    total_differences: usize,
+    truncated: bool,
+    differences: Vec<RunFieldDifference>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct RunFieldDifference {
+    path: String,
+    left: RunFieldValue,
+    right: RunFieldValue,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(tag = "presence", rename_all = "snake_case")]
+pub(super) enum RunFieldValue {
+    Missing,
+    Value { value: Value },
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct RunStreamGetResult {
+    schema_version: u32,
+    run_id: RunId,
+    participant: RunParticipantArg,
+    field: RunStream,
+    output: String,
 }

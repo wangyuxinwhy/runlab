@@ -1,4 +1,12 @@
+//! `runlab schema`: the public JSON schema of every document this CLI prints.
+//!
+//! Each name maps to the exact type its command emits, so a schema cannot drift
+//! from the output it describes without failing to compile.
+
 use anyhow::Result;
+use clap::{Subcommand, ValueEnum};
+use schemars::JsonSchema;
+use serde::Serialize;
 
 use crate::core::{AcceptedRunRecord, TerminalRunRecord};
 use crate::execution::RunStartResult;
@@ -7,14 +15,17 @@ use crate::maintenance::{
 };
 use crate::reconciliation::{RunReconcileBatchResult, RunReconcileResult};
 
-use super::{
+use super::emit;
+use super::image::{
     DockerImageCheckoutCreateResult, DockerImageMaterializeResult, ImageCatalogListResult,
     ImageCatalogRemoveResult, ImageCatalogSetResult, ImageCatalogShowResult, ImageDiffResult,
     ImageExportResult, ImageFileGetResult, ImageImportResult, ImageInspectResult,
-    ImageOperationResult, ImagePullResult, ManagedServiceCheckResult, RunDiffResult, RunListResult,
-    RunStreamGetResult, RuntimeConfigCheckResult, RuntimeConfigCreateResult, SchemaCommand,
-    SchemaListResult, SchemaName, emit,
+    ImageOperationResult, ImagePullResult,
 };
+use super::inputs::{
+    ManagedServiceCheckResult, RuntimeConfigCheckResult, RuntimeConfigCreateResult,
+};
+use super::run::{RunDiffResult, RunListResult, RunStreamGetResult};
 
 pub(super) fn run_schema(command: SchemaCommand) -> Result<u8> {
     match command {
@@ -96,4 +107,103 @@ pub(super) fn run_schema(command: SchemaCommand) -> Result<u8> {
         },
     }
     Ok(0)
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub(super) enum SchemaCommand {
+    /// List the versioned public JSON schema names.
+    List,
+    /// Print one public JSON Schema.
+    Show {
+        #[arg(value_enum, default_value_t = SchemaName::TerminalRunRecord)]
+        name: SchemaName,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum SchemaName {
+    AcceptedRunRecord,
+    TerminalRunRecord,
+    RunStartResult,
+    RunListResult,
+    RunDiffResult,
+    RunStreamGetResult,
+    RunReconcileResult,
+    RunReconcileBatchResult,
+    RunVerifyResult,
+    ImageOperationResult,
+    ImageInspectResult,
+    ImageImportResult,
+    ImagePullResult,
+    ImageCatalogListResult,
+    ImageCatalogShowResult,
+    ImageCatalogSetResult,
+    ImageCatalogRemoveResult,
+    ImageDiffResult,
+    ImageExportResult,
+    ImageFileGetResult,
+    DockerImageMaterializeResult,
+    DockerImageCheckoutCreateResult,
+    RuntimeConfigCreateResult,
+    RuntimeConfigCheckResult,
+    ManagedServiceCheckResult,
+    StateVerifyResult,
+    StateGcPlan,
+    StateGcPlanResult,
+    StateGcApplyResult,
+    VmStatus,
+    VmInstallResult,
+    VmOperationResult,
+    VmOperationStatus,
+    VmCancelResult,
+    VmDiscardResult,
+    SchemaListResult,
+}
+
+impl SchemaName {
+    const ALL: [Self; 36] = [
+        Self::AcceptedRunRecord,
+        Self::TerminalRunRecord,
+        Self::RunStartResult,
+        Self::RunListResult,
+        Self::RunDiffResult,
+        Self::RunStreamGetResult,
+        Self::RunReconcileResult,
+        Self::RunReconcileBatchResult,
+        Self::RunVerifyResult,
+        Self::ImageOperationResult,
+        Self::ImageInspectResult,
+        Self::ImageImportResult,
+        Self::ImagePullResult,
+        Self::ImageCatalogListResult,
+        Self::ImageCatalogShowResult,
+        Self::ImageCatalogSetResult,
+        Self::ImageCatalogRemoveResult,
+        Self::ImageDiffResult,
+        Self::ImageExportResult,
+        Self::ImageFileGetResult,
+        Self::DockerImageMaterializeResult,
+        Self::DockerImageCheckoutCreateResult,
+        Self::RuntimeConfigCreateResult,
+        Self::RuntimeConfigCheckResult,
+        Self::ManagedServiceCheckResult,
+        Self::StateVerifyResult,
+        Self::StateGcPlan,
+        Self::StateGcPlanResult,
+        Self::StateGcApplyResult,
+        Self::VmStatus,
+        Self::VmInstallResult,
+        Self::VmOperationResult,
+        Self::VmOperationStatus,
+        Self::VmCancelResult,
+        Self::VmDiscardResult,
+        Self::SchemaListResult,
+    ];
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct SchemaListResult {
+    schema_version: u32,
+    schemas: Vec<SchemaName>,
 }

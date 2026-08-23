@@ -1,16 +1,25 @@
-use std::path::Path;
+//! `runlab runtime-config` and `runlab managed-service`: the two files a Run
+//! takes as input.
+//!
+//! Both commands do the same thing to a different declaration -- write one or
+//! check one -- and report its digest, so a caller can pin the exact bytes a
+//! Run will accept.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use clap::Subcommand;
+use schemars::JsonSchema;
+use serde::Serialize;
 
+use crate::catalog::ImageSelector;
+use crate::core::{Digest, OciDescriptor, ServiceName, TcpReadinessCondition};
 use crate::integrity::{digest_bytes, read_bounded_file, write_new_output};
 use crate::runtime::RuntimeConfig;
 use crate::topology::ManagedServiceFile;
 
 use super::image::resolve_image;
-use super::{
-    ContentSummary, ManagedServiceCheckResult, ManagedServiceCommand, RuntimeConfigCheckResult,
-    RuntimeConfigCommand, RuntimeConfigCreateResult, absolute_path, emit, image_service,
-};
+use super::{absolute_path, emit, image_service};
 
 pub(super) fn run_runtime_config(state: &Path, command: RuntimeConfigCommand) -> Result<u8> {
     match command {
@@ -69,4 +78,56 @@ pub(super) fn run_managed_service(state: &Path, command: ManagedServiceCommand) 
         readiness: service.readiness,
     })?;
     Ok(0)
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum RuntimeConfigCommand {
+    /// Convert OCI Image defaults into an OCI Runtime config.json.
+    Create {
+        #[arg(value_name = "IMAGE")]
+        image: ImageSelector,
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Validate an OCI Runtime config.json without selecting an execution backend.
+    Check { path: PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum ManagedServiceCommand {
+    /// Validate the declaration, OCI Image, Runtime Config, and TCP readiness condition.
+    Check { path: PathBuf },
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct RuntimeConfigCreateResult {
+    schema_version: u32,
+    requested_reference: Option<String>,
+    manifest_digest: Digest,
+    output: String,
+    size: usize,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct RuntimeConfigCheckResult {
+    schema_version: u32,
+    valid: bool,
+    oci_version: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct ContentSummary {
+    digest: Digest,
+    size: usize,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct ManagedServiceCheckResult {
+    schema_version: u32,
+    valid: bool,
+    name: ServiceName,
+    requested_reference: Option<String>,
+    initial_image: OciDescriptor,
+    runtime_config: ContentSummary,
+    readiness: TcpReadinessCondition,
 }
