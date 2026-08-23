@@ -1,34 +1,53 @@
-use std::sync::atomic::AtomicBool;
+//! The two-participant topology: a Primary Run bound to one required Managed
+//! Service.
+//!
+//! This module owns everything that only exists because a Run has two
+//! participants: readiness, concurrent observation of both processes, the
+//! lifecycle stop one triggers in the other, and the terminal transaction that
+//! relates both sets of facts. Single-participant behaviour is reached through
+//! `participant`, and the recovery attempt and Run network through `scope`.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use crate::core::{
-    ACCEPTED_RUN_RECORD_SCHEMA_VERSION, AcceptedLifecycle, AcceptedRunRecord, Digest,
-    ManagedServiceCondition, ManagedServiceFacts, NetworkControl, RunControls, RunId,
-    TERMINAL_RUN_RECORD_SCHEMA_VERSION, TerminalLifecycle, TerminalRunRecord,
+    ACCEPTED_RUN_RECORD_SCHEMA_VERSION, AcceptedLifecycle, AcceptedRunRecord, Digest, ImageView,
+    ManagedServiceCondition, ManagedServiceFacts, ManagedServiceReadiness, NetworkControl,
+    OciDescriptor, OperationError, OperationErrorScope, ProcessSlot, RunControls, RunId,
+    ServiceName, StoredBytes, TERMINAL_RUN_RECORD_SCHEMA_VERSION, TcpReadinessCondition,
+    TerminalLifecycle, TerminalRunRecord,
 };
+use crate::filesystem::Inventory;
 use crate::native::backend::{
-    NativeBackend, NativeExecutionMode, RuncRunner, verify_resolver_target,
+    NativeBackend, NativeExecutionMode, NativePreflight, PreparedRuncRun, RuncCaptureLimits,
+    RuncRunner, RuncStopReason, verify_resolver_target,
 };
 use crate::native::network::{NativeNetworkBinding, RunNetwork};
+use crate::native::read_only_file::VerifiedSourceFile;
 use crate::native::recovery::{
     ManagedTerminalCheckpoint, NativeAttempt, NativeParticipant, NativeRecoveryStore,
     TerminalCheckpoint,
 };
-use crate::native::resolver::ResolverConfig;
+use crate::native::resolver::{ResolverConfig, ResolverSourceFile};
 use crate::runtime::RuntimeConfig;
 use crate::signal::TerminationFlag;
 
-use super::{
-    ManagedAcceptance, ManagedExecutionStates, ManagedExecutions, ManagedNativeInput,
-    ManagedObservations, ManagedPreparation, ManagedPrimaryInput, ManagedRunState,
-    ManagedServiceInput, NativeExecution, PreparedManagedEnvironments, RunCleanup, RunResult,
-    RunState, Runner, RunnerBackend, TerminalInput, abandon_managed_pre_acceptance,
-    available_bytes, finish_run_network, managed_run_cli_exit_code, mark_managed_accepted,
-    observe_native_process, prepare_native_process_start, prepare_resolver_source,
-    readiness_probe_error, run_managed_observations, run_network_cleanup_error, start_run_network,
-    verify_platform,
+use super::participant::{
+    NativeEnvironment, NativeExecution, NativeProcessObservation, observe_native_process,
+    prepare_native_process_start, run_native_process_observation, verify_platform,
+};
+use super::scope::{
+    abandon_managed_pre_acceptance, finish_run_network, mark_managed_accepted,
+    prepare_resolver_source, run_network_cleanup_error, start_run_network,
+};
+use crate::execution::{
+    ParticipantState, RunCleanup, RunResult, RunState, Runner, RunnerBackend, TerminalInput,
+    available_bytes, run_cli_exit_code_with_errors,
 };
 
 impl Runner<'_> {
@@ -549,5 +568,480 @@ impl Runner<'_> {
             cli_exit_code,
             cleanup,
         })
+    }
+}
+
+pub struct ManagedServiceInput<'a> {
+    pub name: ServiceName,
+    pub requested_image_reference: Option<&'a str>,
+    pub initial_manifest: &'a Digest,
+    pub runtime: &'a RuntimeConfig,
+    pub runtime_bytes: &'a [u8],
+    pub readiness: TcpReadinessCondition,
+}
+
+pub struct ManagedPrimaryInput<'a> {
+    pub initial_manifest: &'a Digest,
+    pub requested_image_reference: Option<&'a str>,
+    pub runtime: &'a RuntimeConfig,
+    pub runtime_bytes: &'a [u8],
+    pub controls: RunControls,
+    pub stdin: &'a [u8],
+}
+
+struct ManagedNativeInput<'a> {
+    run_id: RunId,
+    controls: &'a RunControls,
+    stdin: &'a [u8],
+    primary_manifest: &'a Digest,
+    primary_runtime: &'a RuntimeConfig,
+    service_manifest: &'a Digest,
+    service_runtime: &'a RuntimeConfig,
+    capture_limits: RuncCaptureLimits,
+    cancelled: &'a AtomicBool,
+    service_timeout_seconds: u64,
+    primary_files: &'a [VerifiedSourceFile],
+    service_files: &'a [VerifiedSourceFile],
+    resolver_source: Option<&'a ResolverSourceFile>,
+}
+
+struct ManagedPreparation {
+    primary_image: ImageView,
+    service_image: ImageView,
+    service_timeout_seconds: u64,
+    state_root: PathBuf,
+    preflight: NativePreflight,
+}
+
+struct ManagedAcceptance {
+    accepted_at: chrono::DateTime<Utc>,
+    primary_image: OciDescriptor,
+    primary_runtime: StoredBytes,
+    condition: ManagedServiceCondition,
+}
+
+#[derive(Clone, Copy)]
+struct ManagedExecutions<'a, 'execution> {
+    primary: &'a NativeExecution<'execution>,
+    service: &'a NativeExecution<'execution>,
+}
+
+struct PreparedManagedEnvironments<'runc> {
+    primary: NativeEnvironment,
+    primary_before: Inventory,
+    service: NativeEnvironment,
+    service_before: Inventory,
+    service_runtime: Option<PreparedRuncRun<'runc>>,
+}
+
+struct ManagedObservations {
+    primary: Option<NativeProcessObservation>,
+    service: Option<NativeProcessObservation>,
+}
+
+struct ManagedExecutionStates<'a> {
+    attempt: &'a mut NativeAttempt,
+    primary: &'a mut ParticipantState,
+    managed: &'a mut ManagedRunState,
+}
+
+struct ManagedRunState {
+    condition: ManagedServiceCondition,
+    readiness: Option<ManagedServiceReadiness>,
+    participant: ParticipantState,
+}
+
+impl ManagedRunState {
+    fn new(condition: ManagedServiceCondition) -> Self {
+        Self {
+            condition,
+            readiness: None,
+            participant: ParticipantState::new(OperationErrorScope::ManagedService),
+        }
+    }
+}
+
+fn run_managed_observations(
+    runc: &RuncRunner,
+    network: &NativeNetworkBinding,
+    input: &ManagedNativeInput<'_>,
+    executions: ManagedExecutions<'_, '_>,
+    prepared: &mut PreparedManagedEnvironments<'_>,
+    states: ManagedExecutionStates<'_>,
+) -> ManagedObservations {
+    let ManagedExecutionStates {
+        attempt,
+        primary,
+        managed,
+    } = states;
+    let service_finished = AtomicBool::new(false);
+    let service_terminal_observed = AtomicBool::new(false);
+    let primary_terminal_observed = AtomicBool::new(false);
+    let primary_observation_complete = AtomicBool::new(false);
+    let service_requested_primary_stop = AtomicBool::new(false);
+    let mut primary_observation = None;
+    let service_runtime = prepared
+        .service_runtime
+        .take()
+        .expect("Managed Service runtime resources are prepared");
+    let service_observation = thread::scope(|scope| {
+        let service_handle = scope.spawn(|| {
+            let observation = run_native_process_observation(
+                service_runtime,
+                prepared.service.bundle(),
+                executions.service,
+                &service_terminal_observed,
+            );
+            service_finished.store(true, Ordering::Release);
+            observation
+        });
+        let readiness = wait_for_managed_readiness(
+            network,
+            &managed.condition.readiness,
+            &service_finished,
+            input.cancelled,
+        );
+        managed.readiness = Some(readiness.clone());
+        let readiness_persisted = match attempt.record_managed_readiness(readiness.clone()) {
+            Ok(()) => true,
+            Err(error) => {
+                managed.participant.error("recovery_checkpoint", &error);
+                primary.fail_before_start("recovery_checkpoint", &error);
+                false
+            }
+        };
+        if readiness_persisted && matches!(readiness, ManagedServiceReadiness::Ready { .. }) {
+            if let Some(primary_runtime) = prepare_native_process_start(
+                runc,
+                NativeExecutionMode::Rootful,
+                attempt,
+                NativeParticipant::Primary,
+                primary,
+            ) {
+                let watcher = scope.spawn(|| {
+                    let requested = request_primary_stop_after_service_exit(
+                        &service_terminal_observed,
+                        &primary_terminal_observed,
+                        &primary_observation_complete,
+                        executions.primary.lifecycle_stop,
+                    );
+                    service_requested_primary_stop.store(requested, Ordering::Release);
+                });
+                primary_observation = Some(run_native_process_observation(
+                    primary_runtime,
+                    prepared.primary.bundle(),
+                    executions.primary,
+                    &primary_terminal_observed,
+                ));
+                primary_observation_complete.store(true, Ordering::Release);
+                let _ = watcher.join();
+            }
+        } else if readiness_persisted {
+            if matches!(readiness, ManagedServiceReadiness::Cancelled { .. }) {
+                primary.cancel_before_start();
+            } else {
+                primary.not_started(readiness_failure_message(&readiness));
+                primary.operation_errors.push(OperationError {
+                    scope: OperationErrorScope::Run,
+                    phase: "managed_service_readiness".to_owned(),
+                    message: readiness_failure_message(&readiness).to_owned(),
+                });
+            }
+        }
+        executions
+            .service
+            .lifecycle_stop
+            .store(true, Ordering::Release);
+        service_handle.join()
+    });
+    finish_managed_observations(
+        service_observation,
+        service_requested_primary_stop.load(Ordering::Acquire),
+        primary_observation,
+        primary,
+        managed,
+    )
+}
+
+fn finish_managed_observations(
+    service_observation: thread::Result<NativeProcessObservation>,
+    service_requested_primary_stop: bool,
+    primary_observation: Option<NativeProcessObservation>,
+    primary: &mut ParticipantState,
+    managed: &mut ManagedRunState,
+) -> ManagedObservations {
+    let service = if let Ok(observation) = service_observation {
+        Some(observation)
+    } else {
+        managed.participant.fail_before_start(
+            "process_execute",
+            &anyhow::anyhow!("Managed Service execution thread panicked"),
+        );
+        None
+    };
+    let primary_stop_reason = primary_observation
+        .as_ref()
+        .and_then(|observation| observation.result.as_ref().ok())
+        .and_then(|result| result.stop_reason);
+    record_managed_service_loss(
+        managed_service_loss_confirmed(service_requested_primary_stop, primary_stop_reason),
+        primary,
+    );
+    ManagedObservations {
+        primary: primary_observation,
+        service,
+    }
+}
+
+fn request_primary_stop_after_service_exit(
+    service_terminal_observed: &AtomicBool,
+    primary_terminal_observed: &AtomicBool,
+    primary_observation_complete: &AtomicBool,
+    primary_lifecycle_stop: &AtomicBool,
+) -> bool {
+    loop {
+        if primary_terminal_observed.load(Ordering::Acquire)
+            || primary_observation_complete.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        if service_terminal_observed.load(Ordering::Acquire) {
+            if primary_terminal_observed.load(Ordering::Acquire)
+                || primary_observation_complete.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            primary_lifecycle_stop.store(true, Ordering::Release);
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn record_managed_service_loss(lost: bool, primary: &mut ParticipantState) {
+    if lost {
+        primary.operation_errors.push(OperationError {
+            scope: OperationErrorScope::Run,
+            phase: "managed_service_lost".to_owned(),
+            message: "Managed Service exited after readiness and before Primary completion"
+                .to_owned(),
+        });
+    }
+}
+
+fn managed_service_loss_confirmed(
+    service_requested_primary_stop: bool,
+    primary_stop_reason: Option<RuncStopReason>,
+) -> bool {
+    service_requested_primary_stop && primary_stop_reason == Some(RuncStopReason::LifecycleStop)
+}
+
+fn wait_for_managed_readiness(
+    network: &NativeNetworkBinding,
+    condition: &TcpReadinessCondition,
+    service_finished: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> ManagedServiceReadiness {
+    let started = Instant::now();
+    let timeout = Duration::from_secs(condition.timeout_seconds);
+    let Some(deadline) = started.checked_add(timeout) else {
+        return readiness_probe_error(0, "Managed Service readiness deadline overflow");
+    };
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            return readiness_probe_error(
+                0,
+                &format!("failed to resolve readiness probe executable: {error}"),
+            );
+        }
+    };
+    let mut attempts = 0_u32;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return ManagedServiceReadiness::Cancelled {
+                observed_at: Utc::now(),
+                attempts,
+            };
+        }
+        if service_finished.load(Ordering::Acquire) {
+            return ManagedServiceReadiness::ServiceExited {
+                observed_at: Utc::now(),
+                attempts,
+            };
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return ManagedServiceReadiness::TimedOut {
+                observed_at: Utc::now(),
+                attempts,
+            };
+        }
+        attempts = match attempts.checked_add(1) {
+            Some(value) => value,
+            None => return readiness_probe_error(attempts, "readiness attempt count overflow"),
+        };
+        let remaining = deadline.saturating_duration_since(now);
+        let probe_timeout = remaining.min(Duration::from_millis(250));
+        let arguments = [
+            crate::subprocess::TCP_PROBE_COMMAND.to_owned(),
+            "--port".to_owned(),
+            condition.port.to_string(),
+            "--timeout-milliseconds".to_owned(),
+            probe_timeout.as_millis().max(1).to_string(),
+        ];
+        match network.invoke(
+            &executable,
+            arguments,
+            probe_timeout + Duration::from_secs(1),
+        ) {
+            Ok(output) if output.status.success() => {
+                return ManagedServiceReadiness::Ready {
+                    observed_at: Utc::now(),
+                    attempts,
+                };
+            }
+            Ok(output) if output.status.code() == Some(75) => {}
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let message = if stderr.is_empty() {
+                    format!("readiness probe exited with {}", output.status)
+                } else {
+                    format!(
+                        "readiness probe exited with {}; stderr: {stderr}",
+                        output.status
+                    )
+                };
+                return readiness_probe_error(attempts, &message);
+            }
+            Err(error) => {
+                return readiness_probe_error(
+                    attempts,
+                    &format!("readiness probe failed: {error}"),
+                );
+            }
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+        );
+    }
+}
+
+fn readiness_probe_error(attempts: u32, error: &str) -> ManagedServiceReadiness {
+    ManagedServiceReadiness::ProbeError {
+        observed_at: Utc::now(),
+        attempts,
+        error: error.to_owned(),
+    }
+}
+
+fn readiness_failure_message(readiness: &ManagedServiceReadiness) -> &'static str {
+    match readiness {
+        ManagedServiceReadiness::Ready { .. } => "Managed Service is ready",
+        ManagedServiceReadiness::TimedOut { .. } => "Managed Service readiness timed out",
+        ManagedServiceReadiness::ServiceExited { .. } => "Managed Service exited before readiness",
+        ManagedServiceReadiness::Cancelled { .. } => {
+            "Run was cancelled during Managed Service readiness"
+        }
+        ManagedServiceReadiness::ProbeError { .. } => "Managed Service readiness probe failed",
+    }
+}
+
+fn managed_run_cli_exit_code(
+    process: &ProcessSlot,
+    primary_errors: &[OperationError],
+    service_errors: &[OperationError],
+) -> u8 {
+    run_cli_exit_code_with_errors(
+        process,
+        !primary_errors.is_empty() || !service_errors.is_empty(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{ProcessFacts, ProcessOutcome};
+
+    #[test]
+    fn managed_service_loss_requires_a_confirmed_lifecycle_stop() {
+        assert!(managed_service_loss_confirmed(
+            true,
+            Some(RuncStopReason::LifecycleStop)
+        ));
+        assert!(!managed_service_loss_confirmed(
+            false,
+            Some(RuncStopReason::LifecycleStop)
+        ));
+        assert!(!managed_service_loss_confirmed(true, None));
+        assert!(!managed_service_loss_confirmed(
+            true,
+            Some(RuncStopReason::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn completed_primary_process_is_not_stopped_during_cleanup() {
+        let service_terminal = AtomicBool::new(true);
+        let primary_terminal = AtomicBool::new(true);
+        let primary_complete = AtomicBool::new(false);
+        let lifecycle_stop = AtomicBool::new(false);
+
+        assert!(!request_primary_stop_after_service_exit(
+            &service_terminal,
+            &primary_terminal,
+            &primary_complete,
+            &lifecycle_stop,
+        ));
+        assert!(!lifecycle_stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn service_exit_requests_stop_for_an_observed_running_primary() {
+        let service_terminal = AtomicBool::new(true);
+        let primary_terminal = AtomicBool::new(false);
+        let primary_complete = AtomicBool::new(false);
+        let lifecycle_stop = AtomicBool::new(false);
+
+        assert!(request_primary_stop_after_service_exit(
+            &service_terminal,
+            &primary_terminal,
+            &primary_complete,
+            &lifecycle_stop,
+        ));
+        assert!(lifecycle_stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn managed_cli_exit_status_includes_service_operation_errors() {
+        let exited = ProcessSlot::available(ProcessFacts {
+            terminal_outcome: ProcessOutcome::ProcessExited,
+            exit_code: Some(0),
+            started_at: None,
+            ended_at: None,
+            oom_killed: None,
+            backend_error: None,
+        });
+        let service_errors = vec![OperationError {
+            scope: OperationErrorScope::ManagedService,
+            phase: "final_image_capture".to_owned(),
+            message: "failed".to_owned(),
+        }];
+        assert_eq!(managed_run_cli_exit_code(&exited, &[], &service_errors), 1);
+
+        let cancelled = ProcessSlot::available(ProcessFacts {
+            terminal_outcome: ProcessOutcome::Cancelled,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+            oom_killed: None,
+            backend_error: None,
+        });
+        assert_eq!(
+            managed_run_cli_exit_code(&cancelled, &[], &service_errors),
+            130
+        );
     }
 }
