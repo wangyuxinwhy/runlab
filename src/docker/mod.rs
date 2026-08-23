@@ -14,7 +14,7 @@ pub(crate) use image::DockerImageAdapter;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,16 +25,23 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
-use tempfile::tempfile;
 
 use crate::core::{
     Architecture, BackendDetails, BackendFacts, NetworkControl, Platform, RunControls, RunId,
 };
 use crate::runtime::RuntimeConfig;
 use crate::signal::TerminationFlag;
+use crate::subprocess::bounded_output;
 
 const MAX_COMMAND_OUTPUT_BYTES: u64 = 1024 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// How long a Docker control-plane call may take: inspect, create, stop, remove.
+const CONTROL_TIMEOUT: Duration = Duration::from_mins(2);
+/// How long a Docker call that moves an Image's bytes may take: save, load, commit.
+///
+/// A Run's own bound comes from its `RunControls`; this bounds the client calls
+/// around it, so a wedged Docker daemon cannot hold a `RunLab` process forever.
+const TRANSFER_TIMEOUT: Duration = Duration::from_mins(30);
 const REQUIRED_NAMESPACES: [&str; 6] = ["pid", "network", "ipc", "uts", "mount", "cgroup"];
 
 #[derive(Debug)]
@@ -151,25 +158,34 @@ impl DockerBackend {
                 "the Docker adapter cannot faithfully provision the outbound-only network=egress control"
             );
         }
-        let context = self.run_text(["context", "show"])?.trim().to_owned();
+        let context = self
+            .run_text(["context", "show"], CONTROL_TIMEOUT)?
+            .trim()
+            .to_owned();
         let endpoint = self
-            .run_text([
-                "context",
-                "inspect",
-                "--format",
-                "{{(index .Endpoints \"docker\").Host}}",
-                &context,
-            ])?
+            .run_text(
+                [
+                    "context",
+                    "inspect",
+                    "--format",
+                    "{{(index .Endpoints \"docker\").Host}}",
+                    &context,
+                ],
+                CONTROL_TIMEOUT,
+            )?
             .trim()
             .to_owned();
         let endpoint_kind = endpoint_kind(&endpoint)?;
         let platform = self.native_platform()?;
         let version = self
-            .run_text(["version", "--format", "{{.Server.Version}}"])?
+            .run_text(
+                ["version", "--format", "{{.Server.Version}}"],
+                CONTROL_TIMEOUT,
+            )?
             .trim()
             .to_owned();
         let engine_id = self
-            .run_text(["info", "--format", "{{.ID}}"])?
+            .run_text(["info", "--format", "{{.ID}}"], CONTROL_TIMEOUT)?
             .trim()
             .to_owned();
         if engine_id.is_empty() {
@@ -191,7 +207,10 @@ impl DockerBackend {
 
     pub fn native_platform(&self) -> Result<Platform> {
         let raw = self
-            .run_text(["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"])?
+            .run_text(
+                ["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"],
+                CONTROL_TIMEOUT,
+            )?
             .trim()
             .to_owned();
         let Some((operating_system, architecture)) = raw.split_once('/') else {
@@ -204,17 +223,26 @@ impl DockerBackend {
     }
 
     pub fn save_image(&self, image: &str, destination: &Path) -> Result<()> {
-        self.run(["image", "save", "--output", path_text(destination)?, image])?;
+        self.run(
+            ["image", "save", "--output", path_text(destination)?, image],
+            TRANSFER_TIMEOUT,
+        )?;
         Ok(())
     }
 
     pub fn load_image(&self, archive: &Path) -> Result<()> {
-        self.run(["image", "load", "--input", path_text(archive)?])?;
+        self.run(
+            ["image", "load", "--input", path_text(archive)?],
+            TRANSFER_TIMEOUT,
+        )?;
         Ok(())
     }
 
     pub fn image_exists(&self, reference: &str) -> Result<bool> {
-        let output = self.invoke(["image", "inspect", "--format", "{{.Id}}", reference])?;
+        let output = self.invoke(
+            ["image", "inspect", "--format", "{{.Id}}", reference],
+            CONTROL_TIMEOUT,
+        )?;
         if output.status.success() {
             return Ok(true);
         }
@@ -225,7 +253,7 @@ impl DockerBackend {
     }
 
     pub fn remove_image_tag(&self, tag: &str) -> Result<()> {
-        let output = self.invoke(["image", "rm", tag])?;
+        let output = self.invoke(["image", "rm", tag], CONTROL_TIMEOUT)?;
         if output.status.success() || output.stderr.contains("No such image") {
             return Ok(());
         }
@@ -233,13 +261,16 @@ impl DockerBackend {
     }
 
     pub fn image_diff_ids(&self, image: &str) -> Result<Vec<String>> {
-        let raw = self.run_text([
-            "image",
-            "inspect",
-            "--format",
-            "{{json .RootFS.Layers}}",
-            image,
-        ])?;
+        let raw = self.run_text(
+            [
+                "image",
+                "inspect",
+                "--format",
+                "{{json .RootFS.Layers}}",
+                image,
+            ],
+            CONTROL_TIMEOUT,
+        )?;
         serde_json::from_str(&raw).context("Docker returned an invalid image Layer list")
     }
 
@@ -247,35 +278,41 @@ impl DockerBackend {
         let suffix = RunId::new().to_string();
         let name = format!("runlab-checkout-{}", &suffix[4..]);
         let label = format!("runlab.parent-manifest={parent_manifest}");
-        let output = self.run([
-            "container",
-            "create",
-            "--name",
-            &name,
-            "--hostname",
-            "runlab-checkout",
-            "--label",
-            &label,
-            "--entrypoint",
-            "/bin/sh",
-            image,
-            "-c",
-            "while :; do sleep 3600; done",
-        ])?;
+        let output = self.run(
+            [
+                "container",
+                "create",
+                "--name",
+                &name,
+                "--hostname",
+                "runlab-checkout",
+                "--label",
+                &label,
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-c",
+                "while :; do sleep 3600; done",
+            ],
+            CONTROL_TIMEOUT,
+        )?;
         let container = output.stdout.trim().to_owned();
-        self.run(["container", "start", &container])?;
+        self.run(["container", "start", &container], CONTROL_TIMEOUT)?;
         Ok(container)
     }
 
     pub fn checkout_parent(&self, container: &str) -> Result<String> {
         let value = self
-            .run_text([
-                "container",
-                "inspect",
-                "--format",
-                "{{index .Config.Labels \"runlab.parent-manifest\"}}",
-                container,
-            ])?
+            .run_text(
+                [
+                    "container",
+                    "inspect",
+                    "--format",
+                    "{{index .Config.Labels \"runlab.parent-manifest\"}}",
+                    container,
+                ],
+                CONTROL_TIMEOUT,
+            )?
             .trim()
             .to_owned();
         if !value.starts_with("sha256:") {
@@ -285,7 +322,7 @@ impl DockerBackend {
     }
 
     pub fn commit(&self, container: &str, tag: &str) -> Result<()> {
-        self.run(["container", "commit", container, tag])?;
+        self.run(["container", "commit", container, tag], TRANSFER_TIMEOUT)?;
         Ok(())
     }
 
@@ -354,7 +391,7 @@ impl DockerBackend {
         }
         arguments.push(image.to_owned());
         arguments.extend(runtime.process.args.iter().skip(1).cloned());
-        let output = self.run_owned(&arguments)?;
+        let output = self.run_owned(&arguments, CONTROL_TIMEOUT)?;
         Ok(output.stdout.trim().to_owned())
     }
 
@@ -471,13 +508,16 @@ impl DockerBackend {
             oom_killed: bool,
             error: String,
         }
-        let raw = self.run_text([
-            "container",
-            "inspect",
-            "--format",
-            "{{json .State}}",
-            container,
-        ])?;
+        let raw = self.run_text(
+            [
+                "container",
+                "inspect",
+                "--format",
+                "{{json .State}}",
+                container,
+            ],
+            CONTROL_TIMEOUT,
+        )?;
         let state: State =
             serde_json::from_str(&raw).context("Docker returned an invalid container state")?;
         Ok(ContainerState {
@@ -489,7 +529,7 @@ impl DockerBackend {
     }
 
     pub fn remove_container(&self, container: &str) -> Result<()> {
-        let output = self.invoke(["container", "rm", "--force", container])?;
+        let output = self.invoke(["container", "rm", "--force", container], CONTROL_TIMEOUT)?;
         if output.status.success() || output.stderr.contains("No such container") {
             return Ok(());
         }
@@ -497,12 +537,19 @@ impl DockerBackend {
     }
 
     fn stop_container(&self, container: &str) -> Result<()> {
-        self.run(["container", "stop", "--time", "2", container])?;
+        self.run(
+            ["container", "stop", "--time", "2", container],
+            CONTROL_TIMEOUT,
+        )?;
         Ok(())
     }
 
-    fn run<const N: usize>(&self, arguments: [&str; N]) -> Result<CommandOutput> {
-        let output = self.invoke(arguments)?;
+    fn run<const N: usize>(
+        &self,
+        arguments: [&str; N],
+        timeout: Duration,
+    ) -> Result<CommandOutput> {
+        let output = self.invoke(arguments, timeout)?;
         if output.status.success() {
             Ok(output)
         } else {
@@ -510,8 +557,8 @@ impl DockerBackend {
         }
     }
 
-    fn run_owned(&self, arguments: &[String]) -> Result<CommandOutput> {
-        let output = self.invoke(arguments.iter().map(String::as_str))?;
+    fn run_owned(&self, arguments: &[String], timeout: Duration) -> Result<CommandOutput> {
+        let output = self.invoke(arguments.iter().map(String::as_str), timeout)?;
         if output.status.success() {
             Ok(output)
         } else {
@@ -519,26 +566,29 @@ impl DockerBackend {
         }
     }
 
-    fn run_text<const N: usize>(&self, arguments: [&str; N]) -> Result<String> {
-        Ok(self.run(arguments)?.stdout)
+    fn run_text<const N: usize>(&self, arguments: [&str; N], timeout: Duration) -> Result<String> {
+        Ok(self.run(arguments, timeout)?.stdout)
     }
 
-    fn invoke<'a>(&self, arguments: impl IntoIterator<Item = &'a str>) -> Result<CommandOutput> {
-        let mut stdout = tempfile().context("failed to create Docker stdout capture")?;
-        let mut stderr = tempfile().context("failed to create Docker stderr capture")?;
-        let status = Command::new(&self.executable)
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout.try_clone()?))
-            .stderr(Stdio::from(stderr.try_clone()?))
-            .status()
-            .context("could not execute Docker")?;
-        let stdout = read_command_output(&mut stdout, "stdout")?;
-        let stderr = read_command_output(&mut stderr, "stderr")?;
+    fn invoke<'a>(
+        &self,
+        arguments: impl IntoIterator<Item = &'a str>,
+        timeout: Duration,
+    ) -> Result<CommandOutput> {
+        let mut command = Command::new(&self.executable);
+        command.args(arguments);
+        let output = bounded_output(
+            &mut command,
+            None,
+            timeout,
+            usize::try_from(MAX_COMMAND_OUTPUT_BYTES)
+                .context("Docker output limit is too large")?,
+            "Docker",
+        )?;
         Ok(CommandOutput {
-            status,
-            stdout,
-            stderr,
+            status: output.status,
+            stdout: command_text(output.stdout, "stdout")?,
+            stderr: command_text(output.stderr, "stderr")?,
         })
     }
 }
@@ -686,16 +736,7 @@ fn command_failure(output: &CommandOutput) -> anyhow::Error {
     )
 }
 
-fn read_command_output(file: &mut File, stream: &str) -> Result<String> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_COMMAND_OUTPUT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read Docker {stream}"))?;
-    if u64::try_from(bytes.len()).context("Docker output is too large")? > MAX_COMMAND_OUTPUT_BYTES
-    {
-        bail!("Docker {stream} exceeds the {MAX_COMMAND_OUTPUT_BYTES}-byte diagnostic limit");
-    }
+fn command_text(bytes: Vec<u8>, stream: &str) -> Result<String> {
     String::from_utf8(bytes).with_context(|| format!("Docker {stream} is not valid UTF-8"))
 }
 
