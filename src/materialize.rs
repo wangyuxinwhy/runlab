@@ -32,8 +32,8 @@ use crate::filesystem::{FilesystemOwnership, FsPath, Metadata, Timestamp, Xattrs
 use crate::integrity::ensure_private_directory;
 use crate::oci::OciLayout;
 use crate::render::{
-    LayerEntry, LayerEntryKind, LayerPlan, RenderError, RenderLimits, descendant_bounds,
-    scan_layer, visit_layer_regulars,
+    EntryLocation, LayerEntry, LayerEntryKind, LayerPlan, RenderError, RenderLimits,
+    descendant_bounds, regular_location, scan_layer, visit_layer_regulars,
 };
 
 #[derive(Debug)]
@@ -191,6 +191,15 @@ fn materialize_in(
     Ok(MaterializedRootfs { workspace, rootfs })
 }
 
+/// A hardlink whose target has not been written yet.
+///
+/// Carrying the target beside the entry is what lets `apply_pending_hardlinks`
+/// resolve a chain without re-matching a kind it already knows.
+struct PendingHardlink {
+    entry: LayerEntry,
+    target: FsPath,
+}
+
 struct RootfsWriter<'a> {
     root: OwnedFd,
     staging: PathBuf,
@@ -305,21 +314,30 @@ impl RootfsWriter<'_> {
             self.remove_children(&path)?;
         }
 
-        let mut pending = BTreeMap::new();
+        let mut pending: BTreeMap<FsPath, PendingHardlink> = BTreeMap::new();
         for entry in plan.entries {
-            if matches!(entry.kind, LayerEntryKind::Directory) {
-                self.ensure_directory(&entry.path)?;
-            } else if matches!(entry.kind, LayerEntryKind::Hardlink(_)) {
-                if !self.try_hardlink(&entry)? {
-                    pending.insert(entry.path.clone(), entry);
+            match &entry.kind {
+                LayerEntryKind::Directory => self.ensure_directory(&entry.path)?,
+                LayerEntryKind::Hardlink(target) => {
+                    if !self.try_hardlink(&entry, target)? {
+                        let target = target.clone();
+                        pending.insert(entry.path.clone(), PendingHardlink { entry, target });
+                    }
                 }
-            } else if let LayerEntryKind::Regular(location) = &entry.kind {
-                let source = staged
-                    .remove(&location.ordinal)
-                    .context("materialization content plan lost a regular file")?;
-                self.apply_regular(&entry, &source)?;
-            } else {
-                self.apply_entry(&entry)?;
+                LayerEntryKind::Regular(location) => {
+                    let source = staged
+                        .remove(&location.ordinal)
+                        .context("materialization content plan lost a regular file")?;
+                    self.apply_regular(&entry, location, &source)?;
+                }
+                LayerEntryKind::Symlink(target) => self.apply_symlink(&entry, target)?,
+                LayerEntryKind::Fifo => self.apply_fifo(&entry)?,
+                LayerEntryKind::Character { major, minor } => {
+                    self.apply_device(&entry, FileType::CharacterDevice, *major, *minor)?;
+                }
+                LayerEntryKind::Block { major, minor } => {
+                    self.apply_device(&entry, FileType::BlockDevice, *major, *minor)?;
+                }
             }
         }
         self.apply_pending_hardlinks(pending)?;
@@ -329,18 +347,19 @@ impl RootfsWriter<'_> {
         Ok(())
     }
 
-    fn apply_pending_hardlinks(&self, mut pending: BTreeMap<FsPath, LayerEntry>) -> Result<()> {
+    fn apply_pending_hardlinks(
+        &self,
+        mut pending: BTreeMap<FsPath, PendingHardlink>,
+    ) -> Result<()> {
         while let Some(origin) = pending.keys().next().cloned() {
             let mut current = origin;
             let mut chain = Vec::new();
             let mut visiting = BTreeSet::new();
             loop {
-                let entry = pending
+                let target = &pending
                     .get(&current)
-                    .context("materialization hardlink plan lost an entry")?;
-                let LayerEntryKind::Hardlink(target) = &entry.kind else {
-                    unreachable!()
-                };
+                    .context("materialization hardlink plan lost an entry")?
+                    .target;
                 if !visiting.insert(current.clone()) {
                     return Err(RenderError::UnresolvedHardlink {
                         path: current.display(),
@@ -356,13 +375,10 @@ impl RootfsWriter<'_> {
                 break;
             }
             for path in chain.into_iter().rev() {
-                let entry = pending
+                let PendingHardlink { entry, target } = pending
                     .remove(&path)
                     .context("materialization hardlink plan lost an entry")?;
-                if !self.try_hardlink(&entry)? {
-                    let LayerEntryKind::Hardlink(target) = &entry.kind else {
-                        unreachable!()
-                    };
+                if !self.try_hardlink(&entry, &target)? {
                     return Err(RenderError::UnresolvedHardlink {
                         path: entry.path.display(),
                         target: target.display(),
@@ -393,8 +409,8 @@ impl RootfsWriter<'_> {
         let expected = entries
             .iter()
             .filter(|entry| matches!(entry.kind, LayerEntryKind::Regular(_)))
-            .cloned()
-            .collect::<Vec<_>>();
+            .map(regular_location)
+            .collect::<Result<Vec<_>>>()?;
         let mut staged = BTreeMap::new();
         visit_layer_regulars(
             self.layout,
@@ -402,10 +418,7 @@ impl RootfsWriter<'_> {
             &expected,
             self.limits,
             layer_bytes,
-            |entry, source| {
-                let LayerEntryKind::Regular(location) = &entry.kind else {
-                    unreachable!()
-                };
+            |location, source| {
                 let mut file = NamedTempFile::new_in(&self.staging)?;
                 let copied = std::io::copy(source, file.as_file_mut())?;
                 if copied != location.size {
@@ -427,56 +440,56 @@ impl RootfsWriter<'_> {
         Ok(staged)
     }
 
-    fn apply_entry(&self, entry: &LayerEntry) -> Result<()> {
+    fn apply_symlink(&self, entry: &LayerEntry, target: &[u8]) -> Result<()> {
         let parent = self.open_parent(&entry.path, true)?;
         let name = os(entry.path.basename());
         self.remove_at_if_present(&parent, name)?;
-        match &entry.kind {
-            LayerEntryKind::Symlink(target) => {
-                symlinkat(os(target), &parent, name)?;
-                self.apply_metadata_path(&parent, name, &entry.metadata)?;
-            }
-            LayerEntryKind::Fifo => {
-                mkfifoat(&parent, name, Mode::RUSR | Mode::WUSR)?;
-                self.apply_metadata_path(&parent, name, &entry.metadata)?;
-            }
-            LayerEntryKind::Character { major, minor } => {
-                if self.ownership.is_single_id() {
-                    bail!("rootless native execution does not support character devices in Images");
-                }
-                mknodat(
-                    &parent,
-                    name,
-                    FileType::CharacterDevice,
-                    Mode::RUSR | Mode::WUSR,
-                    makedev(*major, *minor),
-                )?;
-                self.apply_metadata_path(&parent, name, &entry.metadata)?;
-            }
-            LayerEntryKind::Block { major, minor } => {
-                if self.ownership.is_single_id() {
-                    bail!("rootless native execution does not support block devices in Images");
-                }
-                mknodat(
-                    &parent,
-                    name,
-                    FileType::BlockDevice,
-                    Mode::RUSR | Mode::WUSR,
-                    makedev(*major, *minor),
-                )?;
-                self.apply_metadata_path(&parent, name, &entry.metadata)?;
-            }
-            LayerEntryKind::Regular(_)
-            | LayerEntryKind::Directory
-            | LayerEntryKind::Hardlink(_) => unreachable!(),
-        }
-        Ok(())
+        symlinkat(os(target), &parent, name)?;
+        self.apply_metadata_path(&parent, name, &entry.metadata)
     }
 
-    fn apply_regular(&self, entry: &LayerEntry, source: &Path) -> Result<()> {
-        let LayerEntryKind::Regular(location) = &entry.kind else {
-            unreachable!()
-        };
+    fn apply_fifo(&self, entry: &LayerEntry) -> Result<()> {
+        let parent = self.open_parent(&entry.path, true)?;
+        let name = os(entry.path.basename());
+        self.remove_at_if_present(&parent, name)?;
+        mkfifoat(&parent, name, Mode::RUSR | Mode::WUSR)?;
+        self.apply_metadata_path(&parent, name, &entry.metadata)
+    }
+
+    fn apply_device(
+        &self,
+        entry: &LayerEntry,
+        file_type: FileType,
+        major: u32,
+        minor: u32,
+    ) -> Result<()> {
+        if self.ownership.is_single_id() {
+            let noun = if file_type == FileType::BlockDevice {
+                "block"
+            } else {
+                "character"
+            };
+            bail!("rootless native execution does not support {noun} devices in Images");
+        }
+        let parent = self.open_parent(&entry.path, true)?;
+        let name = os(entry.path.basename());
+        self.remove_at_if_present(&parent, name)?;
+        mknodat(
+            &parent,
+            name,
+            file_type,
+            Mode::RUSR | Mode::WUSR,
+            makedev(major, minor),
+        )?;
+        self.apply_metadata_path(&parent, name, &entry.metadata)
+    }
+
+    fn apply_regular(
+        &self,
+        entry: &LayerEntry,
+        location: &EntryLocation,
+        source: &Path,
+    ) -> Result<()> {
         let parent = self.open_parent(&entry.path, true)?;
         let name = os(entry.path.basename());
         self.remove_at_if_present(&parent, name)?;
@@ -499,10 +512,7 @@ impl RootfsWriter<'_> {
         self.apply_metadata_fd(&destination, &entry.metadata)
     }
 
-    fn try_hardlink(&self, entry: &LayerEntry) -> Result<bool> {
-        let LayerEntryKind::Hardlink(target) = &entry.kind else {
-            unreachable!()
-        };
+    fn try_hardlink(&self, entry: &LayerEntry, target: &FsPath) -> Result<bool> {
         let Some(target_parent) = self.open_parent_existing(target)? else {
             return Ok(false);
         };

@@ -166,6 +166,21 @@ pub(crate) enum LayerEntryKind {
     Fifo,
 }
 
+/// Where a planned entry's content sits in its Layer.
+///
+/// The content pass reads bytes, so it only ever visits regular files. Planning
+/// in terms of the location rather than the entry is what states that in the
+/// type and keeps the pass free of arms it can never reach.
+pub(crate) fn regular_location(entry: &LayerEntry) -> Result<&EntryLocation> {
+    let LayerEntryKind::Regular(location) = &entry.kind else {
+        bail!(
+            "OCI Layer content plan contains a non-regular entry: {}",
+            display_path(&entry.path)
+        );
+    };
+    Ok(location)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LayerEntry {
     pub(crate) path: ImagePath,
@@ -736,16 +751,17 @@ impl ImageRenderer {
             let Some(expected) = regulars.remove(&descriptor.digest) else {
                 continue;
             };
+            let expected = expected
+                .iter()
+                .map(regular_location)
+                .collect::<Result<Vec<_>>>()?;
             visit_layer_regulars(
                 &self.layout,
                 descriptor,
                 &expected,
                 self.limits,
                 self.limits.total_uncompressed_bytes,
-                |entry, reader| {
-                    let LayerEntryKind::Regular(location) = &entry.kind else {
-                        unreachable!("regular export plan contains only regular entries")
-                    };
+                |location, reader| {
                     let (digest, size) = contents.put_reader(reader)?;
                     if location.content_digest.as_ref() != Some(&digest) || location.size != size {
                         bail!(
@@ -1340,10 +1356,10 @@ fn copy_regular(
 pub(crate) fn visit_layer_regulars(
     layout: &OciLayout,
     descriptor: &OciDescriptor,
-    expected: &[LayerEntry],
+    expected: &[&EntryLocation],
     limits: RenderLimits,
     max_uncompressed: u64,
-    mut visitor: impl FnMut(&LayerEntry, &mut dyn Read) -> Result<()>,
+    mut visitor: impl FnMut(&EntryLocation, &mut dyn Read) -> Result<()>,
 ) -> Result<()> {
     #[cfg(test)]
     MATERIALIZATION_CONTENT_PASSES.set(
@@ -1364,9 +1380,7 @@ pub(crate) fn visit_layer_regulars(
             let Some(next) = expected.peek() else {
                 continue;
             };
-            let LayerEntryKind::Regular(location) = &next.kind else {
-                bail!("materialization content plan contains a non-regular entry")
-            };
+            let location = *next;
             if location.descriptor != *descriptor {
                 bail!("materialization content plan refers to a different OCI Layer")
             }
@@ -1396,12 +1410,9 @@ pub(crate) fn visit_layer_regulars(
         }
     }
     if let Some(entry) = expected.next() {
-        let LayerEntryKind::Regular(location) = &entry.kind else {
-            unreachable!()
-        };
         bail!(
             "OCI Layer no longer contains image file {}",
-            display_path(&location.path)
+            display_path(&entry.path)
         );
     }
     let mut bounded = archive.into_inner();
