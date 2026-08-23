@@ -65,6 +65,10 @@ impl RunScope {
         None
     }
 
+    fn abort_pre_acceptance(self, error: anyhow::Error) -> anyhow::Error {
+        error
+    }
+
     fn mark_accepted(&mut self, _state: &mut RunState) -> bool {
         true
     }
@@ -356,15 +360,27 @@ impl<'a> Runner<'a> {
         let (backend, mut prepared) = self.prepare_backend(&initial, runtime, &controls)?;
         let run_id = RunId::new();
         let mut scope = RunScope::open(self, run_id, &backend, &mut prepared)?;
-        let directory = create_run_directory(run_id, scope.workspace().as_deref())?;
-        let (accepted_at, runtime_slot) = self.accept_single_run(
+        let directory = match create_run_directory(run_id, scope.workspace().as_deref()) {
+            Ok(directory) => directory,
+            Err(error) => return Err(scope.abort_pre_acceptance(error)),
+        };
+        let accepted = self.accept_single_run(
             run_id,
             &initial.manifest,
             requested_image_reference,
             runtime_bytes,
             &controls,
             stdin,
-        )?;
+        );
+        let (accepted_at, runtime_slot) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // The working directory lives inside the attempt, so it has to
+                // go before the attempt directory is removed under it.
+                drop(directory);
+                return Err(scope.abort_pre_acceptance(error));
+            }
+        };
 
         let mut state = RunState::new(backend);
         let accepted = scope.mark_accepted(&mut state);
@@ -520,7 +536,7 @@ impl<'a> Runner<'a> {
     ) -> ProcessSlot {
         for message in &attached.operation_errors {
             state.operation_errors.push(OperationError {
-                scope: OperationErrorScope::Primary,
+                scope: state.scope,
                 phase: "process_attach".to_owned(),
                 message: message.clone(),
             });
@@ -550,7 +566,7 @@ impl<'a> Runner<'a> {
                     && client_status.code() != Some(container_state.exit_code)
                 {
                     state.operation_errors.push(OperationError {
-                        scope: OperationErrorScope::Primary,
+                        scope: state.scope,
                         phase: "process_wait".to_owned(),
                         message: format!(
                             "Docker client status {} differs from container exit code {}",
@@ -627,7 +643,7 @@ fn record_final_capture(state: &mut ParticipantState, result: Result<CaptureResu
             };
             if let Some(message) = capture.cleanup_error {
                 state.operation_errors.push(OperationError {
-                    scope: OperationErrorScope::Primary,
+                    scope: state.scope,
                     phase: "capture_cleanup".to_owned(),
                     message,
                 });
@@ -830,12 +846,10 @@ mod tests {
     use super::*;
     use crate::core::{Architecture, BackendDetails, ImageView, Platform};
 
-    #[test]
-    fn cleanup_failure_does_not_hide_published_final_asset() {
-        let manifest = descriptor('1', "application/vnd.oci.image.manifest.v1+json");
-        let capture = CaptureResult {
+    fn capture_with_cleanup_failure(manifest: OciDescriptor) -> CaptureResult {
+        CaptureResult {
             image: ImageView {
-                manifest: manifest.clone(),
+                manifest,
                 config: descriptor('2', "application/vnd.oci.image.config.v1+json"),
                 platform: Platform::linux(Architecture::Arm64),
                 layers: Vec::new(),
@@ -844,7 +858,13 @@ mod tests {
                 added_layers: Vec::new(),
             },
             cleanup_error: Some("injected cleanup failure".to_owned()),
-        };
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_hide_published_final_asset() {
+        let manifest = descriptor('1', "application/vnd.oci.image.manifest.v1+json");
+        let capture = capture_with_cleanup_failure(manifest.clone());
         let mut state = RunState::new(BackendFacts {
             name: "docker".to_owned(),
             version: "test".to_owned(),
@@ -861,6 +881,29 @@ mod tests {
         assert_eq!(state.primary.final_image, ImageSlot::Available { manifest });
         assert_eq!(state.primary.operation_errors.len(), 1);
         assert_eq!(state.primary.operation_errors[0].phase, "capture_cleanup");
+    }
+
+    /// Both branches of `record_final_capture` describe the participant they
+    /// were given, so a Managed Service capture cannot report a Primary error.
+    #[test]
+    fn a_capture_error_belongs_to_the_participant_it_came_from() {
+        for scope in [
+            OperationErrorScope::Primary,
+            OperationErrorScope::ManagedService,
+        ] {
+            let manifest = descriptor('1', "application/vnd.oci.image.manifest.v1+json");
+            let mut cleaned = ParticipantState::new(scope);
+            record_final_capture(&mut cleaned, Ok(capture_with_cleanup_failure(manifest)));
+            assert_eq!(cleaned.operation_errors.len(), 1);
+            assert_eq!(cleaned.operation_errors[0].phase, "capture_cleanup");
+            assert_eq!(cleaned.operation_errors[0].scope, scope);
+
+            let mut failed = ParticipantState::new(scope);
+            record_final_capture(&mut failed, Err(anyhow::anyhow!("capture failed")));
+            assert_eq!(failed.operation_errors.len(), 1);
+            assert_eq!(failed.operation_errors[0].phase, "final_image_capture");
+            assert_eq!(failed.operation_errors[0].scope, scope);
+        }
     }
 
     #[test]

@@ -1051,6 +1051,29 @@ impl RunScope {
         })
     }
 
+    /// Discard a recovery attempt whose Run was never accepted.
+    ///
+    /// The attempt is published before acceptance so a crash between the two is
+    /// observable, which means an ordinary error return would leave a durable
+    /// entry behind and block `state gc` until someone reconciles it. Removing
+    /// it here is the eager half of that contract; reconciliation stays the
+    /// backstop for the failures no error path can reach, such as SIGKILL.
+    ///
+    /// The reason the caller already has is what gets reported. A cleanup
+    /// failure is appended to it rather than replacing it, because the entry
+    /// that survives is the reconcilable one.
+    pub(super) fn abort_pre_acceptance(self, error: anyhow::Error) -> anyhow::Error {
+        let Some(attempt) = self.attempt else {
+            return error;
+        };
+        match attempt.remove() {
+            Ok(()) => error,
+            Err(cleanup) => anyhow::anyhow!(
+                "{error:#}; pre-acceptance recovery cleanup also failed: {cleanup:#}"
+            ),
+        }
+    }
+
     /// Where the Run working directory belongs. A native Run keeps it inside
     /// the recovery attempt so an interrupted Run can still find its files.
     pub(super) fn workspace(&self) -> Option<PathBuf> {
@@ -1790,6 +1813,76 @@ impl<'a> Runner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{Architecture, BackendDetails, Platform};
+
+    fn pre_acceptance_backend() -> BackendFacts {
+        BackendFacts {
+            name: "native_linux".to_owned(),
+            version: "0.2.0-dev.0".to_owned(),
+            platform: Platform::linux(Architecture::Arm64),
+            network: NetworkControl::None,
+            run_network: None,
+            details: BackendDetails::NativeLinux {
+                runtime_name: "runc".to_owned(),
+                runtime_version: "1.5.1".to_owned(),
+                runtime_commit: "fixture".to_owned(),
+                runtime_spec: "1.3.0".to_owned(),
+                runtime_digest: crate::integrity::digest_bytes(b"runc fixture"),
+                runtime_size: 12,
+                kernel_release: "fixture".to_owned(),
+                runtime_invocation: crate::core::NativeRuntimeInvocation::Direct,
+                runtime_config: crate::core::NativeRuntimeConfigRealization::Accepted,
+                filesystem: crate::core::NativeFilesystemRealization::OverlayFs {
+                    profile: "index=on".to_owned(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn a_run_that_is_never_accepted_leaves_no_recovery_attempt() {
+        let state = tempfile::tempdir().expect("state");
+        let store = NativeRecoveryStore::open(state.path()).expect("store");
+        let run_id = RunId::new();
+        let attempt = store
+            .prepare(run_id, pre_acceptance_backend())
+            .expect("attempt");
+        assert_eq!(
+            store.list_attempt_ids(None, 4).expect("published").ids,
+            vec![run_id],
+            "the attempt must be durable before acceptance"
+        );
+
+        let scope = RunScope {
+            cancellation: None,
+            attempt: Some(attempt),
+            network: None,
+            binding: None,
+        };
+        let reported = scope.abort_pre_acceptance(anyhow::anyhow!("acceptance failed"));
+
+        assert_eq!(format!("{reported:#}"), "acceptance failed");
+        assert!(
+            store
+                .list_attempt_ids(None, 4)
+                .expect("after abort")
+                .ids
+                .is_empty(),
+            "a Run that was never accepted must not keep blocking state GC"
+        );
+    }
+
+    #[test]
+    fn aborting_without_a_recovery_attempt_reports_the_original_error() {
+        let scope = RunScope {
+            cancellation: None,
+            attempt: None,
+            network: None,
+            binding: None,
+        };
+        let reported = scope.abort_pre_acceptance(anyhow::anyhow!("acceptance failed"));
+        assert_eq!(format!("{reported:#}"), "acceptance failed");
+    }
 
     #[test]
     fn managed_service_loss_requires_a_confirmed_lifecycle_stop() {
