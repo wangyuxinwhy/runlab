@@ -1,4 +1,36 @@
-use super::*;
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::{env, thread};
+
+use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
+use tempfile::NamedTempFile;
+use uuid::Uuid;
+
+use crate::integrity::finish_sha256;
+use crate::signal::TerminationFlag;
+use crate::subprocess::{bounded_output, bounded_status_with_stdout};
+
+use super::protocol::{
+    ensure_status, file_identity, guest_binary_path, normalize_architecture, operation_file,
+    parse_runc_identity, pinned_lima_template, selected_instance_image, validate_forwarded_argv,
+    validate_handshake, validate_name, validate_reference_profile, validate_runc_identity,
+};
+use super::staging::validate_runtime_config_inputs;
+use super::{
+    AttachedOperation, CONNTRACK_PACKAGE_VERSION, DEFAULT_INSTANCE, FileIdentity,
+    GUEST_BINARY_ROOT, LIMA_VERSION, LimaInstance, MAX_CONTROL_OUTPUT, MAX_GUEST_STREAM,
+    MODULES_CONFIG, MODULES_CONFIG_PATH, SYSCTL_CONFIG, SYSCTL_CONFIG_PATH, VM_CONTROL_TIMEOUT,
+    VM_MUTATION_TIMEOUT, VM_TRANSFER_TIMEOUT, VmCancelResult, VmDiscardResult, VmExecutableFact,
+    VmHandshake, VmInstallResult, VmKernelFacts, VmKernelFeatureFacts, VmOperationResult,
+    VmOperationStatus, VmReferenceProfile, VmReferenceTools, VmRuncIdentity, VmStatus,
+};
 
 struct StagedOutput {
     temporary: NamedTempFile,
@@ -1045,6 +1077,9 @@ fn publish_staged_outputs(staged: Vec<StagedOutput>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use super::super::VmImage;
     use super::*;
 
     fn staged(directory: &Path, destination: &str, bytes: &[u8]) -> StagedOutput {

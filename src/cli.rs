@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,35 +9,23 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::catalog::{
-    CatalogDescriptionUpdate, CatalogEntry, ImageSelector, LocalImageCatalog, normalize_reference,
-};
+use crate::catalog::{CatalogEntry, ImageSelector};
 use crate::core::{
-    AcceptedRunRecord, Architecture, Digest, ImageView, MAX_CAPTURED_STREAM_BYTES, NetworkControl,
-    OciDescriptor, Platform, RunControls, RunId, ServiceName, StoredBytes, TcpReadinessCondition,
-    TerminalRunRecord,
+    Architecture, Digest, ImageView, MAX_CAPTURED_STREAM_BYTES, NetworkControl, OciDescriptor,
+    Platform, RunId, ServiceName, TcpReadinessCondition,
 };
-use crate::docker::{DockerBackend, DockerImageAdapter};
-#[cfg(target_os = "linux")]
-use crate::execution::{ManagedPrimaryInput, ManagedServiceInput};
-use crate::execution::{RunStartResult, Runner};
+use crate::docker::DockerBackend;
 use crate::image::{ImageService, ImageStructureDiff};
 use crate::image_ingress::{
     ImageImportResult as IngressImportResult, ImagePullResult as IngressPullResult,
 };
 use crate::ingress::ImportSourceKind;
-use crate::integrity::{
-    digest_bytes, ensure_private_directory, read_bounded_file, write_new_output,
-};
-use crate::maintenance::{
-    RunVerifyResult, StateGcApplyResult, StateGcPlan, StateGcPlanResult, StateVerifyResult,
-};
+use crate::integrity::ensure_private_directory;
 use crate::managed_vm::HostVm;
 use crate::oci::OciLayout;
-use crate::reconciliation::{RunReconcileBatchResult, RunReconcileResult};
 use crate::render::FilesystemChange;
 use crate::runtime::RuntimeConfig;
-use crate::state::{StateMaintenance, StateOperation};
+use crate::state::StateOperation;
 use crate::storage::{RunBytesField, RunDatabase};
 use crate::topology::ManagedServiceFile;
 
@@ -51,7 +38,7 @@ mod inputs;
 mod run;
 mod schema;
 
-use image::{resolve_image, run_docker, run_image};
+use image::{run_docker, run_image};
 use inputs::{check_runtime_config, run_managed_service, run_runtime_config};
 use run::{run_run, run_state};
 use schema::run_schema;

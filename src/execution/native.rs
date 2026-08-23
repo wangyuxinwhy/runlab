@@ -21,12 +21,10 @@ use chrono::{DateTime, Utc};
 
 use crate::bundle::OciBundle;
 use crate::core::{
-    ACCEPTED_RUN_RECORD_SCHEMA_VERSION, AcceptedLifecycle, AcceptedRunRecord, BackendFacts, Digest,
-    ImageView, ManagedServiceCondition, ManagedServiceFacts, ManagedServiceReadiness,
+    BackendFacts, Digest, ImageView, ManagedServiceCondition, ManagedServiceReadiness,
     NetworkControl, OciDescriptor, OperationError, OperationErrorScope, ProcessFacts,
     ProcessOutcome, ProcessSlot, RunControls, RunId, ServiceName, StoredBytes,
-    TERMINAL_RUN_RECORD_SCHEMA_VERSION, TcpReadinessCondition, TerminalLifecycle,
-    TerminalRunRecord,
+    TcpReadinessCondition,
 };
 use crate::filesystem::{Inventory, TreeCapture};
 use crate::image::ImageService;
@@ -44,8 +42,8 @@ use crate::native::network::{
 };
 use crate::native::read_only_file::{DestinationFileGuard, VerifiedSourceFile};
 use crate::native::recovery::{
-    ManagedTerminalCheckpoint, NativeAttempt, NativeParticipant, NativeRecoveryPhase,
-    NativeRecoveryStore, SharedNetworkCheckpoint, TerminalCheckpoint,
+    NativeAttempt, NativeParticipant, NativeRecoveryPhase, NativeRecoveryStore,
+    SharedNetworkCheckpoint, TerminalCheckpoint,
 };
 use crate::native::resolver::{
     ResolverConfig, ResolverProjection, ResolverProjectionPlan, ResolverSourceFile,

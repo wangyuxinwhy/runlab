@@ -1,4 +1,27 @@
-use super::*;
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use anyhow::{Context, Result, ensure};
+use uuid::Uuid;
+
+use crate::subprocess::bounded_output;
+
+use super::protocol::{
+    ensure_guest_linux, ensure_regular_file, ensure_status, guest_binary_path, guest_state_path,
+    load_guest_operation, normalize_architecture, operation_file, operation_path,
+    parse_systemd_status, privileged_file_identity, privileged_file_to_stdout, rewrite_file_tokens,
+    set_private_permissions, unit_name, validate_file_slot, validate_forwarded_argv, validate_name,
+    write_new_json,
+};
+use super::staging::{
+    seal_runtime_config_inputs, sealed_operation_path, validate_runtime_config_inputs,
+};
+use super::{
+    FileIdentity, GUEST_OPERATION_ROOT, GuestOperation, MAX_CONTROL_OUTPUT, PROTOCOL_VERSION,
+    VM_CONTROL_TIMEOUT, VmCancelResult, VmDiscardResult, VmHandshake, VmOperationStatus,
+};
 
 pub fn guest_handshake() -> VmHandshake {
     VmHandshake {

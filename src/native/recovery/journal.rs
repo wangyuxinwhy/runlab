@@ -1,14 +1,27 @@
-use super::{
-    BackendDetails, BackendFacts, Context, DateTime, File, ImageSlot, JOURNAL_SCHEMA_VERSION,
-    MAX_JOURNAL_BYTES, NamedTempFile, NativeFilesystemRealization, NativeParticipant,
-    NativeRecoveryJournal, NativeRecoveryPhase, NativeRuntimeConfigRealization,
-    NativeRuntimeInvocation, NativeSharedNetworkJournal, NativeSharedNetworkPhase, NetworkControl,
-    OperationError, OperationErrorScope, Path, ProcessSlot, Read, Result, RunId, RunNetworkFacts,
-    RunNetworkMode, RunNetworkPlan, RunNetworkRealization, StoredBytes, Utc, Write, bail,
-    canonical_json, create_private_file, digest_bytes, fs, open_private_file, set_private_file,
-    sync_directory, validate_regular_file,
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
+use tempfile::NamedTempFile;
+
+use crate::core::{
+    BackendDetails, BackendFacts, ImageSlot, NativeFilesystemRealization,
+    NativeRuntimeConfigRealization, NativeRuntimeInvocation, NetworkControl, OperationError,
+    OperationErrorScope, ProcessSlot, RunId, RunNetworkFacts, RunNetworkRealization, StoredBytes,
 };
-use super::{NativeResolverProjectionJournal, ResolverSourceCheckpoint};
+use crate::integrity::{canonical_json, digest_bytes, set_private_file, sync_directory};
+use crate::native::network::{RunNetworkMode, RunNetworkPlan};
+
+use super::layout::{create_private_file, open_private_file, validate_regular_file};
+use super::{
+    JOURNAL_SCHEMA_VERSION, MAX_JOURNAL_BYTES, NativeParticipant, NativeRecoveryJournal,
+    NativeRecoveryPhase, NativeSharedNetworkJournal, NativeSharedNetworkPhase,
+};
+use crate::native::resolver::ResolverSourceCheckpoint;
+
+use super::NativeResolverProjectionJournal;
 
 pub(super) fn ensure_resolver_projection_removable(
     projection: &NativeResolverProjectionJournal,

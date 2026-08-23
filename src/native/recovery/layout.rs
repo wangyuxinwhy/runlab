@@ -1,9 +1,18 @@
+use std::fs;
+
 use crate::integrity::{set_private_file, sync_directory};
 
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+
+use crate::core::RunId;
+use crate::integrity::ensure_private_directory;
+
+use super::journal::{parse_recovery_entry_name, validate_journal};
 use super::{
-    Context, File, MAX_JOURNAL_BYTES, NativeRecoveryJournal, NativeRecoveryPhase,
-    NativeSharedNetworkPhase, OpenOptions, Path, Result, RunId, TryLockError, bail,
-    ensure_private_directory, fs, parse_recovery_entry_name, validate_journal,
+    MAX_JOURNAL_BYTES, NativeRecoveryJournal, NativeRecoveryPhase, NativeSharedNetworkPhase,
 };
 
 pub(super) fn try_lock(file: &File, run_id: RunId) -> Result<()> {

@@ -1,13 +1,24 @@
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+
+use crate::catalog::{
+    CatalogDescriptionUpdate, ImageSelector, LocalImageCatalog, normalize_reference,
+};
+use crate::core::{Architecture, ImageView, Platform};
+use crate::docker::DockerImageAdapter;
+use crate::image::ImageService;
+use crate::integrity::ensure_private_directory;
+use crate::oci::OciLayout;
+use crate::state::StateOperation;
+
 use super::{
-    Architecture, CatalogDescriptionUpdate, CheckoutCommand, Context, DockerCommand,
-    DockerImageAdapter, DockerImageCheckoutCreateResult, DockerImageCommand,
+    CheckoutCommand, DockerCommand, DockerImageCheckoutCreateResult, DockerImageCommand,
     DockerImageMaterializeResult, ImageCatalogCommand, ImageCatalogListResult,
     ImageCatalogRemoveResult, ImageCatalogSetResult, ImageCatalogShowResult, ImageCommand,
     ImageDiffResult, ImageExportFormat, ImageExportResult, ImageFileCommand, ImageFileGetResult,
     ImageFilesystemDiffResult, ImageImportResult, ImageInspectResult, ImageOperationResult,
-    ImagePullResult, ImageSelector, ImageService, ImageView, LocalImageCatalog, OciLayout, Path,
-    Platform, ResolvedImageResult, Result, StateOperation, absolute_path, bail, emit,
-    ensure_private_directory, image_service, local_docker, normalize_reference,
+    ImagePullResult, ResolvedImageResult, absolute_path, emit, image_service, local_docker,
 };
 
 pub(super) fn run_image(state: &Path, command: ImageCommand) -> Result<u8> {

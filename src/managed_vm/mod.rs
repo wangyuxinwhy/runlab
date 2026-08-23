@@ -1,3 +1,14 @@
+//! Run Linux `RunLab` inside a managed Lima VM, with no host state mounted.
+//!
+//! The module is split by role rather than by mechanism:
+//!
+//! - `protocol` owns the shapes and validators both sides agree on: the
+//!   handshake, file slots, forwarded argv, and the guest control commands.
+//! - `host` drives `limactl` from macOS and stages files into the guest.
+//! - `guest` is the code that runs *inside* the VM, reached through the hidden
+//!   `__internal-vm-*` commands that `protocol` defines.
+//! - `staging` seals OCI Runtime config inputs into the guest before a Run.
+
 mod guest;
 mod host;
 mod protocol;
@@ -10,42 +21,13 @@ pub use guest::{
 };
 pub use host::HostVm;
 
-use protocol::{
-    ensure_guest_linux, ensure_regular_file, ensure_status, file_identity, guest_binary_path,
-    guest_state_path, load_guest_operation, normalize_architecture, operation_file, operation_path,
-    parse_runc_identity, parse_slot, parse_systemd_status, pinned_lima_template,
-    privileged_file_identity, privileged_file_to_stdout, rewrite_file_tokens,
-    selected_instance_image, set_private_permissions, unit_name, validate_file_slot,
-    validate_forwarded_argv, validate_handshake, validate_name, validate_reference_profile,
-    validate_runc_identity, write_new_json,
-};
-use staging::{
-    derived_input_path, seal_runtime_config_inputs, sealed_operation_path,
-    validate_runtime_config_inputs,
-};
-
-use std::collections::BTreeSet;
-use std::env;
-use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
-use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 use crate::core::Digest;
-use crate::integrity::{canonical_json, finish_sha256, write_new_private};
-use crate::signal::TerminationFlag;
-use crate::subprocess::{bounded_output, bounded_status_with_stdout};
 
 const PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_INSTANCE: &str = "runlab";
@@ -266,6 +248,13 @@ struct GuestOperation {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use super::protocol::{
+        operation_file, parse_runc_identity, parse_systemd_status, pinned_lima_template,
+        rewrite_file_tokens, selected_instance_image, validate_forwarded_argv, validate_name,
+        validate_reference_profile, validate_runc_identity,
+    };
     use super::*;
 
     #[test]

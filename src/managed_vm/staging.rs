@@ -1,4 +1,12 @@
-use super::*;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, ensure};
+use uuid::Uuid;
+
+use super::protocol::{ensure_guest_linux, load_guest_operation, operation_file, parse_slot};
+use super::{FileIdentity, GUEST_SEALED_INPUT_ROOT, GuestOperation};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};

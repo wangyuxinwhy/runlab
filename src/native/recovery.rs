@@ -1,23 +1,18 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{Read, Write};
+use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 
 use crate::core::{
-    BackendDetails, BackendFacts, ImageSlot, ManagedServiceReadiness, NativeFilesystemRealization,
-    NativeRuntimeConfigRealization, NativeRuntimeInvocation, NetworkControl, OperationError,
-    OperationErrorScope, ProcessSlot, RunId, RunNetworkFacts, RunNetworkRealization, StoredBytes,
+    BackendFacts, ImageSlot, ManagedServiceReadiness, NetworkControl, OperationError, ProcessSlot,
+    RunId, RunNetworkFacts, StoredBytes,
 };
-use crate::integrity::{
-    canonical_json, digest_bytes, ensure_private_directory, set_private_file, sync_directory,
-};
+use crate::integrity::sync_directory;
+use crate::native::network::RunNetworkPlan;
 use crate::native::network::{EgressNetworkTools, HostNetworkLock, acquire_host_network_lock};
-use crate::native::network::{RunNetworkMode, RunNetworkPlan};
 use crate::native::resolver::{
     ResolverConfig, ResolverProjectionMounted, ResolverProjectionPending, ResolverSourceCheckpoint,
     ResolverSourceFile,
@@ -33,9 +28,9 @@ mod layout;
 use journal::ensure_resolver_projection_removable;
 use journal::{
     managed_runtime_id, parse_recovery_entry_name, publish_staging, read_journal, runtime_id,
-    validate_backend, validate_journal, validate_network_facts_for_plan,
-    validate_network_plan_mode, validate_participant_errors, validate_sidecar_input,
-    verify_sidecar, write_initial_journal, write_journal, write_sidecar,
+    validate_backend, validate_network_facts_for_plan, validate_network_plan_mode,
+    validate_participant_errors, validate_sidecar_input, verify_sidecar, write_initial_journal,
+    write_journal, write_sidecar,
 };
 use layout::{
     cleanup_staging_directory, create_private_directory_entry, create_private_file,
@@ -1860,10 +1855,13 @@ impl NativeAttempt {
 mod tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
+    use std::io::Write as _;
+
     use super::*;
     use crate::core::{
-        Architecture, Digest, NetworkControl, OciDescriptor, Platform, ProcessFacts,
-        ProcessOutcome, RunResolverFacts, RunResolverSource,
+        Architecture, BackendDetails, Digest, NetworkControl, OciDescriptor, OperationErrorScope,
+        Platform, ProcessFacts, ProcessOutcome, RunNetworkRealization, RunResolverFacts,
+        RunResolverSource,
     };
     use crate::integrity::digest_bytes;
 

@@ -1,4 +1,27 @@
-use super::*;
+use std::collections::BTreeSet;
+use std::env;
+use std::fs::{self, File};
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+
+use anyhow::{Context, Result, bail, ensure};
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
+
+use crate::core::Digest;
+use crate::integrity::{canonical_json, finish_sha256, write_new_private};
+use crate::subprocess::{bounded_output, bounded_status_with_stdout};
+
+use super::staging::{derived_input_path, validate_runtime_config_inputs};
+use super::{
+    CONNTRACK_PACKAGE_VERSION, FileIdentity, GUEST_BINARY_ROOT, GUEST_OPERATION_ROOT,
+    GUEST_STATE_ROOT, GuestOperation, LIMA_VERSION, LimaInstance, MAX_CONTROL_OUTPUT,
+    MAX_FILE_SLOTS, MAX_FORWARDED_ARGUMENT_BYTES, MAX_FORWARDED_ARGUMENTS, PROTOCOL_VERSION,
+    RUNC_COMMIT, RUNC_SPEC, RUNC_VERSION, VM_CONTROL_TIMEOUT, VM_TRANSFER_TIMEOUT, VmHandshake,
+    VmImage, VmOperationStatus, VmReferenceProfile, VmReferenceTools, VmRuncIdentity,
+};
 
 pub(super) fn validate_handshake(handshake: &VmHandshake) -> Result<()> {
     ensure!(
