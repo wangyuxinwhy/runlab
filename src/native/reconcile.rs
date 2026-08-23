@@ -24,7 +24,8 @@ use crate::native::recovery::{
 };
 use crate::native::resolver::recover_cleanup;
 use crate::reconciliation::{
-    RunReconcileBatchItem, RunReconcileBatchOutcome, RunReconcileBatchResult, RunReconcileResult,
+    RunReconcileAction, RunReconcileBatchItem, RunReconcileBatchOutcome, RunReconcileBatchResult,
+    RunReconcileResult, RunReconcileStatus,
 };
 use crate::storage::RunDatabase;
 
@@ -138,14 +139,17 @@ fn reconcile_staging(
         bail!("native recovery staging identity does not match the requested Run");
     }
     if dry_run {
-        return Ok(planned(run_id, vec!["staging_attempt_remove"]));
+        return Ok(planned(
+            run_id,
+            vec![RunReconcileAction::StagingAttemptRemove],
+        ));
     }
     staging.remove()?;
     Ok(completed(
         run_id,
-        "discarded_prepublication",
+        RunReconcileStatus::DiscardedPrepublication,
         false,
-        vec!["staging_attempt_removed"],
+        vec![RunReconcileAction::StagingAttemptRemoved],
     ))
 }
 
@@ -158,15 +162,15 @@ fn reconcile_pre_acceptance(
         bail!("native recovery attempt has no accepted Run Record: {run_id}");
     }
     if dry_run {
-        return Ok(planned(run_id, vec!["attempt_remove"]));
+        return Ok(planned(run_id, vec![RunReconcileAction::AttemptRemove]));
     }
     cleanup_resources(&mut attempt, &mut Vec::new())?;
     attempt.remove()?;
     Ok(completed(
         run_id,
-        "discarded_pre_acceptance",
+        RunReconcileStatus::DiscardedPreAcceptance,
         false,
-        vec!["attempt_removed"],
+        vec![RunReconcileAction::AttemptRemoved],
     ))
 }
 
@@ -176,15 +180,15 @@ fn reconcile_terminal_attempt(
     dry_run: bool,
 ) -> Result<RunReconcileResult> {
     if dry_run {
-        return Ok(planned(run_id, vec!["resource_cleanup"]));
+        return Ok(planned(run_id, vec![RunReconcileAction::ResourceCleanup]));
     }
     let mut actions = Vec::new();
     cleanup_resources(&mut attempt, &mut actions)?;
     attempt.remove()?;
-    actions.push("attempt_removed");
+    actions.push(RunReconcileAction::AttemptRemoved);
     Ok(completed(
         run_id,
-        "cleaned_terminal_attempt",
+        RunReconcileStatus::CleanedTerminalAttempt,
         false,
         actions,
     ))
@@ -251,7 +255,7 @@ fn reconcile_accepted_primary(
 
     let rootfs = attempt.bundle_directory().join("rootfs");
     if reconcile_participant_filesystem(&attempt, NativeParticipant::Primary, &rootfs)? {
-        actions.push("overlay_unmounted");
+        actions.push(RunReconcileAction::OverlayUnmounted);
     }
     let terminal_at = attempt.journal().terminal_at().unwrap_or_else(Utc::now);
     if !terminal_prepared {
@@ -291,19 +295,24 @@ fn reconcile_accepted_primary(
         recovered.stdout_bytes.as_deref(),
         recovered.stderr_bytes.as_deref(),
     )?;
-    actions.push("run_terminalized");
+    actions.push(RunReconcileAction::RunTerminalized);
     if network_cleanup_complete {
         match attempt.remove_after_terminal() {
             Ok(()) => {
-                actions.push("attempt_removed");
-                Ok(completed(run_id, "reconciled", true, actions))
+                actions.push(RunReconcileAction::AttemptRemoved);
+                Ok(completed(
+                    run_id,
+                    RunReconcileStatus::Reconciled,
+                    true,
+                    actions,
+                ))
             }
             Err(error) => Ok(cleanup_pending(run_id, actions, &error)),
         }
     } else {
         Ok(completed_with_resources(
             run_id,
-            "terminalized_cleanup_pending",
+            RunReconcileStatus::TerminalizedCleanupPending,
             true,
             actions,
             false,
@@ -312,11 +321,14 @@ fn reconcile_accepted_primary(
 }
 
 fn primary_reconcile_plan(run_id: RunId, has_resolver: bool) -> RunReconcileResult {
-    let mut actions = vec!["runtime_cleanup"];
+    let mut actions = vec![RunReconcileAction::RuntimeCleanup];
     if has_resolver {
-        actions.push("resolver_projection_cleanup");
+        actions.push(RunReconcileAction::ResolverProjectionCleanup);
     }
-    actions.extend(["overlay_unmount", "run_terminalize"]);
+    actions.extend([
+        RunReconcileAction::OverlayUnmount,
+        RunReconcileAction::RunTerminalize,
+    ]);
     planned(run_id, actions)
 }
 
@@ -466,18 +478,21 @@ fn prepare_recovered_managed_checkpoints(
 }
 
 fn managed_reconcile_plan(run_id: RunId, has_resolver: bool) -> RunReconcileResult {
-    let mut actions = vec!["managed_runtime_cleanup", "primary_runtime_cleanup"];
+    let mut actions = vec![
+        RunReconcileAction::ManagedRuntimeCleanup,
+        RunReconcileAction::PrimaryRuntimeCleanup,
+    ];
     if has_resolver {
         actions.extend([
-            "managed_resolver_projection_cleanup",
-            "resolver_projection_cleanup",
+            RunReconcileAction::ManagedResolverProjectionCleanup,
+            RunReconcileAction::ResolverProjectionCleanup,
         ]);
     }
     actions.extend([
-        "managed_overlay_unmount",
-        "primary_overlay_unmount",
-        "shared_network_cleanup",
-        "run_terminalize",
+        RunReconcileAction::ManagedOverlayUnmount,
+        RunReconcileAction::PrimaryOverlayUnmount,
+        RunReconcileAction::SharedNetworkCleanup,
+        RunReconcileAction::RunTerminalize,
     ]);
     planned(run_id, actions)
 }
@@ -485,13 +500,13 @@ fn managed_reconcile_plan(run_id: RunId, has_resolver: bool) -> RunReconcileResu
 fn cleanup_network_for_terminal(
     attempt: &mut NativeAttempt,
     operation_errors: &mut Vec<OperationError>,
-    actions: &mut Vec<&'static str>,
+    actions: &mut Vec<RunReconcileAction>,
 ) -> bool {
     match cleanup_shared_network(attempt, actions) {
         Ok(()) => true,
         Err(error) => {
             operation_errors.push(run_network_cleanup_error(&error));
-            actions.push("run_network_cleanup_deferred");
+            actions.push(RunReconcileAction::RunNetworkCleanupDeferred);
             false
         }
     }
@@ -510,7 +525,7 @@ fn terminalize_recovered_managed(
     accepted: &crate::core::AcceptedRunRecord,
     attempt: NativeAttempt,
     recovered: ManagedRecovery,
-    mut actions: Vec<&'static str>,
+    mut actions: Vec<RunReconcileAction>,
 ) -> Result<RunReconcileResult> {
     let condition = accepted
         .managed_service
@@ -554,19 +569,24 @@ fn terminalize_recovered_managed(
         recovered.service.stdout_bytes.as_deref(),
         recovered.service.stderr_bytes.as_deref(),
     )?;
-    actions.push("run_terminalized");
+    actions.push(RunReconcileAction::RunTerminalized);
     if recovered.network_cleanup_complete {
         match attempt.remove_after_terminal() {
             Ok(()) => {
-                actions.push("attempt_removed");
-                Ok(completed(accepted.run_id, "reconciled", true, actions))
+                actions.push(RunReconcileAction::AttemptRemoved);
+                Ok(completed(
+                    accepted.run_id,
+                    RunReconcileStatus::Reconciled,
+                    true,
+                    actions,
+                ))
             }
             Err(error) => Ok(cleanup_pending(accepted.run_id, actions, &error)),
         }
     } else {
         Ok(completed_with_resources(
             accepted.run_id,
-            "terminalized_cleanup_pending",
+            RunReconcileStatus::TerminalizedCleanupPending,
             true,
             actions,
             false,
@@ -613,14 +633,19 @@ fn push_unique_error(errors: &mut Vec<OperationError>, error: OperationError) {
 }
 
 fn already_terminal(run_id: RunId) -> RunReconcileResult {
-    completed(run_id, "already_terminal", false, Vec::new())
+    completed(
+        run_id,
+        RunReconcileStatus::AlreadyTerminal,
+        false,
+        Vec::new(),
+    )
 }
 
-fn planned(run_id: RunId, actions: Vec<&'static str>) -> RunReconcileResult {
+fn planned(run_id: RunId, actions: Vec<RunReconcileAction>) -> RunReconcileResult {
     RunReconcileResult {
         schema_version: 2,
         run_id,
-        status: "planned",
+        status: RunReconcileStatus::Planned,
         terminalized: false,
         actions,
         resources_absent: false,
@@ -630,18 +655,18 @@ fn planned(run_id: RunId, actions: Vec<&'static str>) -> RunReconcileResult {
 
 fn completed(
     run_id: RunId,
-    status: &'static str,
+    status: RunReconcileStatus,
     terminalized: bool,
-    actions: Vec<&'static str>,
+    actions: Vec<RunReconcileAction>,
 ) -> RunReconcileResult {
     completed_with_resources(run_id, status, terminalized, actions, true)
 }
 
 fn completed_with_resources(
     run_id: RunId,
-    status: &'static str,
+    status: RunReconcileStatus,
     terminalized: bool,
-    actions: Vec<&'static str>,
+    actions: Vec<RunReconcileAction>,
     resources_absent: bool,
 ) -> RunReconcileResult {
     RunReconcileResult {
@@ -657,13 +682,13 @@ fn completed_with_resources(
 
 fn cleanup_pending(
     run_id: RunId,
-    actions: Vec<&'static str>,
+    actions: Vec<RunReconcileAction>,
     error: &anyhow::Error,
 ) -> RunReconcileResult {
     RunReconcileResult {
         schema_version: 2,
         run_id,
-        status: "terminalized_cleanup_pending",
+        status: RunReconcileStatus::TerminalizedCleanupPending,
         terminalized: true,
         actions,
         resources_absent: false,
@@ -681,7 +706,7 @@ fn run_network_cleanup_error(error: &anyhow::Error) -> OperationError {
 
 fn cleanup_shared_network(
     attempt: &mut NativeAttempt,
-    actions: &mut Vec<&'static str>,
+    actions: &mut Vec<RunReconcileAction>,
 ) -> Result<()> {
     let Some(network) = attempt.journal().shared_network() else {
         return Ok(());
@@ -701,22 +726,25 @@ fn cleanup_shared_network(
             .context("native egress cleanup tools are unavailable")?
             .cleanup_plan(plan, Duration::from_secs(5))
             .context("failed to clean Run egress resources")?;
-        actions.push("run_network_egress_removed");
+        actions.push(RunReconcileAction::RunNetworkEgressRemoved);
     }
     if let Some(holder) = holder {
         holder
             .request_stop(Duration::from_secs(5))
             .context("failed to stop the durable Run network holder")?;
-        actions.push("run_network_holder_stopped");
+        actions.push(RunReconcileAction::RunNetworkHolderStopped);
     } else {
-        actions.push("run_network_holder_absent");
+        actions.push(RunReconcileAction::RunNetworkHolderAbsent);
     }
     attempt.record_shared_network_cleanup(Utc::now())?;
-    actions.push("run_network_cleanup_complete");
+    actions.push(RunReconcileAction::RunNetworkCleanupComplete);
     Ok(())
 }
 
-fn cleanup_resources(attempt: &mut NativeAttempt, actions: &mut Vec<&'static str>) -> Result<()> {
+fn cleanup_resources(
+    attempt: &mut NativeAttempt,
+    actions: &mut Vec<RunReconcileAction>,
+) -> Result<()> {
     if attempt.journal().managed_service().is_some() {
         cleanup_runtime(attempt, NativeParticipant::ManagedService, actions)?;
     }
@@ -736,7 +764,7 @@ fn cleanup_resources(attempt: &mut NativeAttempt, actions: &mut Vec<&'static str
 fn cleanup_resolver(
     attempt: &mut NativeAttempt,
     participant: NativeParticipant,
-    actions: &mut Vec<&'static str>,
+    actions: &mut Vec<RunReconcileAction>,
 ) -> Result<()> {
     let Some(resolver) = attempt.journal().resolver() else {
         return Ok(());
@@ -760,8 +788,8 @@ fn cleanup_resolver(
     attempt.record_resolver_cleanup(participant)?;
     actions.push(participant_action(
         participant,
-        "resolver_projection_removed",
-        "managed_resolver_projection_removed",
+        RunReconcileAction::ResolverProjectionRemoved,
+        RunReconcileAction::ManagedResolverProjectionRemoved,
     ));
     Ok(())
 }
@@ -769,7 +797,7 @@ fn cleanup_resolver(
 fn cleanup_runtime(
     attempt: &NativeAttempt,
     participant: NativeParticipant,
-    actions: &mut Vec<&'static str>,
+    actions: &mut Vec<RunReconcileAction>,
 ) -> Result<()> {
     let rootless = rootless_ownership(attempt)?.is_some();
     let root = attempt.participant_runtime_root(participant)?;
@@ -814,8 +842,8 @@ fn cleanup_runtime(
         fs::remove_dir(&root).context("failed to remove empty native runtime root")?;
         actions.push(participant_action(
             participant,
-            "runtime_root_removed",
-            "managed_runtime_root_removed",
+            RunReconcileAction::RuntimeRootRemoved,
+            RunReconcileAction::ManagedRuntimeRootRemoved,
         ));
         return Ok(());
     }
@@ -831,8 +859,8 @@ fn cleanup_runtime(
     if runner.reconcile(&root, runtime_id)? {
         actions.push(participant_action(
             participant,
-            "runtime_deleted",
-            "managed_runtime_deleted",
+            RunReconcileAction::RuntimeDeleted,
+            RunReconcileAction::ManagedRuntimeDeleted,
         ));
     }
     if !rootless {
@@ -845,14 +873,14 @@ fn reconcile_cgroup(
     checkpoint: &Path,
     runtime_id: &str,
     participant: NativeParticipant,
-    actions: &mut Vec<&'static str>,
+    actions: &mut Vec<RunReconcileAction>,
 ) -> Result<bool> {
     let reconciled = crate::native::cgroup::reconcile_checkpoint(checkpoint, runtime_id)?;
     if reconciled {
         actions.push(participant_action(
             participant,
-            "cgroup_removed",
-            "managed_cgroup_removed",
+            RunReconcileAction::CgroupRemoved,
+            RunReconcileAction::ManagedCgroupRemoved,
         ));
     }
     Ok(reconciled)
@@ -861,7 +889,7 @@ fn reconcile_cgroup(
 fn reconcile_overlay(
     attempt: &NativeAttempt,
     participant: NativeParticipant,
-    actions: &mut Vec<&'static str>,
+    actions: &mut Vec<RunReconcileAction>,
 ) -> Result<()> {
     let rootfs = attempt
         .participant_bundle_directory(participant)?
@@ -869,8 +897,8 @@ fn reconcile_overlay(
     if reconcile_participant_filesystem(attempt, participant, &rootfs)? {
         actions.push(participant_action(
             participant,
-            "overlay_unmounted",
-            "managed_overlay_unmounted",
+            RunReconcileAction::OverlayUnmounted,
+            RunReconcileAction::ManagedOverlayUnmounted,
         ));
     }
     Ok(())
@@ -913,9 +941,9 @@ fn rootless_ownership(attempt: &NativeAttempt) -> Result<Option<FilesystemOwners
 
 const fn participant_action(
     participant: NativeParticipant,
-    primary: &'static str,
-    service: &'static str,
-) -> &'static str {
+    primary: RunReconcileAction,
+    service: RunReconcileAction,
+) -> RunReconcileAction {
     match participant {
         NativeParticipant::Primary => primary,
         NativeParticipant::ManagedService => service,
@@ -973,7 +1001,7 @@ fn recover_participant(
     attempt: &mut NativeAttempt,
     participant: NativeParticipant,
     mut operation_errors: Vec<OperationError>,
-    actions: &mut Vec<&'static str>,
+    actions: &mut Vec<RunReconcileAction>,
 ) -> Result<RecoveredParticipant> {
     let recovered = recovered_process(attempt, participant)?;
     let (final_image, captured_at) = participant_capture_facts(attempt, participant)?;
@@ -998,8 +1026,8 @@ fn recover_participant(
         )?;
         actions.push(participant_action(
             participant,
-            "recovery_capture_started",
-            "managed_recovery_capture_started",
+            RunReconcileAction::RecoveryCaptureStarted,
+            RunReconcileAction::ManagedRecoveryCaptureStarted,
         ));
     }
     let final_image = recover_final_image(
@@ -1134,7 +1162,7 @@ fn recover_final_image(
     attempt: &mut NativeAttempt,
     participant: NativeParticipant,
     operation_errors: &mut Vec<OperationError>,
-    actions: &mut Vec<&'static str>,
+    actions: &mut Vec<RunReconcileAction>,
 ) -> ImageSlot {
     let (final_image, captured_at) = match participant {
         NativeParticipant::Primary => (
@@ -1218,8 +1246,8 @@ fn recover_final_image(
             } else {
                 actions.push(participant_action(
                     participant,
-                    "final_image_published",
-                    "managed_final_image_published",
+                    RunReconcileAction::FinalImagePublished,
+                    RunReconcileAction::ManagedFinalImagePublished,
                 ));
             }
             final_image
@@ -1325,7 +1353,7 @@ mod tests {
         );
         let repeated = reconcile_native_run(state.path(), &database, Some(&images), run_id, false)
             .expect("repeat reconcile");
-        assert_eq!(repeated.status, "already_terminal");
+        assert_eq!(repeated.status, RunReconcileStatus::AlreadyTerminal);
         assert!(!repeated.terminalized);
     }
 
@@ -1485,8 +1513,11 @@ mod tests {
         let RunReconcileBatchOutcome::Completed { result } = &dry_run.items[0].outcome else {
             panic!("staging dry-run failed");
         };
-        assert_eq!(result.status, "planned");
-        assert_eq!(result.actions, vec!["staging_attempt_remove"]);
+        assert_eq!(result.status, RunReconcileStatus::Planned);
+        assert_eq!(
+            result.actions,
+            vec![RunReconcileAction::StagingAttemptRemove]
+        );
         assert!(staging.exists(), "dry-run removed staging");
 
         let applied = reconcile_native_runs(state.path(), &database, None, None, 20, false)
@@ -1495,8 +1526,11 @@ mod tests {
         let RunReconcileBatchOutcome::Completed { result } = &applied.items[0].outcome else {
             panic!("staging reconciliation failed");
         };
-        assert_eq!(result.status, "discarded_prepublication");
-        assert_eq!(result.actions, vec!["staging_attempt_removed"]);
+        assert_eq!(result.status, RunReconcileStatus::DiscardedPrepublication);
+        assert_eq!(
+            result.actions,
+            vec![RunReconcileAction::StagingAttemptRemoved]
+        );
         assert!(!staging.exists());
 
         let repeated = reconcile_native_runs(state.path(), &database, None, None, 20, false)
@@ -1548,7 +1582,13 @@ mod tests {
         cleanup_runtime(&attempt, NativeParticipant::Primary, &mut actions)
             .expect("owned cgroup proves cleanup");
 
-        assert_eq!(actions, ["cgroup_removed", "runtime_root_removed"]);
+        assert_eq!(
+            actions,
+            [
+                RunReconcileAction::CgroupRemoved,
+                RunReconcileAction::RuntimeRootRemoved
+            ]
+        );
         let checkpoint_value: serde_json::Value =
             serde_json::from_slice(&fs::read(&checkpoint).expect("cgroup tombstone"))
                 .expect("checkpoint JSON");
@@ -1556,7 +1596,7 @@ mod tests {
         let mut repeated_actions = Vec::new();
         cleanup_runtime(&attempt, NativeParticipant::Primary, &mut repeated_actions)
             .expect("cgroup tombstone is idempotent");
-        assert_eq!(repeated_actions, ["cgroup_removed"]);
+        assert_eq!(repeated_actions, [RunReconcileAction::CgroupRemoved]);
     }
 
     #[test]

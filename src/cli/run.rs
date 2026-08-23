@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::catalog::ImageSelector;
-use crate::core::{Digest, MAX_CAPTURED_STREAM_BYTES, RunControls, RunId, StoredBytes};
+use crate::core::{Digest, RunControls, RunId, StoredBytes};
 use crate::docker::DockerBackend;
 use crate::execution::{RunStartResult, Runner};
 use crate::image::ImageService;
@@ -248,17 +248,11 @@ pub(super) fn run_reconcile(_state: &Path, _arguments: &RunReconcileArgs) -> Res
 }
 
 pub(super) fn run_start(state: &Path, arguments: RunStartArgs) -> Result<u8> {
-    if arguments.timeout_seconds == 0 {
-        bail!("--timeout-seconds must be greater than zero");
-    }
-    if arguments.stdout_limit_bytes == 0 || arguments.stderr_limit_bytes == 0 {
-        bail!("stream limits must be greater than zero");
-    }
-    if arguments.stdout_limit_bytes > MAX_CAPTURED_STREAM_BYTES
-        || arguments.stderr_limit_bytes > MAX_CAPTURED_STREAM_BYTES
-    {
-        bail!("stream limits must not exceed {MAX_CAPTURED_STREAM_BYTES} bytes");
-    }
+    RunControls::validate_limits(
+        arguments.timeout_seconds,
+        arguments.stdout_limit_bytes,
+        arguments.stderr_limit_bytes,
+    )?;
     if matches!(arguments.backend, RunBackendArg::Docker) && arguments.managed_service.is_some() {
         bail!("--managed-service requires --backend native");
     }
@@ -274,16 +268,16 @@ pub(super) fn run_start(state: &Path, arguments: RunStartArgs) -> Result<u8> {
         Some(path) => read_bounded_file(&path, MAX_STDIN_BYTES)?,
         None => Vec::new(),
     };
-    let controls = RunControls {
-        stdin: StoredBytes::Available {
+    let controls = RunControls::new(
+        StoredBytes::Available {
             digest: digest_bytes(&stdin),
             size: u64::try_from(stdin.len()).context("stdin size overflow")?,
         },
-        timeout_seconds: arguments.timeout_seconds,
-        stdout_limit_bytes: arguments.stdout_limit_bytes,
-        stderr_limit_bytes: arguments.stderr_limit_bytes,
-        network: arguments.network.into(),
-    };
+        arguments.timeout_seconds,
+        arguments.stdout_limit_bytes,
+        arguments.stderr_limit_bytes,
+        arguments.network.into(),
+    )?;
     let _operation = StateOperation::enter(state)?;
     let images = image_service(state)?;
     let (initial_image, requested_image_reference) =

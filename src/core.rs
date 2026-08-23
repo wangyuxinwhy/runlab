@@ -477,6 +477,54 @@ pub struct RunControls {
     pub network: NetworkControl,
 }
 
+impl RunControls {
+    /// Reject limits a Run cannot honour. Separate from `new` so a caller can
+    /// refuse a request before reading any input or creating any state.
+    pub fn validate_limits(
+        timeout_seconds: u64,
+        stdout_limit_bytes: u64,
+        stderr_limit_bytes: u64,
+    ) -> Result<()> {
+        if timeout_seconds == 0 {
+            bail!("Run timeout must be greater than zero seconds");
+        }
+        if stdout_limit_bytes == 0 || stderr_limit_bytes == 0 {
+            bail!("stream limits must be greater than zero");
+        }
+        if stdout_limit_bytes > MAX_CAPTURED_STREAM_BYTES
+            || stderr_limit_bytes > MAX_CAPTURED_STREAM_BYTES
+        {
+            bail!("stream limits must not exceed {MAX_CAPTURED_STREAM_BYTES} bytes");
+        }
+        Ok(())
+    }
+
+    pub fn new(
+        stdin: StoredBytes,
+        timeout_seconds: u64,
+        stdout_limit_bytes: u64,
+        stderr_limit_bytes: u64,
+        network: NetworkControl,
+    ) -> Result<Self> {
+        Self::validate_limits(timeout_seconds, stdout_limit_bytes, stderr_limit_bytes)?;
+        Ok(Self {
+            stdin,
+            timeout_seconds,
+            stdout_limit_bytes,
+            stderr_limit_bytes,
+            network,
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        Self::validate_limits(
+            self.timeout_seconds,
+            self.stdout_limit_bytes,
+            self.stderr_limit_bytes,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BackendFacts {
     pub name: String,
@@ -863,6 +911,7 @@ impl TerminalRunRecord {
         if let Some(service) = &self.managed_service {
             service.validate()?;
         }
+        self.controls.validate()?;
         self.process.validate()?;
         if self
             .operation_errors
@@ -909,6 +958,7 @@ impl AcceptedRunRecord {
                 self.schema_version
             );
         }
+        self.controls.validate()?;
         if let Some(service) = &self.managed_service {
             service.validate()?;
         }
