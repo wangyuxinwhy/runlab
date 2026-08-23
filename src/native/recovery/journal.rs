@@ -8,10 +8,8 @@ use super::{
     canonical_json, create_private_file, digest_bytes, fs, open_private_file, set_private_file,
     sync_directory, validate_regular_file,
 };
-#[cfg(target_os = "linux")]
 use super::{NativeResolverProjectionJournal, ResolverSourceCheckpoint};
 
-#[cfg(target_os = "linux")]
 pub(super) fn ensure_resolver_projection_removable(
     projection: &NativeResolverProjectionJournal,
     participant: &str,
@@ -311,12 +309,10 @@ pub(super) fn validate_journal(
         Some(_) => bail!("network=none single-participant recovery has a Run network journal"),
         None => bail!("native topology requires a Run network recovery journal"),
     }
-    #[cfg(target_os = "linux")]
     validate_resolver_journal(journal)?;
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 pub(super) fn validate_resolver_journal(journal: &NativeRecoveryJournal) -> Result<()> {
     match (&journal.resolver, journal.backend.network) {
         (None, NetworkControl::None) => return Ok(()),
@@ -371,7 +367,6 @@ pub(super) fn validate_resolver_journal(journal: &NativeRecoveryJournal) -> Resu
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 pub(super) fn validate_resolver_projection(
     participant_phase: NativeRecoveryPhase,
     projection: &NativeResolverProjectionJournal,

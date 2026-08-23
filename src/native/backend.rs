@@ -4,8 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-mod runc;
-pub(crate) use runc::{
+pub(crate) use super::runc::{
     PreparedRuncRun, RuncCaptureLimits, RuncExecution, RuncOperationErrorKind, RuncRunFailure,
     RuncRunResult, RuncRunner, RuncStopReason, RuncStreamCapture,
 };
@@ -16,10 +15,10 @@ use crate::core::{
 };
 use crate::filesystem::FilesystemOwnership;
 use crate::integrity::digest_bytes;
-use crate::native_cgroup::PreparedNativeCgroup;
-use crate::native_network::{EgressNetworkTools, NativeNetworkTools};
-use crate::native_resolver::ResolverConfig;
-use crate::read_only_file::{VerifiedSourceFile, verify_sources};
+use crate::native::cgroup::PreparedNativeCgroup;
+use crate::native::network::{EgressNetworkTools, NativeNetworkTools};
+use crate::native::read_only_file::{VerifiedSourceFile, verify_sources};
+use crate::native::resolver::ResolverConfig;
 use crate::runtime::{RootlessMapping, RuntimeConfig};
 
 const SUPPORTED_RUNC_VERSION: &str = "1.5.1";
@@ -233,7 +232,7 @@ impl NativeBackend {
         if !rootless {
             verify_cgroup_v2()?;
             PreparedNativeCgroup::probe().context("native cgroup preflight failed")?;
-            crate::native_fs::OverlayRootfs::preflight_at(state_root)?;
+            crate::native::fs::OverlayRootfs::preflight_at(state_root)?;
             return Ok(NativeRealization {
                 runner: self.runtime.clone(),
                 mode: NativeExecutionMode::Rootful,
@@ -296,7 +295,7 @@ fn verify_cgroup_v2() -> Result<()> {
     fs::metadata("/proc/self/ns/cgroup").context("cgroup namespace is unavailable")?;
     fs::metadata("/sys/fs/cgroup/cgroup.controllers")
         .context("the unified cgroup v2 hierarchy is unavailable")?;
-    let mounted = crate::native_fs::mounted_as(Path::new("/sys/fs/cgroup"), "cgroup2")?;
+    let mounted = crate::native::fs::mounted_as(Path::new("/sys/fs/cgroup"), "cgroup2")?;
     if !mounted {
         bail!("/sys/fs/cgroup is not a cgroup v2 mount");
     }

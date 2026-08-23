@@ -253,7 +253,6 @@ pub(super) fn validate_staging_workspace(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 pub(super) fn validate_same_mount(parent: &Path, child: &Path) -> Result<()> {
     if mount_id(parent)? != mount_id(child)? {
         bail!(
@@ -264,14 +263,6 @@ pub(super) fn validate_same_mount(parent: &Path, child: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(super) fn validate_same_mount(parent: &Path, child: &Path) -> Result<()> {
-    fs::symlink_metadata(parent).context("failed to inspect staging parent")?;
-    fs::symlink_metadata(child).context("failed to inspect staging child")?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
 pub(super) fn mount_id(path: &Path) -> Result<u64> {
     use rustix::fs::{AtFlags, CWD, StatxFlags, statx};
 

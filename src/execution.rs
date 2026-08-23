@@ -39,24 +39,24 @@ use crate::{
     bundle::OciBundle,
     filesystem::{Inventory, TreeCapture},
     materialize::MaterializedRootfs,
-    native_backend::{
+    native::backend::{
         NativeBackend, NativeExecutionMode, NativePreflight, PreparedRuncRun, RuncCaptureLimits,
         RuncExecution, RuncOperationErrorKind, RuncRunFailure, RuncRunResult, RuncRunner,
         RuncStopReason,
     },
-    native_fs::OverlayRootfs,
-    native_network::{
+    native::fs::OverlayRootfs,
+    native::network::{
         EgressNetworkTools, NativeNetworkBinding, NativeNetworkTools, NetworkHolderHandle,
         RunNetwork, RunNetworkMode,
     },
-    native_recovery::{
+    native::read_only_file::{DestinationFileGuard, VerifiedSourceFile},
+    native::recovery::{
         ManagedTerminalCheckpoint, NativeAttempt, NativeParticipant, NativeRecoveryPhase,
         NativeRecoveryStore, SharedNetworkCheckpoint, TerminalCheckpoint,
     },
-    native_resolver::{
+    native::resolver::{
         ResolverConfig, ResolverProjection, ResolverProjectionPlan, ResolverSourceFile,
     },
-    read_only_file::{DestinationFileGuard, VerifiedSourceFile},
     signal::TerminationFlag,
 };
 
@@ -1847,7 +1847,7 @@ fn finish_run_network(attempt: &mut NativeAttempt, network: Option<RunNetwork>) 
         .journal()
         .shared_network()
         .context("native attempt has no Run network")?;
-    if journal.phase() == crate::native_recovery::NativeSharedNetworkPhase::CleanupComplete {
+    if journal.phase() == crate::native::recovery::NativeSharedNetworkPhase::CleanupComplete {
         return Ok(());
     }
     let plan = journal.plan().cloned();
@@ -2088,7 +2088,7 @@ fn record_runc_result(
 
 #[cfg(target_os = "linux")]
 fn runc_stream_slot(
-    capture: &crate::native_backend::RuncStreamCapture,
+    capture: &crate::native::backend::RuncStreamCapture,
     limit: u64,
     stop_reason: Option<&str>,
 ) -> StoredBytes {
@@ -2169,7 +2169,7 @@ impl NativeEnvironment {
     fn verify_runtime_mounts_removed(&self) -> Result<()> {
         match self.overlay.as_ref() {
             Some(overlay) => overlay.verify_runtime_mounts_removed(),
-            None => crate::native_fs::ensure_no_mounts_at_or_below(self.rootfs()?),
+            None => crate::native::fs::ensure_no_mounts_at_or_below(self.rootfs()?),
         }
     }
 

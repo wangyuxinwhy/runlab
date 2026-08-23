@@ -19,9 +19,9 @@ use uuid::Uuid;
 use crate::bundle::OciBundle;
 use crate::core::{Digest, MAX_CAPTURED_STREAM_BYTES, NativeRuntimeInvocation};
 use crate::integrity::{digest_reader, ensure_private_directory};
-use crate::native_cgroup::PreparedNativeCgroup;
-use crate::native_network::NativeNetworkBinding;
-use crate::read_only_file::{VerifiedSourceFile, verify_all_sources};
+use crate::native::cgroup::PreparedNativeCgroup;
+use crate::native::network::NativeNetworkBinding;
+use crate::native::read_only_file::{VerifiedSourceFile, verify_all_sources};
 use crate::runtime::{RootlessMapping, RuntimeConfig};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);

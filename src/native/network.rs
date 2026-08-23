@@ -1,5 +1,4 @@
 use std::ffi::OsStr;
-#[cfg(target_os = "linux")]
 use std::fs::TryLockError;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -28,9 +27,7 @@ const NETWORK_HOLDER_IDENTITY: &str = "identity.json";
 const NETWORK_HOLDER_STOP: &str = "stop";
 const NETWORK_HOLDER_SCHEMA_VERSION: u32 = 1;
 const MAX_NETWORK_HOLDER_IDENTITY_BYTES: u64 = 4 * 1024;
-#[cfg(target_os = "linux")]
 const HOST_NETWORK_LOCK_DIRECTORY: &str = "/run/runlab";
-#[cfg(target_os = "linux")]
 const HOST_NETWORK_LOCK_FILE: &str = "network-allocation.lock";
 
 mod lifecycle;
@@ -39,13 +36,9 @@ use lifecycle::{
     LinkOwnership, NativeNetworkHelperOutput, SharedLoopbackNetwork, TableOwnership,
     disable_ipv6_for_interface, process_start_time_ticks,
 };
-#[cfg(target_os = "linux")]
 pub(crate) use lifecycle::{
     NativeNetworkBinding, RunNetwork, connect_loopback_tcp, hold_network_namespace,
 };
-#[cfg(not(target_os = "linux"))]
-use lifecycle::{NativeNetworkBinding, connect_loopback_tcp};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunNetworkMode {
@@ -338,7 +331,6 @@ struct NetworkHolderIdentity {
 }
 
 impl NetworkHolderIdentity {
-    #[cfg(target_os = "linux")]
     fn current(run_id: RunId) -> io::Result<Self> {
         let pid = std::process::id();
         let namespace = namespace_identity(Path::new("/proc/self/ns/net"))?;
@@ -1082,7 +1074,6 @@ impl EgressNetworkTools {
 }
 
 pub(crate) fn acquire_host_network_lock(timeout: Duration) -> io::Result<HostNetworkLock> {
-    #[cfg(target_os = "linux")]
     {
         if !rustix::process::geteuid().is_root() {
             return Err(io::Error::new(
@@ -1094,17 +1085,8 @@ pub(crate) fn acquire_host_network_lock(timeout: Duration) -> io::Result<HostNet
         prepare_host_network_lock_directory(directory)?;
         acquire_host_network_lock_in(directory, (0, 0), timeout)
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = timeout;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "host network lock requires Linux",
-        ))
-    }
 }
 
-#[cfg(target_os = "linux")]
 fn prepare_host_network_lock_directory(directory: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
@@ -1121,7 +1103,6 @@ fn prepare_host_network_lock_directory(directory: &Path) -> io::Result<()> {
     verify_host_network_lock_directory(directory, (0, 0))
 }
 
-#[cfg(target_os = "linux")]
 fn acquire_host_network_lock_in(
     directory: &Path,
     expected_owner: (u32, u32),
@@ -1180,7 +1161,6 @@ fn acquire_host_network_lock_in(
     }
 }
 
-#[cfg(target_os = "linux")]
 fn verify_host_network_lock_directory(
     directory: &Path,
     expected_owner: (u32, u32),
@@ -2108,7 +2088,6 @@ mod tests {
             .expect("absolute egress helpers");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_with_allocation_lock_does_not_reacquire_it() {
         let directory = tempfile::tempdir().expect("helper directory");
@@ -2139,7 +2118,6 @@ mod tests {
             .expect("cleanup under existing lock");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn filesystem_allocation_lock_rejects_unsafe_directory_and_serializes_holders() {
         let directory = tempfile::tempdir().expect("lock directory");

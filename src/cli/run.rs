@@ -201,7 +201,7 @@ pub(super) fn run_reconcile(state: &Path, arguments: &RunReconcileArgs) -> Resul
         .then(|| image_service(state))
         .transpose()?;
     if let Some(run_id) = arguments.run_id {
-        emit(&crate::native_reconcile::reconcile_native_run(
+        emit(&crate::native::reconcile::reconcile_native_run(
             state,
             &database,
             images.as_ref(),
@@ -214,7 +214,7 @@ pub(super) fn run_reconcile(state: &Path, arguments: &RunReconcileArgs) -> Resul
     if !(1..=100).contains(&limit) {
         bail!("--limit must be between 1 and 100");
     }
-    let result = crate::native_reconcile::reconcile_native_runs(
+    let result = crate::native::reconcile::reconcile_native_runs(
         state,
         &database,
         images.as_ref(),
@@ -327,7 +327,7 @@ pub(super) fn run_native(
     managed_service: Option<&(LoadedManagedService, Option<String>)>,
 ) -> Result<crate::execution::RunResult> {
     let backend =
-        crate::native_backend::NativeBackend::discover(std::time::Duration::from_secs(5))?;
+        crate::native::backend::NativeBackend::discover(std::time::Duration::from_secs(5))?;
     let runner = Runner::native(database, images, &backend);
     match managed_service {
         Some((service, service_requested_reference)) => runner.run_with_managed_service(

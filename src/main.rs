@@ -22,26 +22,8 @@ mod managed_vm;
 #[cfg(target_os = "linux")]
 mod materialize;
 #[cfg(target_os = "linux")]
-mod native_backend;
-#[cfg(target_os = "linux")]
-mod native_cgroup;
-#[cfg(target_os = "linux")]
-mod native_fs;
-#[cfg(any(test, target_os = "linux"))]
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "native execution is Linux-only")
-)]
-mod native_network;
-#[cfg(target_os = "linux")]
-mod native_reconcile;
-#[cfg(any(test, target_os = "linux"))]
-mod native_recovery;
-#[cfg(target_os = "linux")]
-mod native_resolver;
+mod native;
 mod oci;
-#[cfg(target_os = "linux")]
-mod read_only_file;
 mod reconciliation;
 mod render;
 mod runtime;

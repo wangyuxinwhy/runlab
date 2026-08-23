@@ -566,7 +566,6 @@ fn start_network_holder(
     })
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn hold_network_namespace(directory: &Path, run_id: RunId) -> io::Result<()> {
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
@@ -615,7 +614,6 @@ pub(crate) fn hold_network_namespace(directory: &Path, run_id: RunId) -> io::Res
     }
 }
 
-#[cfg(target_os = "linux")]
 fn disable_ipv6_in_current_namespace() -> io::Result<()> {
     for path in [
         "/proc/sys/net/ipv6/conf/default/disable_ipv6",
@@ -626,7 +624,6 @@ fn disable_ipv6_in_current_namespace() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 pub(super) fn disable_ipv6_for_interface(interface: &str) -> io::Result<()> {
     disable_ipv6_at(
         &Path::new("/proc/sys/net/ipv6/conf")
@@ -635,15 +632,6 @@ pub(super) fn disable_ipv6_for_interface(interface: &str) -> io::Result<()> {
     )
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(super) fn disable_ipv6_for_interface(_interface: &str) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "network interface IPv6 control requires Linux",
-    ))
-}
-
-#[cfg(target_os = "linux")]
 fn disable_ipv6_at(path: &Path) -> io::Result<()> {
     match fs::write(path, b"1\n") {
         Ok(()) => {}

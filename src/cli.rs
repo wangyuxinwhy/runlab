@@ -1375,7 +1375,7 @@ fn run_docker_with_state(explicit: Option<PathBuf>, command: DockerCommand) -> R
 #[cfg(target_os = "linux")]
 fn run_internal_network_holder(directory: &Path, run_id: &str) -> Result<u8> {
     let run_id = RunId::parse(run_id).context("internal network holder Run identity is invalid")?;
-    crate::native_network::hold_network_namespace(directory, run_id)
+    crate::native::network::hold_network_namespace(directory, run_id)
         .context("internal network holder failed")?;
     Ok(0)
 }
@@ -1389,7 +1389,7 @@ fn run_internal_network_holder(_directory: &Path, _run_id: &str) -> Result<u8> {
 fn run_internal_tcp_probe(port: u16, timeout_milliseconds: u64) -> Result<u8> {
     use std::io::ErrorKind;
 
-    match crate::native_network::connect_loopback_tcp(
+    match crate::native::network::connect_loopback_tcp(
         port,
         std::time::Duration::from_millis(timeout_milliseconds),
     ) {

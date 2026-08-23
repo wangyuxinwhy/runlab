@@ -14,15 +14,15 @@ use crate::core::{
 use crate::filesystem::{FilesystemOwnership, TreeCapture};
 use crate::image::ImageService;
 use crate::integrity::digest_bytes;
-use crate::native_backend::RuncRunner;
-use crate::native_fs::OverlayRootfs;
-use crate::native_network::{EgressNetworkTools, NetworkHolderHandle, RunNetworkMode};
-use crate::native_recovery::{
+use crate::native::backend::RuncRunner;
+use crate::native::fs::OverlayRootfs;
+use crate::native::network::{EgressNetworkTools, NetworkHolderHandle, RunNetworkMode};
+use crate::native::recovery::{
     ManagedTerminalCheckpoint, NativeAttempt, NativeParticipant, NativeRecoveryEntry,
     NativeRecoveryPhase, NativeRecoveryStore, NativeResolverProjectionJournal,
     NativeSharedNetworkPhase, RecoveryCaptureCheckpoint, TerminalCheckpoint,
 };
-use crate::native_resolver::recover_cleanup;
+use crate::native::resolver::recover_cleanup;
 use crate::reconciliation::{
     RunReconcileBatchItem, RunReconcileBatchOutcome, RunReconcileBatchResult, RunReconcileResult,
 };
@@ -131,7 +131,7 @@ fn open_entry(state_root: &Path, run_id: RunId) -> Result<Option<NativeRecoveryE
 
 fn reconcile_staging(
     run_id: RunId,
-    staging: crate::native_recovery::NativeStagingAttempt,
+    staging: crate::native::recovery::NativeStagingAttempt,
     dry_run: bool,
 ) -> Result<RunReconcileResult> {
     if staging.run_id() != run_id {
@@ -847,7 +847,7 @@ fn reconcile_cgroup(
     participant: NativeParticipant,
     actions: &mut Vec<&'static str>,
 ) -> Result<bool> {
-    let reconciled = crate::native_cgroup::reconcile_checkpoint(checkpoint, runtime_id)?;
+    let reconciled = crate::native::cgroup::reconcile_checkpoint(checkpoint, runtime_id)?;
     if reconciled {
         actions.push(participant_action(
             participant,
@@ -882,7 +882,7 @@ fn reconcile_participant_filesystem(
     rootfs: &Path,
 ) -> Result<bool> {
     if rootless_ownership(attempt)?.is_some() {
-        crate::native_fs::ensure_no_mounts_at_or_below(rootfs)?;
+        crate::native::fs::ensure_no_mounts_at_or_below(rootfs)?;
         Ok(false)
     } else {
         OverlayRootfs::reconcile(rootfs)
@@ -1239,7 +1239,7 @@ fn recover_final_image(
 
 fn participant_capture_ready(attempt: &NativeAttempt, rootfs: &Path) -> Result<bool> {
     if rootless_ownership(attempt)?.is_some() {
-        crate::native_fs::ensure_no_mounts_at_or_below(rootfs)?;
+        crate::native::fs::ensure_no_mounts_at_or_below(rootfs)?;
         let metadata = match fs::symlink_metadata(rootfs) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -1277,7 +1277,7 @@ mod tests {
         ProcessFacts, ProcessOutcome, RunControls, RunNetworkFacts, RunNetworkRealization,
         ServiceName, TcpReadinessCondition,
     };
-    use crate::native_recovery::SharedNetworkCheckpoint;
+    use crate::native::recovery::SharedNetworkCheckpoint;
     use crate::oci::OciLayout;
 
     #[test]
@@ -1345,7 +1345,7 @@ mod tests {
             )
             .expect("service accepted");
         attempt
-            .record_network_plan(crate::native_network::RunNetworkPlan::loopback(run_id))
+            .record_network_plan(crate::native::network::RunNetworkPlan::loopback(run_id))
             .expect("network plan");
         attempt
             .record_shared_network(SharedNetworkCheckpoint::for_test(
@@ -1539,8 +1539,9 @@ mod tests {
                 .expect("runtime root"),
         )
         .expect("empty runtime root");
-        let prepared = crate::native_cgroup::PreparedNativeCgroup::prepare(runtime_id, &checkpoint)
-            .expect("cgroup");
+        let prepared =
+            crate::native::cgroup::PreparedNativeCgroup::prepare(runtime_id, &checkpoint)
+                .expect("cgroup");
         drop(prepared);
         let mut actions = Vec::new();
 

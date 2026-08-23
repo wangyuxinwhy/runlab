@@ -1,5 +1,3 @@
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
@@ -18,11 +16,9 @@ use crate::core::{
 use crate::integrity::{
     canonical_json, digest_bytes, ensure_private_directory, set_private_file, sync_directory,
 };
-#[cfg(target_os = "linux")]
-use crate::native_network::{EgressNetworkTools, HostNetworkLock, acquire_host_network_lock};
-use crate::native_network::{RunNetworkMode, RunNetworkPlan};
-#[cfg(target_os = "linux")]
-use crate::native_resolver::{
+use crate::native::network::{EgressNetworkTools, HostNetworkLock, acquire_host_network_lock};
+use crate::native::network::{RunNetworkMode, RunNetworkPlan};
+use crate::native::resolver::{
     ResolverConfig, ResolverProjectionMounted, ResolverProjectionPending, ResolverSourceCheckpoint,
     ResolverSourceFile,
 };
@@ -34,7 +30,6 @@ const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 100_000;
 mod journal;
 mod layout;
 
-#[cfg(target_os = "linux")]
 use journal::ensure_resolver_projection_removable;
 use journal::{
     managed_runtime_id, parse_recovery_entry_name, publish_staging, read_journal, runtime_id,
@@ -96,7 +91,6 @@ pub(crate) struct NativeSharedNetworkJournal {
     holder_exit_observed_at: Option<DateTime<Utc>>,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub(crate) enum NativeResolverProjectionJournal {
@@ -115,7 +109,6 @@ pub(crate) enum NativeResolverProjectionJournal {
     CleanupComplete,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeResolverJournal {
@@ -125,7 +118,6 @@ pub(crate) struct NativeResolverJournal {
     managed_service: Option<NativeResolverProjectionJournal>,
 }
 
-#[cfg(target_os = "linux")]
 impl NativeResolverJournal {
     pub(crate) fn facts(&self) -> &crate::core::RunResolverFacts {
         &self.facts
@@ -259,7 +251,6 @@ pub(crate) struct NativeRecoveryJournal {
     operation_errors: Vec<OperationError>,
     managed_service: Option<NativeManagedServiceJournal>,
     shared_network: Option<NativeSharedNetworkJournal>,
-    #[cfg(target_os = "linux")]
     resolver: Option<NativeResolverJournal>,
 }
 
@@ -336,7 +327,6 @@ impl NativeRecoveryJournal {
         self.shared_network.as_ref()
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) const fn resolver(&self) -> Option<&NativeResolverJournal> {
         self.resolver.as_ref()
     }
@@ -480,7 +470,6 @@ impl NativeRecoveryStore {
         self.prepare_inner(run_id, backend, true)
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn reserve_network_plan(
         &self,
         attempt: &mut NativeAttempt,
@@ -684,7 +673,6 @@ impl NativeRecoveryStore {
         let lock = open_private_file(&directory.join("lock"))?;
         try_lock(&lock, run_id)?;
         let journal = read_journal(&directory, run_id)?;
-        #[cfg(target_os = "linux")]
         if let Some(resolver) = journal.resolver.as_ref() {
             ResolverSourceFile::open_from_attempt(&directory, resolver.facts(), resolver.source())?;
         }
@@ -752,7 +740,6 @@ fn initial_journal(run_id: RunId, backend: BackendFacts, managed: bool) -> Nativ
             holder_start_time_ticks: None,
             holder_exit_observed_at: None,
         }),
-        #[cfg(target_os = "linux")]
         resolver: None,
     }
 }
@@ -768,13 +755,11 @@ impl NativeStagingAttempt {
     }
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) struct RunNetworkPlanReservation {
     plan: RunNetworkPlan,
     host_lock: Option<HostNetworkLock>,
 }
 
-#[cfg(target_os = "linux")]
 impl RunNetworkPlanReservation {
     #[must_use]
     pub(crate) fn plan(&self) -> &RunNetworkPlan {
@@ -787,7 +772,6 @@ impl RunNetworkPlanReservation {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn network_allocation_remaining(deadline: std::time::Instant) -> Result<std::time::Duration> {
     deadline
         .checked_duration_since(std::time::Instant::now())
@@ -862,7 +846,7 @@ pub(crate) struct SharedNetworkCheckpoint {
 
 impl SharedNetworkCheckpoint {
     pub(crate) fn from_resources(
-        resources: &crate::native_network::RunNetworkResources,
+        resources: &crate::native::network::RunNetworkResources,
         resolver: Option<crate::core::RunResolverFacts>,
     ) -> Result<Self> {
         Ok(Self {
@@ -900,7 +884,6 @@ impl NativeAttempt {
         self.directory.join("workspace")
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn prepare_resolver(
         &mut self,
         config: &ResolverConfig,
@@ -926,7 +909,6 @@ impl NativeAttempt {
         Ok(source)
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn open_resolver_source(&self) -> Result<Option<ResolverSourceFile>> {
         let Some(resolver) = self.journal.resolver.as_ref() else {
             return Ok(None);
@@ -935,7 +917,6 @@ impl NativeAttempt {
             .map(Some)
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn begin_resolver_mount(
         &mut self,
         participant: NativeParticipant,
@@ -955,7 +936,6 @@ impl NativeAttempt {
         })
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn record_resolver_mounted(
         &mut self,
         participant: NativeParticipant,
@@ -971,7 +951,6 @@ impl NativeAttempt {
         })
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn begin_resolver_cleanup(&mut self, participant: NativeParticipant) -> Result<()> {
         let next = match self.resolver_projection(participant)? {
             NativeResolverProjectionJournal::NotStarted
@@ -993,7 +972,6 @@ impl NativeAttempt {
         self.update_resolver_projection(participant, |_| next)
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn record_resolver_cleanup(&mut self, participant: NativeParticipant) -> Result<()> {
         if !matches!(
             self.resolver_projection(participant)?,
@@ -1006,7 +984,6 @@ impl NativeAttempt {
         })
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn resolver_projection(
         &self,
         participant: NativeParticipant,
@@ -1018,7 +995,6 @@ impl NativeAttempt {
             .projection(participant)
     }
 
-    #[cfg(target_os = "linux")]
     fn update_resolver_projection(
         &mut self,
         participant: NativeParticipant,
@@ -1191,7 +1167,6 @@ impl NativeAttempt {
         if next == current {
             return Ok(());
         }
-        #[cfg(target_os = "linux")]
         if next == NativeRecoveryPhase::RuntimeStartPending
             && let Some(resolver) = self.journal.resolver.as_ref()
             && !matches!(
@@ -1322,7 +1297,6 @@ impl NativeAttempt {
         participant: NativeParticipant,
         captured_at: DateTime<Utc>,
     ) -> Result<()> {
-        #[cfg(target_os = "linux")]
         self.ensure_resolver_ready_for_capture(participant)?;
         let existing = match participant {
             NativeParticipant::Primary => self.journal.captured_at,
@@ -1361,7 +1335,6 @@ impl NativeAttempt {
         participant: NativeParticipant,
         checkpoint: RecoveryCaptureCheckpoint<'_>,
     ) -> Result<()> {
-        #[cfg(target_os = "linux")]
         self.ensure_resolver_ready_for_capture(participant)?;
         validate_participant_errors(participant, &checkpoint.operation_errors)?;
         validate_sidecar_input(&checkpoint.stdout, checkpoint.stdout_bytes, "stdout")?;
@@ -1756,7 +1729,6 @@ impl NativeAttempt {
         {
             bail!("shared network recovery is not complete");
         }
-        #[cfg(target_os = "linux")]
         if let Some(resolver) = &self.journal.resolver {
             ensure_resolver_projection_removable(&resolver.primary, "primary")?;
             if let Some(service) = &resolver.managed_service {
@@ -1766,7 +1738,6 @@ impl NativeAttempt {
         self.remove()
     }
 
-    #[cfg(target_os = "linux")]
     fn ensure_resolver_ready_for_capture(&self, participant: NativeParticipant) -> Result<()> {
         let Some(resolver) = &self.journal.resolver else {
             return Ok(());
@@ -1781,8 +1752,7 @@ impl NativeAttempt {
     }
 
     pub(crate) fn remove(self) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        crate::native_fs::ensure_no_mounts_at_or_below(&self.directory)?;
+        crate::native::fs::ensure_no_mounts_at_or_below(&self.directory)?;
         let parent = self
             .directory
             .parent()
@@ -1939,7 +1909,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn resolver_source_checkpoint(facts: &RunResolverFacts) -> ResolverSourceCheckpoint {
         serde_json::from_value(serde_json::json!({
             "identity": resolver_file_identity(11, 0o100_444, 0, facts.content_size),
@@ -1949,7 +1918,6 @@ mod tests {
         .expect("resolver source checkpoint")
     }
 
-    #[cfg(target_os = "linux")]
     fn resolver_projection_pending(source: &ResolverSourceCheckpoint) -> ResolverProjectionPending {
         serde_json::from_value(serde_json::json!({
             "source": source,
@@ -1959,7 +1927,6 @@ mod tests {
         .expect("resolver projection pending")
     }
 
-    #[cfg(target_os = "linux")]
     fn resolver_projection_mounted() -> ResolverProjectionMounted {
         serde_json::from_value(serde_json::json!({
             "projection_mount_id": 42,
@@ -1967,7 +1934,6 @@ mod tests {
         .expect("resolver projection mounted")
     }
 
-    #[cfg(target_os = "linux")]
     fn resolver_file_identity(inode: u64, mode: u32, uid: u32, size: u64) -> serde_json::Value {
         serde_json::json!({
             "device": 1,
@@ -1984,7 +1950,6 @@ mod tests {
         })
     }
 
-    #[cfg(target_os = "linux")]
     fn seed_resolver(attempt: &mut NativeAttempt) -> RunResolverFacts {
         let facts = resolver_facts();
         let source = resolver_source_checkpoint(&facts);
@@ -2001,7 +1966,6 @@ mod tests {
         facts
     }
 
-    #[cfg(target_os = "linux")]
     fn activate_egress_network(attempt: &mut NativeAttempt, resolver: RunResolverFacts) {
         attempt
             .advance_phase(NativeRecoveryPhase::Accepted)
@@ -2024,7 +1988,6 @@ mod tests {
             .expect("active network");
     }
 
-    #[cfg(target_os = "linux")]
     fn active_egress_attempt(store: &NativeRecoveryStore) -> NativeAttempt {
         let mut attempt = store
             .prepare(RunId::new(), egress_backend())
@@ -2034,7 +1997,6 @@ mod tests {
         attempt
     }
 
-    #[cfg(target_os = "linux")]
     fn rewrite_journal(
         attempt: NativeAttempt,
         update: impl FnOnce(&mut serde_json::Value),
@@ -2267,7 +2229,6 @@ mod tests {
         assert!(staging.exists());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires rootful Linux mount privileges"]
     fn staging_cleanup_rejects_every_bind_mount_boundary() {
@@ -2466,7 +2427,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn assert_mount_boundary_rejected(store: &NativeRecoveryStore, run_id: RunId) {
         let error = store
             .open_entry(run_id)
@@ -2474,12 +2434,10 @@ mod tests {
         assert!(error.to_string().contains("crosses a mount boundary"));
     }
 
-    #[cfg(target_os = "linux")]
     struct TestBindMount {
         target: PathBuf,
     }
 
-    #[cfg(target_os = "linux")]
     impl TestBindMount {
         fn new(source: &Path, target: &Path) -> Self {
             rustix::mount::mount(
@@ -2496,7 +2454,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     impl Drop for TestBindMount {
         fn drop(&mut self) {
             rustix::mount::unmount(&self.target, rustix::mount::UnmountFlags::DETACH)
@@ -2628,7 +2585,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn resolver_fact_mismatches_fail_closed_before_source_reopen() {
         let state = tempfile::tempdir().expect("state");
@@ -2685,7 +2641,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn runtime_start_pending_requires_a_mounted_resolver() {
         let state = tempfile::tempdir().expect("state");
@@ -2705,7 +2660,6 @@ mod tests {
         assert_eq!(attempt.journal().generation(), generation);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn active_resolver_blocks_capture_without_mutating_observations() {
         let state = tempfile::tempdir().expect("state");
@@ -2771,7 +2725,6 @@ mod tests {
         assert_eq!(fs::read(attempt.stderr_path()).expect("stderr"), stderr);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn not_started_resolver_cleanup_is_idempotent() {
         let state = tempfile::tempdir().expect("state");
