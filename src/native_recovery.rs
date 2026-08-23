@@ -15,7 +15,9 @@ use crate::core::{
     NativeRuntimeConfigRealization, NativeRuntimeInvocation, NetworkControl, OperationError,
     OperationErrorScope, ProcessSlot, RunId, RunNetworkFacts, RunNetworkRealization, StoredBytes,
 };
-use crate::integrity::{canonical_json, digest_bytes, ensure_private_directory};
+use crate::integrity::{
+    canonical_json, digest_bytes, ensure_private_directory, set_private_file, sync_directory,
+};
 #[cfg(target_os = "linux")]
 use crate::native_network::{EgressNetworkTools, HostNetworkLock, acquire_host_network_lock};
 use crate::native_network::{RunNetworkMode, RunNetworkPlan};
@@ -43,9 +45,8 @@ use journal::{
 use layout::{
     cleanup_staging_directory, create_private_directory_entry, create_private_file,
     ensure_real_private_directory, open_private_file, path_present, set_private_directory,
-    set_private_file, sync_directory, try_lock, validate_directory, validate_directory_metadata,
-    validate_managed_workspace, validate_recovery_workspace, validate_regular_file,
-    validate_staging_directory, verify_mode,
+    try_lock, validate_directory, validate_directory_metadata, validate_managed_workspace,
+    validate_recovery_workspace, validate_regular_file, validate_staging_directory, verify_mode,
 };
 #[cfg(test)]
 use layout::{create_private_directory, validate_pristine_prepublication_journal};

@@ -1,3 +1,5 @@
+use crate::integrity::{set_private_file, sync_directory};
+
 use super::{
     Context, File, MAX_JOURNAL_BYTES, NativeRecoveryJournal, NativeRecoveryPhase,
     NativeSharedNetworkPhase, OpenOptions, Path, Result, RunId, TryLockError, bail,
@@ -429,17 +431,6 @@ pub(super) fn validate_regular_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn set_private_file(file: &File) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .context("failed to secure native recovery file")?;
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
 pub(super) fn verify_mode(path: &Path, expected: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -456,11 +447,4 @@ pub(super) fn verify_mode(path: &Path, expected: u32) -> Result<()> {
         );
     }
     Ok(())
-}
-
-pub(super) fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("failed to open directory {}", path.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to fsync directory {}", path.display()))
 }

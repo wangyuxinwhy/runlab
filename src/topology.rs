@@ -1,12 +1,10 @@
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{ServiceName, TcpReadinessCondition};
-use crate::integrity::canonical_json;
+use crate::integrity::{canonical_json, read_bounded_file};
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -21,7 +19,7 @@ pub(crate) struct ManagedServiceFile {
 
 impl ManagedServiceFile {
     pub(crate) fn load(path: &Path) -> Result<Self> {
-        let bytes = read_bounded(path)?;
+        let bytes = read_bounded_file(path, MAX_FILE_BYTES)?;
         let document: ManagedServiceDocument = serde_json::from_slice(&bytes)
             .with_context(|| format!("Managed Service file is invalid: {}", path.display()))?;
         if document.schema_version != SCHEMA_VERSION {
@@ -113,19 +111,6 @@ impl ReadinessDocument {
             .validate(),
         }
     }
-}
-
-fn read_bounded(path: &Path) -> Result<Vec<u8>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open Managed Service file {}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read Managed Service file {}", path.display()))?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        bail!("Managed Service file exceeds {MAX_FILE_BYTES} bytes");
-    }
-    Ok(bytes)
 }
 
 fn validate_runtime_config_path(path: &Path) -> Result<()> {
@@ -313,7 +298,7 @@ mod tests {
 
         let error = ManagedServiceFile::load(&path).expect_err("oversized file");
 
-        assert!(error.to_string().contains("exceeds 1048576 bytes"));
+        assert!(format!("{error:#}").contains("exceeds the 1048576-byte limit"));
     }
 
     #[test]

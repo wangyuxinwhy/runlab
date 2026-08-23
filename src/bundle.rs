@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use tempfile::TempDir;
 
-use crate::integrity::{ensure_private_directory, write_new_output};
+use crate::integrity::{ensure_private_directory, sync_directory, write_new_output};
 use crate::runtime::RuntimeConfig;
 
 #[derive(Debug)]
@@ -135,13 +135,6 @@ fn verify_entry(bundle: &Path, entry: &Path, expected: EntryKind) -> Result<()> 
         bail!("OCI bundle path escapes the bundle: {}", entry.display());
     }
     Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    fs::File::open(path)
-        .with_context(|| format!("failed to open directory {}", path.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to fsync directory {}", path.display()))
 }
 
 #[cfg(test)]

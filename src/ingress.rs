@@ -15,7 +15,7 @@ use crate::core::{
     Architecture, Digest, OCI_IMAGE_CONFIG, OCI_IMAGE_INDEX, OCI_IMAGE_MANIFEST, OCI_LAYER_GZIP,
     OCI_LAYER_TAR, OCI_LAYER_ZSTD, OciDescriptor, Platform,
 };
-use crate::integrity::digest_bytes;
+use crate::integrity::{digest_bytes, read_bounded};
 use crate::oci::{MAX_IMAGE_LAYERS, OciLayout};
 
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
@@ -1010,20 +1010,6 @@ fn verify_descriptor_bytes(bytes: &[u8], descriptor: &OciDescriptor) -> Result<(
         );
     }
     Ok(())
-}
-
-fn read_bounded(mut reader: impl Read, limit: u64, name: &str) -> Result<Vec<u8>> {
-    let capacity = usize::try_from(limit.min(1024 * 1024)).context("input limit overflow")?;
-    let mut bytes = Vec::with_capacity(capacity);
-    reader
-        .by_ref()
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {name}"))?;
-    if u64::try_from(bytes.len()).context("input size overflow")? > limit {
-        bail!("{name} exceeds the {limit}-byte limit");
-    }
-    Ok(bytes)
 }
 
 fn blob_member(digest: &Digest) -> Vec<u8> {

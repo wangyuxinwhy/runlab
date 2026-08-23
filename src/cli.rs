@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -28,7 +27,9 @@ use crate::image_ingress::{
     ImageImportResult as IngressImportResult, ImagePullResult as IngressPullResult,
 };
 use crate::ingress::ImportSourceKind;
-use crate::integrity::{digest_bytes, ensure_private_directory, write_new_output};
+use crate::integrity::{
+    digest_bytes, ensure_private_directory, read_bounded_file, write_new_output,
+};
 use crate::maintenance::{
     RunVerifyResult, StateGcApplyResult, StateGcPlan, StateGcPlanResult, StateVerifyResult,
 };
@@ -1445,31 +1446,6 @@ fn emit(value: &impl Serialize) -> Result<()> {
     let mut lock = stdout.lock();
     serde_json::to_writer(&mut lock, value).context("failed to serialize JSON output")?;
     writeln!(lock).context("failed to write JSON output")
-}
-
-fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let size = file
-        .metadata()
-        .with_context(|| format!("failed to inspect {}", path.display()))?
-        .len();
-    if size > max_bytes {
-        bail!(
-            "{} exceeds the {max_bytes}-byte input limit",
-            path.display()
-        );
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(size).context("input is too large")?);
-    file.take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    if u64::try_from(bytes.len()).context("input is too large")? > max_bytes {
-        bail!(
-            "{} exceeds the {max_bytes}-byte input limit",
-            path.display()
-        );
-    }
-    Ok(bytes)
 }
 
 fn absolute_path(path: &Path) -> Result<String> {

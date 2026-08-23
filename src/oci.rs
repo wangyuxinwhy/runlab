@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,7 @@ use tempfile::NamedTempFile;
 use crate::core::{Digest, OCI_IMAGE_INDEX, OCI_IMAGE_MANIFEST, OciDescriptor, Platform};
 use crate::integrity::{
     canonical_json, digest_reader, ensure_private_directory, finish_sha256, open_regular_lock,
+    read_bounded, replace_private, set_private_file, sync_directory, write_new_private,
 };
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
@@ -203,12 +204,12 @@ impl OciLayout {
 
     pub fn get_bytes(&self, digest: &Digest) -> Result<Vec<u8>> {
         let file = self.open_verified(digest, None)?;
-        read_bounded_reader(file, MAX_JSON_BYTES, &digest.to_string())
+        read_bounded(file, MAX_JSON_BYTES, &digest.to_string())
     }
 
     pub fn get_descriptor_bytes(&self, descriptor: &OciDescriptor) -> Result<Vec<u8>> {
         let file = self.open_descriptor(descriptor)?;
-        read_bounded_reader(file, MAX_JSON_BYTES, &descriptor.digest.to_string())
+        read_bounded(file, MAX_JSON_BYTES, &descriptor.digest.to_string())
     }
 
     pub fn get_json(&self, descriptor: &OciDescriptor) -> Result<Value> {
@@ -489,12 +490,12 @@ impl OciLayout {
 
     fn read_index(&self) -> Result<Value> {
         let path = self.root.join("index.json");
-        let bytes = read_bounded(&path, MAX_JSON_BYTES)?;
+        let bytes = read_bounded_json(&path)?;
         serde_json::from_slice(&bytes).context("local OCI Image Layout index.json is invalid")
     }
 
     fn validate_layout_files(&self) -> Result<()> {
-        let marker = read_bounded(&self.root.join("oci-layout"), MAX_JSON_BYTES)?;
+        let marker = read_bounded_json(&self.root.join("oci-layout"))?;
         let marker: Value =
             serde_json::from_slice(&marker).context("OCI Layout marker is invalid")?;
         if marker
@@ -562,7 +563,7 @@ impl OciLayout {
             if u64::try_from(bytes.len()).context("OCI index size overflow")? > MAX_JSON_BYTES {
                 bail!("local OCI Image Layout index exceeds {MAX_JSON_BYTES} bytes");
             }
-            atomic_replace_private(&path, &bytes)?;
+            replace_private(&path, &bytes)?;
         }
         Ok(result)
     }
@@ -627,6 +628,14 @@ fn open_regular_nofollow(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn read_bounded_json(path: &Path) -> Result<Vec<u8>> {
+    read_bounded(
+        open_regular_nofollow(path)?,
+        MAX_JSON_BYTES,
+        &path.display().to_string(),
+    )
+}
+
 fn copy_and_digest(mut reader: impl Read, destination: &mut File) -> Result<(Digest, u64)> {
     let mut writer = BufWriter::with_capacity(COPY_BUFFER_BYTES, destination);
     let mut hasher = Sha256::new();
@@ -650,92 +659,6 @@ fn copy_and_digest(mut reader: impl Read, destination: &mut File) -> Result<(Dig
     writer.flush().context("failed to flush OCI blob")?;
     let digest = finish_sha256(hasher);
     Ok((digest, size))
-}
-
-fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    let file = open_regular_nofollow(path)?;
-    read_bounded_reader(file, max_bytes, &path.display().to_string())
-}
-
-fn read_bounded_reader(mut file: File, max_bytes: u64, name: &str) -> Result<Vec<u8>> {
-    let size = file
-        .metadata()
-        .with_context(|| format!("failed to inspect {name}"))?
-        .len();
-    if size > max_bytes {
-        bail!("{name} exceeds the {max_bytes}-byte JSON limit");
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(size).context("file is too large")?);
-    Read::by_ref(&mut file)
-        .take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {name}"))?;
-    if u64::try_from(bytes.len()).context("file is too large")? > max_bytes {
-        bail!("{name} exceeds the {max_bytes}-byte JSON limit");
-    }
-    Ok(bytes)
-}
-
-fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    writer
-        .write_all(bytes)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    writer
-        .flush()
-        .with_context(|| format!("failed to flush {}", path.display()))?;
-    writer
-        .get_ref()
-        .sync_all()
-        .with_context(|| format!("failed to fsync {}", path.display()))?;
-    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
-}
-
-fn atomic_replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("atomic replacement path has no parent")?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create replacement for {}", path.display()))?;
-    set_private_file(temporary.as_file())?;
-    temporary
-        .write_all(bytes)
-        .with_context(|| format!("failed to write replacement for {}", path.display()))?;
-    temporary
-        .as_file_mut()
-        .sync_all()
-        .with_context(|| format!("failed to fsync replacement for {}", path.display()))?;
-    let temporary_path = temporary.into_temp_path();
-    fs::rename(&temporary_path, path)
-        .with_context(|| format!("failed to publish replacement for {}", path.display()))?;
-    sync_directory(parent)
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("failed to open directory {}", path.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to fsync directory {}", path.display()))
-}
-
-fn set_private_file(file: &File) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .context("failed to set owner-only file permissions")?;
-    }
-    Ok(())
 }
 
 fn validate_reference(reference: &str) -> Result<()> {

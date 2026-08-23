@@ -26,7 +26,7 @@ use crate::core::{
 };
 #[cfg(test)]
 use crate::filesystem::ContentStore;
-use crate::integrity::{canonical_json, digest_reader};
+use crate::integrity::{canonical_json, digest_reader, sync_directory};
 use crate::oci::{MAX_IMAGE_LAYERS, OciLayout};
 use crate::render::{FilesystemDiff, ImageRenderer, layer_diff_id};
 #[cfg(target_os = "linux")]
@@ -766,13 +766,6 @@ fn deterministic_header(size: u64) -> Header {
     header.set_entry_type(EntryType::Regular);
     header.set_cksum();
     header
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("failed to open directory {}", path.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to fsync directory {}", path.display()))
 }
 
 #[cfg(test)]

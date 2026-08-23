@@ -539,11 +539,7 @@ pub(super) fn privileged_file_to_stdout(path: &str) -> Result<()> {
 }
 
 pub(super) fn write_new_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    Ok(())
+    write_new_private(path, &canonical_json(value)?)
 }
 
 #[cfg(unix)]

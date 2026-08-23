@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::core::{Digest, RunResolverFacts, RunResolverSource};
-use crate::integrity::digest_bytes;
+use crate::integrity::{digest_bytes, sync_directory};
 
 const ETC_RESOLV_CONF: &str = "/etc/resolv.conf";
 const SYSTEMD_RESOLVED_UPLINK: &str = "/run/systemd/resolve/resolv.conf";
@@ -96,7 +96,7 @@ impl ResolverConfig {
     }
 
     fn read_from_paths(primary: &Path, fallback: &Path) -> Result<Self> {
-        let primary_bytes = read_bounded(primary, "host resolver configuration")?;
+        let primary_bytes = read_verified_resolver_file(primary, "host resolver configuration")?;
         let primary_candidates = parse_nameservers(&primary_bytes, primary)?;
         if !primary_candidates.usable.is_empty() {
             return Self::from_addresses(
@@ -111,7 +111,8 @@ impl ResolverConfig {
             );
         }
 
-        let fallback_bytes = read_bounded(fallback, "systemd-resolved uplink configuration")?;
+        let fallback_bytes =
+            read_verified_resolver_file(fallback, "systemd-resolved uplink configuration")?;
         let fallback_candidates = parse_nameservers(&fallback_bytes, fallback)?;
         if fallback_candidates.usable.is_empty() {
             bail!(
@@ -617,7 +618,9 @@ fn is_usable_nameserver(address: Ipv4Addr) -> bool {
         || (octets[0] == 10 && octets[1] == 240))
 }
 
-fn read_bounded(path: &Path, description: &str) -> Result<Vec<u8>> {
+/// Read a host resolver file and bind the bytes to the inode and size observed
+/// on the same descriptor, so a swap between `stat` and `read` is rejected.
+fn read_verified_resolver_file(path: &Path, description: &str) -> Result<Vec<u8>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open {description} {}", path.display()))?;
     let metadata = file
@@ -907,13 +910,6 @@ fn verify_no_symlink_components(path: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("failed to open directory {}", path.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to fsync directory {}", path.display()))
 }
 
 #[cfg(test)]

@@ -43,7 +43,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 use crate::core::Digest;
-use crate::integrity::finish_sha256;
+use crate::integrity::{canonical_json, finish_sha256, write_new_private};
 use crate::signal::TerminationFlag;
 use crate::subprocess::{bounded_output, bounded_status_with_stdout};
 

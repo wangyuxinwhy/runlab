@@ -121,12 +121,94 @@ pub(crate) fn open_regular_lock(path: &Path, create: bool, description: &str) ->
     Ok(file)
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
-    let directory = fs::File::open(path)
-        .with_context(|| format!("failed to open directory {}", path.display()))?;
-    directory
+/// Durably record a directory entry change. Every publish in this crate pairs a
+/// file `sync_all` with this call; without it a crash can lose the rename that
+/// made the file reachable.
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("failed to open directory {}", path.display()))?
         .sync_all()
         .with_context(|| format!("failed to fsync directory {}", path.display()))
+}
+
+/// Restrict a file to its owner. The crate keeps every derived artifact private
+/// because Run state can contain captured process output.
+pub(crate) fn set_private_file(file: &File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .context("failed to set owner-only file permissions")?;
+    }
+    Ok(())
+}
+
+/// Publish `bytes` at `path` as a new private file, refusing to replace an
+/// existing one. Crash-atomic: readers observe either no file or all the bytes.
+pub(crate) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    persist_private(path, bytes, Publish::New)
+}
+
+/// Atomically replace `path` with `bytes`, keeping the file private.
+pub(crate) fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    persist_private(path, bytes, Publish::Replace)
+}
+
+#[derive(Clone, Copy)]
+enum Publish {
+    New,
+    Replace,
+}
+
+fn persist_private(path: &Path, bytes: &[u8], publish: Publish) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create replacement for {}", path.display()))?;
+    set_private_file(temporary.as_file())?;
+    temporary
+        .write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .with_context(|| format!("failed to fsync {}", path.display()))?;
+    match publish {
+        Publish::New => {
+            temporary
+                .persist_noclobber(path)
+                .map_err(|error| error.error)
+                .with_context(|| format!("failed to publish {}", path.display()))?;
+        }
+        Publish::Replace => {
+            let temporary = temporary.into_temp_path();
+            fs::rename(&temporary, path)
+                .with_context(|| format!("failed to publish replacement for {}", path.display()))?;
+        }
+    }
+    sync_directory(parent)
+}
+
+/// Read at most `limit` bytes from `path`, refusing anything larger.
+pub(crate) fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let name = path.display().to_string();
+    let file = File::open(path).with_context(|| format!("failed to open {name}"))?;
+    read_bounded(file, limit, &name)
+}
+
+/// Read at most `limit` bytes from `reader`, refusing anything larger.
+pub(crate) fn read_bounded(reader: impl Read, limit: u64, name: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {name}"))?;
+    if u64::try_from(bytes.len()).context("content size overflow")? > limit {
+        bail!("{name} exceeds the {limit}-byte limit");
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
