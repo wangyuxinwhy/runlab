@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native and Docker implementations of the Run Protocol"
+repository = "https://github.com/wangyuxinwhy/runlab"
 license = "MIT"
 publish = false
 
 [dependencies]
-run_protocol = { path = "../run_protocol" }
+oci-spec = { version = "0.10.0", default-features = false, features = ["image"] }
+run_protocol = { version = "0.1.0", path = "../run_protocol" }
+thiserror = "2.0.18"
 
 [lints.rust]
 unsafe_code = "forbid"

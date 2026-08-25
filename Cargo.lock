@@ -1336,7 +1336,9 @@ dependencies = [
 name = "run_engine"
 version = "0.1.0"
 dependencies = [
+ "oci-spec",
  "run_protocol",
+ "thiserror",
 ]
 
 [[package]]
