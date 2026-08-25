@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::io::{Read, Seek};
 
 use oci_spec::image::Descriptor;
 use thiserror::Error;
@@ -50,15 +50,17 @@ impl ContentError {
 /// The store has no Catalog, tag, enumeration, deletion, Run identity, or
 /// database operations. Implementations must be safe for concurrent calls.
 pub trait OciContentStore: Send + Sync {
-    /// Reads the exact bytes identified by a complete OCI Descriptor.
+    /// Opens the exact bytes identified by a complete OCI Descriptor.
     ///
-    /// The caller verifies media type, digest, and size before using the bytes;
-    /// the store must not normalize or reserialize existing content.
+    /// The returned reader starts at byte zero and supports seeking so a caller
+    /// can verify and then consume large Layers without retaining them in
+    /// memory. The caller verifies media type, digest, and size before using the
+    /// content; the store must not normalize or reserialize existing bytes.
     ///
     /// # Errors
     ///
     /// Returns [`ContentError`] when the bytes cannot be obtained exactly.
-    fn read(&self, descriptor: &Descriptor) -> Result<Arc<[u8]>, ContentError>;
+    fn open(&self, descriptor: &Descriptor) -> Result<Box<dyn OciContent>, ContentError>;
 
     /// Atomically publishes exact bytes under their expected OCI Descriptor.
     ///
@@ -70,11 +72,18 @@ pub trait OciContentStore: Send + Sync {
     ///
     /// Returns [`ContentError`] when descriptor verification or atomic
     /// publication cannot be completed.
-    fn publish(&self, descriptor: &Descriptor, bytes: &[u8]) -> Result<(), ContentError>;
+    fn publish(&self, descriptor: &Descriptor, content: &mut dyn Read) -> Result<(), ContentError>;
 }
+
+/// Seekable, streaming access to one immutable OCI content blob.
+pub trait OciContent: Read + Seek + Send {}
+
+impl<T> OciContent for T where T: Read + Seek + Send {}
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     fn assert_store_contract<T: OciContentStore>() {
@@ -87,14 +96,18 @@ mod tests {
         struct UnavailableStore;
 
         impl OciContentStore for UnavailableStore {
-            fn read(&self, _descriptor: &Descriptor) -> Result<Arc<[u8]>, ContentError> {
+            fn open(&self, _descriptor: &Descriptor) -> Result<Box<dyn OciContent>, ContentError> {
                 Err(ContentError::new(
                     ContentErrorKind::Unavailable,
                     "content is absent",
                 ))
             }
 
-            fn publish(&self, _descriptor: &Descriptor, _bytes: &[u8]) -> Result<(), ContentError> {
+            fn publish(
+                &self,
+                _descriptor: &Descriptor,
+                _content: &mut dyn Read,
+            ) -> Result<(), ContentError> {
                 Err(ContentError::new(
                     ContentErrorKind::Rejected,
                     "store is read-only",
@@ -103,5 +116,18 @@ mod tests {
         }
 
         assert_store_contract::<UnavailableStore>();
+    }
+
+    #[test]
+    fn content_handle_can_be_rewound_without_buffering_in_the_interface() {
+        let mut content: Box<dyn OciContent> = Box::new(Cursor::new(b"exact".to_vec()));
+        let mut first = Vec::new();
+        content.read_to_end(&mut first).expect("first read");
+        content.rewind().expect("rewind");
+        let mut second = Vec::new();
+        content.read_to_end(&mut second).expect("second read");
+
+        assert_eq!(first, b"exact");
+        assert_eq!(second, first);
     }
 }

@@ -7,7 +7,7 @@ mod cancellation;
 mod content;
 
 pub use cancellation::CancellationToken;
-pub use content::{ContentError, ContentErrorKind, OciContentStore};
+pub use content::{ContentError, ContentErrorKind, OciContent, OciContentStore};
 
 use run_protocol::{EngineError, RunInput, RunOutput};
 
