@@ -1,0 +1,18 @@
+[package]
+name = "run_engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Native and Docker implementations of the Run Protocol"
+license = "MIT"
+publish = false
+
+[dependencies]
+run_protocol = { path = "../run_protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"

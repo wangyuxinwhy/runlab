@@ -1,0 +1,15 @@
+[package]
+name = "run_protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Data model and invariants for the Run Protocol"
+license = "MIT"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"
