@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Data model and invariants for the Run Protocol"
+repository = "https://github.com/wangyuxinwhy/runlab"
 license = "MIT"
 publish = false
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+oci-spec = { version = "0.10.0", default-features = false, features = ["image", "runtime"] }
+serde = "1.0.229"
+serde_json = "1.0.151"
+thiserror = "2.0.18"
 
 [lints.rust]
 unsafe_code = "forbid"

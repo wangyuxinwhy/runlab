@@ -1342,6 +1342,13 @@ dependencies = [
 [[package]]
 name = "run_protocol"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "oci-spec",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "runlab"
