@@ -215,30 +215,30 @@ impl FilesystemView {
         limits: RenderLimits,
     ) -> Result<()> {
         let mut components = requested.components().peekable();
-        let mut current = FsPath::from_relative(b"", limits.path_bytes)
-            .context("resolver projection path is invalid")?;
+        let mut current =
+            FsPath::from_relative(b"", limits.path_bytes).context("Image path is invalid")?;
         while let Some(component) = components.next() {
             current = current
                 .join_component(component, limits.path_bytes)
-                .context("resolver projection path is invalid")?;
+                .context("Image path is invalid")?;
             let last = components.peek().is_none();
             match (self.nodes.get(&current).map(|node| &node.kind), last) {
                 (Some(NodeKind::Directory), false) | (Some(NodeKind::Regular(_)), true) => {}
                 (None, false) if self.has_descendant(&current) => {}
                 (Some(NodeKind::Symlink(_)), _) => bail!(
-                    "resolver projection path contains a symbolic link in the Initial Image: {}",
+                    "Image path contains a symbolic link in the Initial Image: {}",
                     display_path(&current)
                 ),
                 (Some(_), true) => bail!(
-                    "resolver projection target is not a regular file in the Initial Image: {}",
+                    "Image path is not a regular file in the Initial Image: {}",
                     display_path(requested)
                 ),
                 (Some(_), false) => bail!(
-                    "resolver projection parent is not a directory in the Initial Image: {}",
+                    "Image path parent is not a directory in the Initial Image: {}",
                     display_path(&current)
                 ),
                 (None, _) => bail!(
-                    "resolver projection target is absent from the Initial Image: {}; missing {}",
+                    "Image path is absent from the Initial Image: {}; missing {}",
                     display_path(requested),
                     display_path(&current)
                 ),
@@ -708,12 +708,36 @@ impl ImageRenderer {
         image: &ImageView,
         path: &[u8],
     ) -> Result<()> {
-        let requested = path_from_request(path, self.limits)?;
-        if requested.is_root() {
-            bail!("resolver projection target must not be the filesystem root");
-        }
+        self.verify_regular_paths_without_symlinks(image, &[(path, "Image path")])
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_regular_paths_without_symlinks(
+        &self,
+        image: &ImageView,
+        paths: &[(&[u8], &str)],
+    ) -> Result<()> {
+        let requested = paths
+            .iter()
+            .map(|(path, label)| {
+                let requested = path_from_request(path, self.limits)
+                    .with_context(|| format!("{label} is invalid"))?;
+                if requested.is_root() {
+                    bail!("{label} must not be the filesystem root");
+                }
+                Ok((requested, *label))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let view = self.filesystem_view(image, false)?;
-        view.verify_regular_path_without_symlinks(&requested, self.limits)
+        for (requested, label) in requested {
+            view.verify_regular_path_without_symlinks(&requested, self.limits)
+                .with_context(|| {
+                    format!(
+                        "{label} is not a supported regular file destination in the Initial Image"
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn diff(&self, before: &ImageView, after: &ImageView) -> Result<FilesystemDiff> {
@@ -1760,7 +1784,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolver_target_accepts_implicit_directories_but_rejects_symlinks() {
+    fn regular_image_path_accepts_implicit_directories_and_rejects_invalid_targets() {
         let limits = RenderLimits::default();
         let target = path(b"etc/resolv.conf");
         let mut implicit = FilesystemView::default();
@@ -1837,6 +1861,16 @@ mod tests {
             format!("{error:#}").contains("contains a symbolic link"),
             "{error:#}"
         );
+
+        for (requested, expected) in [
+            (b"etc".as_slice(), "not a regular file"),
+            (b"missing".as_slice(), "absent"),
+        ] {
+            let error = explicit
+                .verify_regular_path_without_symlinks(&path(requested), limits)
+                .expect_err("non-regular target must be rejected");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 
     #[test]

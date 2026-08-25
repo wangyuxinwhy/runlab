@@ -22,7 +22,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::image::ImageService;
@@ -122,6 +122,21 @@ enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(super) enum NetworkArg {
+    None,
+    Egress,
+}
+
+impl From<NetworkArg> for crate::core::NetworkControl {
+    fn from(value: NetworkArg) -> Self {
+        match value {
+            NetworkArg::None => Self::None,
+            NetworkArg::Egress => Self::Egress,
+        }
+    }
 }
 
 pub fn run() -> Result<u8> {

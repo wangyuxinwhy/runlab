@@ -53,6 +53,7 @@ mod materialize;
 #[cfg(target_os = "linux")]
 mod native;
 mod oci;
+mod profiling;
 mod reconciliation;
 mod render;
 mod runtime;

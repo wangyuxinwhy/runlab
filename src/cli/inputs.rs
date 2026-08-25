@@ -13,22 +13,28 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::catalog::ImageSelector;
-use crate::core::{Digest, OciDescriptor, ServiceName, TcpReadinessCondition};
+use crate::core::{Digest, NetworkControl, OciDescriptor, ServiceName, TcpReadinessCondition};
 use crate::integrity::{digest_bytes, read_bounded_file, write_new_output};
 use crate::runtime::RuntimeConfig;
 use crate::topology::ManagedServiceFile;
 
 use super::image::resolve_image;
-use super::{absolute_path, emit, image_service};
+use super::{NetworkArg, absolute_path, emit, image_service};
 
 pub(super) fn run_runtime_config(state: &Path, command: RuntimeConfigCommand) -> Result<u8> {
     match command {
-        RuntimeConfigCommand::Create { image, output } => {
+        RuntimeConfigCommand::Create {
+            image,
+            output,
+            network,
+        } => {
             let images = image_service(state)?;
             let (resolved, requested_reference) = resolve_image(state, &images, &image)?;
             let manifest_digest = resolved.manifest.digest;
-            let runtime =
-                RuntimeConfig::from_image_config(&images.image_config(&manifest_digest)?)?;
+            let runtime = RuntimeConfig::from_image_config(
+                &images.image_config(&manifest_digest)?,
+                NetworkControl::from(network),
+            )?;
             let bytes = runtime.encoded()?;
             write_new_output(&output, &bytes)?;
             emit(&RuntimeConfigCreateResult {
@@ -88,6 +94,9 @@ pub(super) enum RuntimeConfigCommand {
         image: ImageSelector,
         #[arg(long, value_name = "FILE")]
         output: PathBuf,
+        /// Run network provisioning this config accompanies; egress inherits a Run-owned namespace.
+        #[arg(long, value_enum, default_value_t = NetworkArg::None)]
+        network: NetworkArg,
     },
     /// Validate an OCI Runtime config.json without selecting an execution backend.
     Check { path: PathBuf },

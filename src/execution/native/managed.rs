@@ -25,7 +25,7 @@ use crate::core::{
 use crate::filesystem::Inventory;
 use crate::native::backend::{
     NativeBackend, NativeExecutionMode, NativePreflight, PreparedRuncRun, RuncCaptureLimits,
-    RuncRunner, RuncStopReason, verify_resolver_target,
+    RuncRunner, RuncStopReason, verify_file_mount_destinations, verify_resolver_target,
 };
 use crate::native::network::{NativeNetworkBinding, RunNetwork};
 use crate::native::read_only_file::VerifiedSourceFile;
@@ -110,9 +110,9 @@ impl Runner<'_> {
                             run_id,
                             controls: &input.controls,
                             stdin: input.stdin,
-                            primary_manifest: input.initial_manifest,
+                            primary_image: &prepared.primary_image,
                             primary_runtime: input.runtime,
-                            service_manifest: service.initial_manifest,
+                            service_image: &prepared.service_image,
                             service_runtime: service.runtime,
                             capture_limits: prepared.preflight.capture_limits,
                             cancelled: cancellation.flag(),
@@ -191,6 +191,18 @@ impl Runner<'_> {
             backend.preflight_managed(runtime, service.runtime, controls, &state_root)?;
         verify_platform("Primary", &primary_image, &preflight.facts)?;
         verify_platform("Managed Service", &service_image, &preflight.facts)?;
+        verify_file_mount_destinations(
+            self.images,
+            &primary_image,
+            &preflight.primary_files,
+            Some("primary"),
+        )?;
+        verify_file_mount_destinations(
+            self.images,
+            &service_image,
+            &preflight.managed_service_files,
+            Some("managed_service"),
+        )?;
         Ok(ManagedPreparation {
             primary_image,
             service_image,
@@ -260,7 +272,7 @@ impl Runner<'_> {
         let primary_execution = NativeExecution {
             runner: runc,
             mode: NativeExecutionMode::Rootful,
-            initial_manifest: input.primary_manifest,
+            initial_image: input.primary_image,
             bundle_runtime: input.primary_runtime,
             controls: input.controls,
             stdin: input.stdin,
@@ -276,7 +288,7 @@ impl Runner<'_> {
         let service_execution = NativeExecution {
             runner: runc,
             mode: NativeExecutionMode::Rootful,
-            initial_manifest: input.service_manifest,
+            initial_image: input.service_image,
             bundle_runtime: input.service_runtime,
             controls: &service_controls,
             stdin: &[],
@@ -593,9 +605,9 @@ struct ManagedNativeInput<'a> {
     run_id: RunId,
     controls: &'a RunControls,
     stdin: &'a [u8],
-    primary_manifest: &'a Digest,
+    primary_image: &'a ImageView,
     primary_runtime: &'a RuntimeConfig,
-    service_manifest: &'a Digest,
+    service_image: &'a ImageView,
     service_runtime: &'a RuntimeConfig,
     capture_limits: RuncCaptureLimits,
     cancelled: &'a AtomicBool,

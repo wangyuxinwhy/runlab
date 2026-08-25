@@ -169,7 +169,9 @@ impl ImageService {
         if layers.len() != diff_ids.len() {
             bail!("OCI Image has inconsistent Layer and DiffID counts");
         }
-        self.verify_diff_ids(&layers, &diff_ids)?;
+        crate::profiling::measure("image.inspect.verify_diff_ids", || {
+            self.verify_diff_ids(&layers, &diff_ids)
+        })?;
         let view = ImageView {
             manifest,
             config,
@@ -180,7 +182,9 @@ impl ImageService {
             added_layers: Vec::new(),
         };
         view.validate()?;
-        ImageRenderer::new(self.layout.clone()).verify(&view)?;
+        crate::profiling::measure("image.inspect.verify_filesystem", || {
+            ImageRenderer::new(self.layout.clone()).verify(&view)
+        })?;
         Ok(view)
     }
 
@@ -194,6 +198,15 @@ impl ImageService {
         path: &[u8],
     ) -> Result<()> {
         ImageRenderer::new(self.layout.clone()).verify_regular_path_without_symlinks(image, path)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_regular_paths_without_symlinks(
+        &self,
+        image: &ImageView,
+        paths: &[(&[u8], &str)],
+    ) -> Result<()> {
+        ImageRenderer::new(self.layout.clone()).verify_regular_paths_without_symlinks(image, paths)
     }
 
     pub fn image_config(&self, manifest_digest: &Digest) -> Result<Value> {
@@ -237,14 +250,30 @@ impl ImageService {
         workspace: &Path,
         ownership: FilesystemOwnership,
     ) -> Result<MaterializedRootfs> {
-        let image = self.inspect(manifest_digest)?;
-        crate::materialize::materialize_at_with_ownership(
-            &self.layout,
-            &image,
-            crate::render::RenderLimits::default(),
-            workspace,
-            ownership,
-        )
+        let image = crate::profiling::measure("materialize.image_inspect", || {
+            self.inspect(manifest_digest)
+        })?;
+        self.materialize_inspected_rootfs_at(&image, workspace, ownership)
+    }
+
+    /// Materialize an Image whose exact bytes and filesystem were already
+    /// verified at the Run acceptance boundary.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn materialize_inspected_rootfs_at(
+        &self,
+        image: &ImageView,
+        workspace: &Path,
+        ownership: FilesystemOwnership,
+    ) -> Result<MaterializedRootfs> {
+        crate::profiling::measure("materialize.write_rootfs", || {
+            crate::materialize::materialize_at_with_ownership(
+                &self.layout,
+                image,
+                crate::render::RenderLimits::default(),
+                workspace,
+                ownership,
+            )
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -257,17 +286,47 @@ impl ImageService {
         captured_at: DateTime<Utc>,
         staging_parent: &Path,
     ) -> Result<CaptureResult> {
-        let changes = crate::changeset::compare(before, &after.inventory)?;
-        let staged = LayerEncoder::default().stage_in(&changes, &after.contents, staging_parent)?;
-        let layer = self.publish_staged_layer(staged)?;
-        self.publish_final_image(
-            parent_manifest,
-            layer,
-            &CaptureMetadata {
-                captured_at,
-                action: CaptureAction::Run(run_id.to_string()),
-            },
+        let parent =
+            crate::profiling::measure("capture.parent_inspect", || self.inspect(parent_manifest))?;
+        self.capture_inspected_filesystem(
+            &parent,
+            before,
+            after,
+            run_id,
+            captured_at,
+            staging_parent,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn capture_inspected_filesystem(
+        &self,
+        parent: &ImageView,
+        before: &Inventory,
+        after: &CapturedTree,
+        run_id: &RunId,
+        captured_at: DateTime<Utc>,
+        staging_parent: &Path,
+    ) -> Result<CaptureResult> {
+        let changes = crate::profiling::measure("capture.compare", || {
+            crate::changeset::compare(before, &after.inventory)
+        })?;
+        let staged = crate::profiling::measure("capture.layer_encode", || {
+            LayerEncoder::default().stage_in(&changes, &after.contents, staging_parent)
+        })?;
+        let layer = crate::profiling::measure("capture.layer_publish", || {
+            self.publish_staged_layer(staged)
+        })?;
+        crate::profiling::measure("capture.final_image_publish", || {
+            self.publish_final_image_from_parent(
+                parent,
+                layer,
+                &CaptureMetadata {
+                    captured_at,
+                    action: CaptureAction::Run(run_id.to_string()),
+                },
+            )
+        })
     }
 
     pub fn get_file(
@@ -360,6 +419,20 @@ impl ImageService {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    fn publish_final_image_from_parent(
+        &self,
+        parent: &ImageView,
+        layer: FinalLayer,
+        capture: &CaptureMetadata,
+    ) -> Result<CaptureResult> {
+        let image = self.assemble_final_image_from_parent(parent, layer, capture)?;
+        Ok(CaptureResult {
+            image,
+            cleanup_error: None,
+        })
+    }
+
     pub(crate) fn publish_staged_layer(&self, mut staged: StagedLayer) -> Result<FinalLayer> {
         let expected = staged.descriptor.clone();
         let descriptor =
@@ -407,8 +480,20 @@ impl ImageService {
         layer: FinalLayer,
         capture: &CaptureMetadata,
     ) -> Result<ImageView> {
-        let parent = self.inspect(parent_manifest)?;
-        let layer = self.verify_stored_final_layer(layer.descriptor, layer.diff_id)?;
+        let parent =
+            crate::profiling::measure("capture.parent_inspect", || self.inspect(parent_manifest))?;
+        self.assemble_final_image_from_parent(&parent, layer, capture)
+    }
+
+    fn assemble_final_image_from_parent(
+        &self,
+        parent: &ImageView,
+        layer: FinalLayer,
+        capture: &CaptureMetadata,
+    ) -> Result<ImageView> {
+        let layer = crate::profiling::measure("capture.final_layer_verify", || {
+            self.verify_stored_final_layer(layer.descriptor, layer.diff_id)
+        })?;
         let parent_config = self.layout.get_json(&parent.config)?;
         let config_value = final_config_value(&parent_config, &layer.diff_id, capture)?;
         let config = self
@@ -422,34 +507,32 @@ impl ImageService {
         let manifest = self
             .layout
             .put_bytes(&canonical_json(&manifest_value)?, OCI_IMAGE_MANIFEST)?;
-        let inspected = self.inspect(&manifest.digest)?;
-        let expected_layers = parent
+        let layers = parent
             .layers
             .iter()
             .cloned()
             .chain(std::iter::once(layer.descriptor.clone()))
             .collect::<Vec<_>>();
-        let expected_diff_ids = parent
+        let diff_ids = parent
             .diff_ids
             .iter()
             .cloned()
             .chain(std::iter::once(layer.diff_id))
             .collect::<Vec<_>>();
-        if inspected.layers != expected_layers || inspected.diff_ids != expected_diff_ids {
-            bail!("Final OCI Image does not extend its Initial Image by exactly one Layer");
-        }
-        if inspected.platform != parent.platform {
-            bail!("Final OCI Image changed the Initial Image platform");
-        }
-        Ok(ImageView {
-            manifest: inspected.manifest,
-            config: inspected.config,
-            platform: inspected.platform,
-            layers: inspected.layers,
-            diff_ids: inspected.diff_ids,
-            parent_manifest: Some(parent.manifest.digest),
+        let image = ImageView {
+            manifest,
+            config,
+            platform: parent.platform,
+            layers,
+            diff_ids,
+            parent_manifest: Some(parent.manifest.digest.clone()),
             added_layers: vec![layer.descriptor.digest],
-        })
+        };
+        // The parent was fully verified before acceptance. The two new exact-byte
+        // blobs and the new Layer were produced and verified above, so rescanning
+        // all immutable parent Layers cannot add evidence about this child.
+        image.validate()?;
+        Ok(image)
     }
 
     pub(crate) fn publish_imported(

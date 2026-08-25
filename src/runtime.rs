@@ -14,7 +14,6 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Number, Value, json};
 
-#[cfg(target_os = "linux")]
 use crate::core::NetworkControl;
 use crate::integrity::canonical_json;
 
@@ -29,6 +28,7 @@ const STANDARD_MOUNT_DESTINATIONS: [&str; 5] =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeFileMount {
+    mount_index: usize,
     source: PathBuf,
     destination: PathBuf,
 }
@@ -49,6 +49,12 @@ impl NativeFileMount {
 
     #[cfg(any(test, target_os = "linux"))]
     #[must_use]
+    pub(crate) fn mount_index(&self) -> usize {
+        self.mount_index
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    #[must_use]
     pub(crate) fn destination(&self) -> &Path {
         &self.destination
     }
@@ -56,6 +62,7 @@ impl NativeFileMount {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn for_test(source: PathBuf, destination: PathBuf) -> Self {
         Self {
+            mount_index: 0,
             source,
             destination,
         }
@@ -113,7 +120,7 @@ impl RuntimeConfig {
         Ok(value)
     }
 
-    pub fn from_image_config(image: &Value) -> Result<Self> {
+    pub fn from_image_config(image: &Value, network: NetworkControl) -> Result<Self> {
         let image = image
             .as_object()
             .context("OCI Image config must be an object")?;
@@ -135,6 +142,10 @@ impl RuntimeConfig {
             Some(_) => bail!("OCI Image Config.WorkingDir must be a string"),
         };
         let user = image_user(config.get("User"))?;
+        let namespaces = match network {
+            NetworkControl::None => REQUIRED_NAMESPACES.as_slice(),
+            NetworkControl::Egress => MANAGED_NAMESPACES.as_slice(),
+        };
         let value = json!({
             "ociVersion": SUPPORTED_OCI_VERSION,
             "root": {"path": "rootfs", "readonly": false},
@@ -180,7 +191,7 @@ impl RuntimeConfig {
                 }
             ],
             "linux": {
-                "namespaces": REQUIRED_NAMESPACES.map(|kind| json!({"type": kind}))
+                "namespaces": namespaces.iter().map(|kind| json!({"type": kind})).collect::<Vec<_>>()
             }
         });
         Self::from_value(value)
@@ -431,7 +442,7 @@ fn validate_native_mounts(value: Option<&Value>) -> Result<Vec<NativeFileMount>>
         .context("OCI Runtime mounts must be an array")?;
     let mut destinations = BTreeSet::new();
     let mut file_mounts = Vec::new();
-    for mount in mounts {
+    for (mount_index, mount) in mounts.iter().enumerate() {
         let mount = mount
             .as_object()
             .context("OCI Runtime mount must be an object")?;
@@ -473,7 +484,7 @@ fn validate_native_mounts(value: Option<&Value>) -> Result<Vec<NativeFileMount>>
             ),
             "/dev/mqueue" => ("mqueue", "mqueue", &["nosuid", "noexec", "nodev"]),
             _ => {
-                file_mounts.push(validate_native_file_mount(mount, destination)?);
+                file_mounts.push(validate_native_file_mount(mount, mount_index, destination)?);
                 if file_mounts.len() > MAX_NATIVE_FILE_MOUNTS {
                     bail!(
                         "the native execution profile accepts at most {MAX_NATIVE_FILE_MOUNTS} read-only file mounts"
@@ -558,6 +569,7 @@ fn require_native_standard_mounts(value: Option<&Value>) -> Result<()> {
 
 fn validate_native_file_mount(
     mount: &Map<String, Value>,
+    mount_index: usize,
     destination: &str,
 ) -> Result<NativeFileMount> {
     let source = mount
@@ -586,6 +598,7 @@ fn validate_native_file_mount(
     validate_absolute_mount_path(&source, "source")?;
     validate_absolute_mount_path(&destination, "destination")?;
     Ok(NativeFileMount {
+        mount_index,
         source,
         destination,
     })
@@ -978,15 +991,18 @@ mod tests {
 
     #[test]
     fn image_defaults_become_explicit_runtime_config() {
-        let config = RuntimeConfig::from_image_config(&json!({
-            "config": {
-                "User": "0:0",
-                "Env": ["PATH=/usr/bin:/bin", "MODE=test"],
-                "Entrypoint": ["/bin/sh"],
-                "Cmd": ["-c", "exit 0"],
-                "WorkingDir": "/workspace"
-            }
-        }))
+        let config = RuntimeConfig::from_image_config(
+            &json!({
+                "config": {
+                    "User": "0:0",
+                    "Env": ["PATH=/usr/bin:/bin", "MODE=test"],
+                    "Entrypoint": ["/bin/sh"],
+                    "Cmd": ["-c", "exit 0"],
+                    "WorkingDir": "/workspace"
+                }
+            }),
+            NetworkControl::None,
+        )
         .expect("runtime config");
         assert_eq!(
             config.value()["process"]["args"],
@@ -994,6 +1010,25 @@ mod tests {
         );
         assert_eq!(config.value()["process"]["user"]["uid"], 0);
         RuntimeConfig::load(&config.encoded().expect("encoded")).expect("round trip");
+    }
+
+    #[test]
+    fn image_authoring_selects_the_run_network_namespace_shape() {
+        let image = json!({"config": {"Entrypoint": ["/bin/true"]}});
+        for (network, expected) in [
+            (NetworkControl::None, REQUIRED_NAMESPACES.as_slice()),
+            (NetworkControl::Egress, MANAGED_NAMESPACES.as_slice()),
+        ] {
+            let config =
+                RuntimeConfig::from_image_config(&image, network).expect("authored runtime config");
+            let actual = config.value()["linux"]["namespaces"]
+                .as_array()
+                .expect("namespace array")
+                .iter()
+                .map(|namespace| namespace["type"].as_str().expect("namespace type"))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "network={network}");
+        }
     }
 
     #[test]
@@ -1092,6 +1127,7 @@ mod tests {
             mounts[0].source(),
             Path::new("/var/runlab-input/credential")
         );
+        assert_eq!(mounts[0].mount_index(), 0);
         assert_eq!(mounts[0].destination(), Path::new("/run/credential"));
 
         for invalid in [
@@ -1170,9 +1206,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn native_profile_requires_every_standard_mount() {
-        let authored = RuntimeConfig::from_image_config(&json!({
-            "config": {"Entrypoint": ["/bin/true"]}
-        }))
+        let authored = RuntimeConfig::from_image_config(
+            &json!({
+                "config": {"Entrypoint": ["/bin/true"]}
+            }),
+            NetworkControl::None,
+        )
         .expect("authored runtime config");
         for missing in STANDARD_MOUNT_DESTINATIONS {
             let mut value = authored.value().clone();
@@ -1191,9 +1230,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn native_profile_accepts_only_a_no_swap_memory_limit() {
-        let authored = RuntimeConfig::from_image_config(&json!({
-            "config": {"Entrypoint": ["/bin/true"]}
-        }))
+        let authored = RuntimeConfig::from_image_config(
+            &json!({
+                "config": {"Entrypoint": ["/bin/true"]}
+            }),
+            NetworkControl::None,
+        )
         .expect("authored runtime config");
         let mut value = authored.value().clone();
         value["linux"]["resources"] = json!({
@@ -1222,12 +1264,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn native_network_namespace_profiles_are_distinct() {
-        let single = RuntimeConfig::from_image_config(&json!({
+        let image = json!({
             "config": {
                 "Entrypoint": ["/bin/true"]
             }
-        }))
-        .expect("single-participant runtime config");
+        });
+        let single = RuntimeConfig::from_image_config(&image, NetworkControl::None)
+            .expect("single-participant runtime config");
         single
             .validate_native_profile()
             .expect("single-participant profile");
@@ -1243,15 +1286,8 @@ mod tests {
             .expect_err("managed profile must inherit the Run network namespace");
         assert!(error.to_string().contains("managed-service"));
 
-        let mut managed = single.value().clone();
-        managed["linux"]["namespaces"]
-            .as_array_mut()
-            .expect("namespace array")
-            .retain(|namespace| namespace["type"] != "network");
-        let managed = RuntimeConfig::load(
-            &serde_json::to_vec(&managed).expect("managed runtime config JSON"),
-        )
-        .expect("managed runtime config");
+        let managed = RuntimeConfig::from_image_config(&image, NetworkControl::Egress)
+            .expect("run-network runtime config");
         managed
             .validate_native_managed_profile()
             .expect("managed-service profile");
@@ -1270,9 +1306,12 @@ mod tests {
 
     #[test]
     fn vm_mount_source_rewrite_is_structural_and_canonical() {
-        let authored = RuntimeConfig::from_image_config(&json!({
-            "config": {"Entrypoint": ["/bin/true"]}
-        }))
+        let authored = RuntimeConfig::from_image_config(
+            &json!({
+                "config": {"Entrypoint": ["/bin/true"]}
+            }),
+            NetworkControl::None,
+        )
         .expect("authored config");
         let mut value = authored.value().clone();
         value["mounts"].as_array_mut().unwrap().push(json!({

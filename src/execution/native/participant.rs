@@ -20,7 +20,7 @@ use chrono::Utc;
 
 use crate::bundle::OciBundle;
 use crate::core::{
-    BackendFacts, Digest, ImageView, NetworkControl, OperationError, ProcessFacts, ProcessOutcome,
+    BackendFacts, ImageView, NetworkControl, OperationError, ProcessFacts, ProcessOutcome,
     ProcessSlot, RunControls, RunId, StoredBytes,
 };
 use crate::filesystem::{Inventory, TreeCapture};
@@ -29,7 +29,7 @@ use crate::materialize::MaterializedRootfs;
 use crate::native::backend::{
     NativeBackend, NativeExecutionMode, PreparedRuncRun, RuncCaptureLimits, RuncExecution,
     RuncOperationErrorKind, RuncRunFailure, RuncRunResult, RuncRunner, RuncStopReason,
-    verify_resolver_target, verify_rootless_image,
+    verify_file_mount_destinations, verify_resolver_target, verify_rootless_image,
 };
 use crate::native::fs::OverlayRootfs;
 use crate::native::network::{EgressNetworkTools, NativeNetworkBinding, NativeNetworkTools};
@@ -65,7 +65,7 @@ pub(in crate::execution) struct PreparedNativeBackend {
 pub(super) struct NativeExecution<'a> {
     pub(super) runner: &'a RuncRunner,
     pub(super) mode: NativeExecutionMode,
-    pub(super) initial_manifest: &'a Digest,
+    pub(super) initial_image: &'a ImageView,
     pub(super) bundle_runtime: &'a RuntimeConfig,
     pub(super) controls: &'a RunControls,
     pub(super) stdin: &'a [u8],
@@ -279,6 +279,7 @@ impl Runner<'_> {
         if preflight.mode.is_rootless() {
             verify_rootless_image(self.images, initial, state_root, preflight.mode.ownership())?;
         }
+        verify_file_mount_destinations(self.images, initial, &preflight.primary_files, None)?;
         Ok((
             preflight.facts,
             PreparedBackend::Native(Box::new(PreparedNativeBackend {
@@ -309,7 +310,7 @@ impl Runner<'_> {
             &NativeExecution {
                 runner: &prepared.runner,
                 mode: prepared.mode,
-                initial_manifest: execution.initial_manifest,
+                initial_image: execution.initial_image,
                 bundle_runtime: prepared
                     .realized_runtime
                     .as_ref()
@@ -556,8 +557,8 @@ impl Runner<'_> {
                 ))
             }
             NativeExecutionMode::Rootless { .. } => {
-                let writable = match self.images.materialize_rootfs_at(
-                    execution.initial_manifest,
+                let writable = match self.images.materialize_inspected_rootfs_at(
+                    execution.initial_image,
                     filesystem_workspace,
                     execution.mode.ownership(),
                 ) {
@@ -643,11 +644,13 @@ impl Runner<'_> {
                 return None;
             }
         };
-        let materialized = match self.images.materialize_rootfs_at(
-            execution.initial_manifest,
-            &lower_workspace,
-            execution.mode.ownership(),
-        ) {
+        let materialized = match crate::profiling::measure("native.materialize_initial", || {
+            self.images.materialize_inspected_rootfs_at(
+                execution.initial_image,
+                &lower_workspace,
+                execution.mode.ownership(),
+            )
+        }) {
             Ok(rootfs) => rootfs,
             Err(error) => {
                 state.fail_before_start("materialize", &error);
@@ -657,9 +660,10 @@ impl Runner<'_> {
         if native_cancelled(execution.cancelled, state) {
             return None;
         }
-        let before = match TreeCapture::with_ownership(execution.mode.ownership())
-            .capture_inventory(materialized.path())
-        {
+        let before = match crate::profiling::measure("native.initial_inventory", || {
+            TreeCapture::with_ownership(execution.mode.ownership())
+                .capture_inventory(materialized.path())
+        }) {
             Ok(capture) => capture,
             Err(error) => {
                 state.fail_before_start("initial_filesystem_capture", &error);
@@ -736,20 +740,25 @@ impl Runner<'_> {
                 return;
             }
         };
-        match environment.rootfs().and_then(|rootfs| {
-            TreeCapture::with_ownership(execution.mode.ownership()).capture_in(rootfs, &workspace)
+        match crate::profiling::measure("native.final_tree_capture", || {
+            environment.rootfs().and_then(|rootfs| {
+                TreeCapture::with_ownership(execution.mode.ownership())
+                    .capture_in(rootfs, &workspace)
+            })
         }) {
             Ok(after) => {
                 record_final_capture(
                     state,
-                    self.images.capture_filesystem(
-                        execution.initial_manifest,
-                        before,
-                        &after,
-                        &execution.run_id,
-                        captured_at,
-                        &workspace,
-                    ),
+                    crate::profiling::measure("native.final_image_capture", || {
+                        self.images.capture_inspected_filesystem(
+                            execution.initial_image,
+                            before,
+                            &after,
+                            &execution.run_id,
+                            captured_at,
+                            &workspace,
+                        )
+                    }),
                 );
             }
             Err(error) => state.error("final_filesystem_capture", &error),

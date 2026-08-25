@@ -43,7 +43,7 @@ impl ContentStore {
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn digest_only() -> Self {
         Self {
             directory: None,

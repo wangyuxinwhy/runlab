@@ -31,6 +31,7 @@ fn native_cli_execution_contract() {
     happy_path(&fixture);
     prepublication_staging_reconciliation(&fixture);
     read_only_sensitive_file_binding(&fixture);
+    invalid_file_mount_destinations_are_rejected_before_acceptance(&fixture);
     missing_executable(&fixture);
     timeout(&fixture);
     oom_kill(&fixture);
@@ -1098,6 +1099,59 @@ fn read_only_sensitive_file_binding(fixture: &NativeFixture) {
         "copied-sensitive-value",
     );
     fs::remove_file(source).expect("remove caller-owned sensitive source");
+    fixture.assert_cleanup();
+}
+
+fn invalid_file_mount_destinations_are_rejected_before_acceptance(fixture: &NativeFixture) {
+    let source = fixture.temp_dir.path().join("destination-preflight-source");
+    fs::write(&source, b"preflight\n").expect("preflight source");
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("preflight source mode");
+    let source = source.canonicalize().expect("canonical preflight source");
+    let runs_before = run_json(&fixture.output(&["state", "verify"]), Some(0))["runs"]
+        .as_u64()
+        .expect("Run count before destination preflight");
+
+    for (name, destination, expected) in [
+        ("missing", "/run/missing", "absent"),
+        ("directory", "/etc", "not a regular file"),
+        (
+            "symlink",
+            "/run/credential-link",
+            "contains a symbolic link",
+        ),
+    ] {
+        let runtime = fixture
+            .state()
+            .join(format!("invalid-destination-{name}.json"));
+        fs::write(
+            &runtime,
+            runtime_config_with_file_mount_at(&["/agent"], &source, destination),
+        )
+        .expect("invalid destination Runtime Config");
+        let output = fixture.output(&[
+            "run",
+            "start",
+            fixture.base_manifest.as_str(),
+            "--runtime-config",
+            runtime.to_str().expect("Runtime Config path"),
+        ]);
+        assert_eq!(output.status.code(), Some(1), "destination={destination}");
+        assert!(output.stdout.is_empty(), "destination={destination}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("mounts[5].destination"),
+            "destination={destination}: {stderr}"
+        );
+        assert!(
+            stderr.contains(expected),
+            "destination={destination}: {stderr}"
+        );
+        let runs_after = run_json(&fixture.output(&["state", "verify"]), Some(0))["runs"]
+            .as_u64()
+            .expect("Run count after destination preflight");
+        assert_eq!(runs_after, runs_before, "destination={destination}");
+    }
+
     fixture.assert_cleanup();
 }
 
@@ -2303,6 +2357,7 @@ fn fixture_layer(executable: &Path) -> Vec<u8> {
         b"hosts: dns\n",
     );
     append_fixture_entry(&mut tar, "run/credential", EntryType::Regular, 0o600, b"");
+    append_fixture_symlink(&mut tar, "run/credential-link", "credential");
     tar.finish().expect("finish Layer tar");
     tar.into_inner().expect("Layer tar bytes")
 }
@@ -2324,6 +2379,22 @@ fn append_fixture_entry(
     header.set_cksum();
     tar.append_data(&mut header, path, bytes)
         .unwrap_or_else(|error| panic!("append fixture Layer entry {path}: {error}"));
+}
+
+fn append_fixture_symlink(tar: &mut Builder<Vec<u8>>, path: &str, target: &str) {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::Symlink);
+    header.set_mode(0o777);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_size(0);
+    header
+        .set_link_name(target)
+        .expect("fixture symlink target");
+    header.set_cksum();
+    tar.append_data(&mut header, path, &[][..])
+        .unwrap_or_else(|error| panic!("append fixture Layer symlink {path}: {error}"));
 }
 
 fn put_blob(directory: &Path, bytes: &[u8], media_type: &str) -> Value {
@@ -2401,13 +2472,21 @@ fn runtime_config(arguments: &[&str]) -> Vec<u8> {
 }
 
 fn runtime_config_with_file_mount(arguments: &[&str], source: &Path) -> Vec<u8> {
+    runtime_config_with_file_mount_at(arguments, source, "/run/credential")
+}
+
+fn runtime_config_with_file_mount_at(
+    arguments: &[&str],
+    source: &Path,
+    destination: &str,
+) -> Vec<u8> {
     let mut config: Value =
         serde_json::from_slice(&runtime_config(arguments)).expect("Runtime Config JSON");
     config["mounts"]
         .as_array_mut()
         .expect("standard mounts")
         .push(json!({
-            "destination": "/run/credential",
+            "destination": destination,
             "type": "bind",
             "source": source,
             "options": ["bind", "ro", "nosuid", "nodev", "noexec"]

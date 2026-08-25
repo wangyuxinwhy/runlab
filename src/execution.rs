@@ -182,7 +182,7 @@ enum PreparedBackend {
 }
 
 struct PreparedExecution<'a> {
-    initial_manifest: &'a Digest,
+    initial_image: &'a ImageView,
     #[cfg_attr(
         not(target_os = "linux"),
         allow(
@@ -283,7 +283,7 @@ impl<'a> Runner<'a> {
     ) {
         match prepared {
             PreparedBackend::Docker(runtime) => self.execute_docker(
-                execution.initial_manifest,
+                &execution.initial_image.manifest.digest,
                 &runtime,
                 execution.controls,
                 execution.stdin,
@@ -347,31 +347,39 @@ impl<'a> Runner<'a> {
         })
     }
 
-    pub fn run_selected(
+    pub(crate) fn run_inspected(
         &self,
-        initial_manifest: &Digest,
+        initial: &ImageView,
         requested_image_reference: Option<&str>,
         runtime: &RuntimeConfig,
         runtime_bytes: &[u8],
         controls: RunControls,
         stdin: &[u8],
     ) -> Result<RunResult> {
-        let initial = self.images.inspect(initial_manifest)?;
-        let (backend, mut prepared) = self.prepare_backend(&initial, runtime, &controls)?;
+        let (backend, mut prepared) =
+            crate::profiling::measure("run.pre_acceptance.backend_preflight", || {
+                self.prepare_backend(initial, runtime, &controls)
+            })?;
         let run_id = RunId::new();
-        let mut scope = RunScope::open(self, run_id, &backend, &mut prepared)?;
-        let directory = match create_run_directory(run_id, scope.workspace().as_deref()) {
+        let mut scope = crate::profiling::measure("run.pre_acceptance.scope_open", || {
+            RunScope::open(self, run_id, &backend, &mut prepared)
+        })?;
+        let directory = match crate::profiling::measure("run.pre_acceptance.workspace", || {
+            create_run_directory(run_id, scope.workspace().as_deref())
+        }) {
             Ok(directory) => directory,
             Err(error) => return Err(scope.abort_pre_acceptance(error)),
         };
-        let accepted = self.accept_single_run(
-            run_id,
-            &initial.manifest,
-            requested_image_reference,
-            runtime_bytes,
-            &controls,
-            stdin,
-        );
+        let accepted = crate::profiling::measure("run.accept", || {
+            self.accept_single_run(
+                run_id,
+                &initial.manifest,
+                requested_image_reference,
+                runtime_bytes,
+                &controls,
+                stdin,
+            )
+        });
         let (accepted_at, runtime_slot) = match accepted {
             Ok(accepted) => accepted,
             Err(error) => {
@@ -384,35 +392,40 @@ impl<'a> Runner<'a> {
 
         let mut state = RunState::new(backend);
         let accepted = scope.mark_accepted(&mut state);
-        let execution_ready =
-            scope.start_network(self, &prepared, controls.network, accepted, &mut state)?;
+        let execution_ready = crate::profiling::measure("run.network_start", || {
+            scope.start_network(self, &prepared, controls.network, accepted, &mut state)
+        })?;
         if execution_ready {
-            self.execute_prepared(
-                prepared,
-                &PreparedExecution {
-                    initial_manifest: &initial.manifest.digest,
-                    runtime,
-                    controls: &controls,
-                    stdin,
-                    run_id,
-                    directory: directory.path(),
-                },
-                &mut scope,
-                &mut state,
-            );
+            crate::profiling::measure("run.execute", || {
+                self.execute_prepared(
+                    prepared,
+                    &PreparedExecution {
+                        initial_image: initial,
+                        runtime,
+                        controls: &controls,
+                        stdin,
+                        run_id,
+                        directory: directory.path(),
+                    },
+                    &mut scope,
+                    &mut state,
+                );
+            });
         }
-        self.terminalize(
-            TerminalInput {
-                run_id,
-                accepted_at,
-                requested_image_reference: requested_image_reference.map(ToOwned::to_owned),
-                initial_image: initial.manifest,
-                runtime_config: runtime_slot,
-                controls,
-            },
-            state,
-            &mut scope,
-        )
+        crate::profiling::measure("run.terminalize", || {
+            self.terminalize(
+                TerminalInput {
+                    run_id,
+                    accepted_at,
+                    requested_image_reference: requested_image_reference.map(ToOwned::to_owned),
+                    initial_image: initial.manifest.clone(),
+                    runtime_config: runtime_slot,
+                    controls,
+                },
+                state,
+                &mut scope,
+            )
+        })
     }
 
     fn accept_single_run(

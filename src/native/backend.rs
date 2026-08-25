@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,37 @@ const RESOLVER_TARGET: &[u8] = b"/etc/resolv.conf";
 
 /// Whether this Image can host the Run resolver projection.
 pub(crate) fn verify_resolver_target(images: &ImageService, image: &ImageView) -> Result<()> {
-    images.verify_regular_path_without_symlinks(image, RESOLVER_TARGET)
+    images
+        .verify_regular_path_without_symlinks(image, RESOLVER_TARGET)
+        .context("native egress resolver target is unsupported")
+}
+
+pub(crate) fn verify_file_mount_destinations(
+    images: &ImageService,
+    image: &ImageView,
+    files: &[VerifiedSourceFile],
+    participant: Option<&str>,
+) -> Result<()> {
+    let labels = files
+        .iter()
+        .map(|file| {
+            participant.map_or_else(
+                || format!("mounts[{}].destination", file.mount_index()),
+                |participant| {
+                    format!(
+                        "{participant}.runtime_config.mounts[{}].destination",
+                        file.mount_index()
+                    )
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let paths = files
+        .iter()
+        .zip(&labels)
+        .map(|(file, label)| (file.destination().as_os_str().as_bytes(), label.as_str()))
+        .collect::<Vec<_>>();
+    images.verify_regular_paths_without_symlinks(image, &paths)
 }
 
 /// Whether this Image survives being materialized and re-read under a rootless

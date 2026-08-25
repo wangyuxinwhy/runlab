@@ -8,7 +8,6 @@
 //! are all `hide = true` and reachable only from the host side of an
 //! operation.
 
-use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -341,11 +340,7 @@ pub(super) fn run_vm(state: Option<&PathBuf>, command: VmCommand) -> Result<u8> 
                 emit(&started)?;
                 return Ok(0);
             };
-            std::io::stdout().lock().write_all(&attached.stdout)?;
-            std::io::stderr().lock().write_all(&attached.stderr)?;
-            let exit_code = attached.status.exit_code.unwrap_or(1);
-            HostVm::new(instance.as_deref())?.complete(attached.operation_id)?;
-            Ok(exit_code)
+            finish_attached(&HostVm::new(instance.as_deref())?, attached)
         }
         VmCommand::Operation { command } => match command {
             VmOperationCommand::Get {
@@ -361,11 +356,7 @@ pub(super) fn run_vm(state: Option<&PathBuf>, command: VmCommand) -> Result<u8> 
                 output,
             } => {
                 let attached = HostVm::new(instance.as_deref())?.attach(operation_id, &output)?;
-                std::io::stdout().lock().write_all(&attached.stdout)?;
-                std::io::stderr().lock().write_all(&attached.stderr)?;
-                let exit_code = attached.status.exit_code.unwrap_or(1);
-                HostVm::new(instance.as_deref())?.complete(attached.operation_id)?;
-                Ok(exit_code)
+                finish_attached(&HostVm::new(instance.as_deref())?, attached)
             }
             VmOperationCommand::Cancel {
                 operation_id,
@@ -385,9 +376,109 @@ pub(super) fn run_vm(state: Option<&PathBuf>, command: VmCommand) -> Result<u8> 
     }
 }
 
+fn finish_attached(vm: &HostVm, attached: managed_vm::AttachedOperation) -> Result<u8> {
+    finish_attached_with(
+        attached,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+        |operation_id| vm.complete(operation_id),
+    )
+}
+
+fn finish_attached_with(
+    attached: managed_vm::AttachedOperation,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+    complete: impl FnOnce(Uuid) -> Result<()>,
+) -> Result<u8> {
+    stdout.write_all(&attached.stdout)?;
+    stderr.write_all(&attached.stderr)?;
+    let exit_code = attached.status.exit_code.unwrap_or(1);
+    if let Some(error) = attached.output_publication_error {
+        bail!(
+            "guest operation {} exited with status {exit_code}; declared output publication failed: {error}; the operation remains available for `runlab vm operation attach {}` or `runlab vm operation discard {}`",
+            attached.operation_id,
+            attached.operation_id,
+            attached.operation_id
+        );
+    }
+    complete(attached.operation_id)?;
+    Ok(exit_code)
+}
+
 pub(super) fn ensure_vm_owns_state(state: Option<&PathBuf>) -> Result<()> {
     if state.is_some() {
         bail!("vm commands do not accept host --state; use --namespace for guest state")
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    fn attached(output_publication_error: Option<String>) -> managed_vm::AttachedOperation {
+        let operation_id = Uuid::nil();
+        managed_vm::AttachedOperation {
+            operation_id,
+            status: managed_vm::VmOperationStatus {
+                schema_version: 1,
+                operation_id,
+                namespace: "test".to_owned(),
+                state: "failed/failed".to_owned(),
+                terminal: true,
+                exit_code: Some(17),
+                result: Some("exit-code".to_owned()),
+                output_count: 1,
+                runtime_config_inputs: Vec::new(),
+            },
+            stdout: b"guest stdout\n".to_vec(),
+            stderr: b"guest stderr\n".to_vec(),
+            output_publication_error,
+        }
+    }
+
+    #[test]
+    fn output_publication_failure_preserves_guest_streams_and_operation() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completed = Cell::new(false);
+        let error = finish_attached_with(
+            attached(Some("declared output is absent".to_owned())),
+            &mut stdout,
+            &mut stderr,
+            |_| {
+                completed.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("publication failure");
+
+        assert_eq!(stdout, b"guest stdout\n");
+        assert_eq!(stderr, b"guest stderr\n");
+        assert!(!completed.get());
+        let error = error.to_string();
+        assert!(error.contains("exited with status 17"));
+        assert!(error.contains("declared output publication failed"));
+        assert!(error.contains("operation remains available"));
+    }
+
+    #[test]
+    fn successful_attachment_completes_after_forwarding_streams() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completed = Cell::new(false);
+        let exit_code = finish_attached_with(attached(None), &mut stdout, &mut stderr, |_| {
+            completed.set(true);
+            Ok(())
+        })
+        .expect("successful attachment");
+
+        assert_eq!(exit_code, 17);
+        assert_eq!(stdout, b"guest stdout\n");
+        assert_eq!(stderr, b"guest stderr\n");
+        assert!(completed.get());
+    }
 }

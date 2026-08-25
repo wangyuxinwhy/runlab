@@ -37,6 +37,7 @@ impl FileIdentity {
 
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedSourceFile {
+    mount_index: usize,
     source: PathBuf,
     destination: PathBuf,
     identity: FileIdentity,
@@ -44,6 +45,16 @@ pub(crate) struct VerifiedSourceFile {
 }
 
 impl VerifiedSourceFile {
+    #[must_use]
+    pub(crate) fn mount_index(&self) -> usize {
+        self.mount_index
+    }
+
+    #[must_use]
+    pub(crate) fn destination(&self) -> &Path {
+        &self.destination
+    }
+
     pub(crate) fn verify_source(&self) -> Result<()> {
         let pinned = FileIdentity::from_metadata(
             &self
@@ -192,6 +203,7 @@ pub(crate) fn verify_sources(
         .map(|mount| {
             let (source, identity) = inspect_source(mount.source(), Some(&canonical_state_root))?;
             Ok(VerifiedSourceFile {
+                mount_index: mount.mount_index(),
                 source: mount.source().to_path_buf(),
                 destination: mount.destination().to_path_buf(),
                 identity,

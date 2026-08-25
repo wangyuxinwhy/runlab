@@ -100,6 +100,70 @@ fn imports_read_only_layout_and_archive_without_docker() {
 }
 
 #[test]
+fn runtime_config_authoring_matches_the_selected_run_network() {
+    let source = TempDir::new().expect("source directory");
+    let fixture = Fixture::write_with_config(
+        source.path(),
+        "amd64",
+        b"runtime config authoring\n",
+        &json!({"Entrypoint": ["/bin/true"]}),
+    );
+    let state = TempDir::new().expect("state");
+    let sentinel = DockerSentinel::new();
+    import_named_fixture(&sentinel, state.path(), &fixture, "local/runtime:test");
+
+    let default_path = state.path().join("default.json");
+    let explicit_none_path = state.path().join("none.json");
+    let egress_path = state.path().join("egress.json");
+    for (network, output_path) in [
+        (None, &default_path),
+        (Some("none"), &explicit_none_path),
+        (Some("egress"), &egress_path),
+    ] {
+        let mut command = runlab(&sentinel, state.path());
+        command.args([
+            "runtime-config",
+            "create",
+            "local/runtime:test",
+            "--output",
+            output_path.to_str().expect("UTF-8 output path"),
+        ]);
+        if let Some(network) = network {
+            command.args(["--network", network]);
+        }
+        let result = success_json(&command.output().expect("runtime-config create"));
+        assert_eq!(result["schema_version"], 1);
+        assert_eq!(result["manifest_digest"], fixture.manifest.digest);
+        assert_eq!(
+            result["output"],
+            output_path
+                .canonicalize()
+                .expect("canonical output path")
+                .to_str()
+                .expect("UTF-8 canonical output path")
+        );
+        assert_eq!(
+            result["size"],
+            fs::metadata(output_path).expect("output metadata").len()
+        );
+    }
+
+    assert_eq!(
+        fs::read(&default_path).expect("default config"),
+        fs::read(&explicit_none_path).expect("explicit none config")
+    );
+    assert_eq!(
+        runtime_namespace_types(&default_path),
+        ["pid", "network", "ipc", "uts", "mount", "cgroup"]
+    );
+    assert_eq!(
+        runtime_namespace_types(&egress_path),
+        ["pid", "ipc", "uts", "mount", "cgroup"]
+    );
+    assert!(!sentinel.called());
+}
+
+#[test]
 fn catalog_remove_is_idempotent_and_retains_oci_content() {
     let source = TempDir::new().expect("source directory");
     let fixture = Fixture::write(source.path(), "amd64", b"retained content\n");
@@ -1177,7 +1241,25 @@ impl Fixture {
         Self::write_with_layer(root, architecture, &layer_tar(content))
     }
 
+    fn write_with_config(
+        root: &Path,
+        architecture: &str,
+        content: &[u8],
+        container_config: &Value,
+    ) -> Self {
+        Self::write_with_layer_and_config(root, architecture, &layer_tar(content), container_config)
+    }
+
     fn write_with_layer(root: &Path, architecture: &str, layer_tar: &[u8]) -> Self {
+        Self::write_with_layer_and_config(root, architecture, layer_tar, &json!({}))
+    }
+
+    fn write_with_layer_and_config(
+        root: &Path,
+        architecture: &str,
+        layer_tar: &[u8],
+        container_config: &Value,
+    ) -> Self {
         fs::create_dir_all(root.join("blobs/sha256")).expect("blob directory");
         fs::write(
             root.join("oci-layout"),
@@ -1187,11 +1269,14 @@ impl Fixture {
 
         let layer = Blob::new(gzip(layer_tar), LAYER_GZIP);
         let config = Blob::new(
-            format!(
-                "{{\n  \"architecture\": \"{architecture}\", \"os\": \"linux\",\n  \"rootfs\": {{\"type\":\"layers\",\"diff_ids\":[\"{}\"]}},\n  \"config\": {{}}, \"x-fixture\": true\n}}\n",
-                digest(layer_tar)
-            )
-            .into_bytes(),
+            serde_json::to_vec(&json!({
+                "architecture": architecture,
+                "os": "linux",
+                "rootfs": {"type": "layers", "diff_ids": [digest(layer_tar)]},
+                "config": container_config,
+                "x-fixture": true
+            }))
+            .expect("Image Config JSON"),
             IMAGE_CONFIG,
         );
         let manifest = Blob::new(
@@ -1556,6 +1641,22 @@ fn append(builder: &mut Builder<File>, path: &str, bytes: &[u8]) {
     builder
         .append_data(&mut header, path, bytes)
         .expect("archive member");
+}
+
+fn runtime_namespace_types(path: &Path) -> Vec<String> {
+    let config: Value = serde_json::from_slice(&fs::read(path).expect("runtime config bytes"))
+        .expect("runtime config JSON");
+    config["linux"]["namespaces"]
+        .as_array()
+        .expect("runtime namespaces")
+        .iter()
+        .map(|namespace| {
+            namespace["type"]
+                .as_str()
+                .expect("runtime namespace type")
+                .to_owned()
+        })
+        .collect()
 }
 
 fn header(size: u64, entry_type: EntryType) -> Header {

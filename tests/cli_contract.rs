@@ -75,6 +75,36 @@ fn help_exposes_oci_run_and_explicit_docker_compatibility_surfaces() {
     assert!(stdout.contains("vm"));
     assert!(!stdout.contains("Base + Overlay + Task"));
     assert!(output.stderr.is_empty());
+
+    let runtime_create = run(&["runtime-config", "create", "--help"]);
+    assert!(runtime_create.status.success());
+    assert!(runtime_create.stderr.is_empty());
+    let runtime_create_help =
+        String::from_utf8(runtime_create.stdout).expect("UTF-8 runtime-config create help");
+    for expected in [
+        "--network <NETWORK>",
+        "[default: none]",
+        "[possible values: none, egress]",
+        "inherits a Run-owned namespace",
+    ] {
+        assert!(
+            runtime_create_help.contains(expected),
+            "missing {expected} in {runtime_create_help}"
+        );
+    }
+
+    let invalid_network = run(&[
+        "runtime-config",
+        "create",
+        "image:test",
+        "--output",
+        "/tmp/config.json",
+        "--network",
+        "private",
+    ]);
+    assert_eq!(invalid_network.status.code(), Some(2));
+    assert!(invalid_network.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid_network.stderr).contains("invalid value 'private'"));
 }
 
 #[test]

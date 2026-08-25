@@ -234,11 +234,6 @@ pub fn guest_remove(operation_id: Uuid) -> Result<()> {
         "systemctl stop",
     )?;
     ensure_status(&stopped, "systemctl stop")?;
-    let reset = guest_control_output(
-        Command::new("/usr/bin/sudo").args(["/usr/bin/systemctl", "reset-failed", &unit]),
-        "systemctl reset-failed",
-    )?;
-    ensure_status(&reset, "systemctl reset-failed")?;
     remove_operation_directories(operation_id)
 }
 

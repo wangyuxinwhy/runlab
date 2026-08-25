@@ -20,9 +20,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::catalog::ImageSelector;
-use crate::core::{
-    Digest, MAX_CAPTURED_STREAM_BYTES, NetworkControl, RunControls, RunId, StoredBytes,
-};
+use crate::core::{ImageView, MAX_CAPTURED_STREAM_BYTES, RunControls, RunId, StoredBytes};
 use crate::docker::DockerBackend;
 #[cfg(target_os = "linux")]
 use crate::execution::{ManagedPrimaryInput, ManagedServiceInput};
@@ -36,7 +34,7 @@ use crate::storage::{RunBytesField, RunDatabase};
 use crate::topology::ManagedServiceFile;
 
 use super::image::resolve_image;
-use super::{absolute_path, emit, image_service, run_database};
+use super::{NetworkArg, absolute_path, emit, image_service, run_database};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 3600;
 const DEFAULT_STREAM_LIMIT_BYTES: u64 = MAX_CAPTURED_STREAM_BYTES;
@@ -298,7 +296,6 @@ pub(super) fn run_start(state: &Path, arguments: RunStartArgs) -> Result<u8> {
     let images = image_service(state)?;
     let (initial_image, requested_image_reference) =
         resolve_image(state, &images, &arguments.initial_image)?;
-    let initial_manifest = initial_image.manifest.digest;
     let managed_service = managed_service
         .map(|mut service| {
             let (image, requested_reference) = resolve_image(state, &images, &service.image)?;
@@ -310,8 +307,8 @@ pub(super) fn run_start(state: &Path, arguments: RunStartArgs) -> Result<u8> {
     let result = match arguments.backend {
         RunBackendArg::Docker => {
             let docker = DockerBackend::discover()?;
-            Runner::docker(&database, &images, &docker).run_selected(
-                &initial_manifest,
+            Runner::docker(&database, &images, &docker).run_inspected(
+                &initial_image,
                 requested_image_reference.as_deref(),
                 &runtime,
                 &runtime_bytes,
@@ -322,7 +319,7 @@ pub(super) fn run_start(state: &Path, arguments: RunStartArgs) -> Result<u8> {
         RunBackendArg::Native => run_native(
             &database,
             &images,
-            &initial_manifest,
+            &initial_image,
             requested_image_reference.as_deref(),
             &runtime,
             &runtime_bytes,
@@ -343,7 +340,7 @@ pub(super) fn run_start(state: &Path, arguments: RunStartArgs) -> Result<u8> {
 pub(super) fn run_native(
     database: &RunDatabase,
     images: &ImageService,
-    initial_manifest: &Digest,
+    initial_image: &ImageView,
     requested_image_reference: Option<&str>,
     runtime: &RuntimeConfig,
     runtime_bytes: &[u8],
@@ -357,7 +354,7 @@ pub(super) fn run_native(
     match managed_service {
         Some((service, service_requested_reference)) => runner.run_with_managed_service(
             ManagedPrimaryInput {
-                initial_manifest,
+                initial_manifest: &initial_image.manifest.digest,
                 requested_image_reference,
                 runtime,
                 runtime_bytes,
@@ -378,8 +375,8 @@ pub(super) fn run_native(
                 readiness: service.declaration.readiness.clone(),
             },
         ),
-        None => runner.run_selected(
-            initial_manifest,
+        None => runner.run_inspected(
+            initial_image,
             requested_image_reference,
             runtime,
             runtime_bytes,
@@ -397,7 +394,7 @@ pub(super) fn run_native(
 pub(super) fn run_native(
     _database: &RunDatabase,
     _images: &ImageService,
-    _initial_manifest: &Digest,
+    _initial_image: &ImageView,
     _requested_image_reference: Option<&str>,
     _runtime: &RuntimeConfig,
     _runtime_bytes: &[u8],
@@ -594,21 +591,6 @@ pub(super) struct LoadedManagedService {
     image: ImageSelector,
     runtime: RuntimeConfig,
     runtime_bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(super) enum NetworkArg {
-    None,
-    Egress,
-}
-
-impl From<NetworkArg> for NetworkControl {
-    fn from(value: NetworkArg) -> Self {
-        match value {
-            NetworkArg::None => Self::None,
-            NetworkArg::Egress => Self::Egress,
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]

@@ -182,8 +182,12 @@ impl TreeCapture {
         root: &OwnedFd,
         mut new_content_store: impl FnMut() -> Result<ContentStore>,
     ) -> Result<CapturedTree> {
-        let first = self.capture_pass(&reopen_directory(root)?, new_content_store()?)?;
-        let second = self.capture_pass(&reopen_directory(root)?, new_content_store()?)?;
+        let first = crate::profiling::measure("filesystem_capture.pass_1", || {
+            self.capture_pass(&reopen_directory(root)?, ContentStore::digest_only())
+        })?;
+        let second = crate::profiling::measure("filesystem_capture.pass_2", || {
+            self.capture_pass(&reopen_directory(root)?, new_content_store()?)
+        })?;
         if first.inventory != second.inventory {
             bail!("filesystem changed between complete capture passes");
         }

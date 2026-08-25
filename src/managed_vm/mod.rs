@@ -202,6 +202,7 @@ pub struct AttachedOperation {
     pub status: VmOperationStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub output_publication_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

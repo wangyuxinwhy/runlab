@@ -374,18 +374,23 @@ impl HostVm {
         };
         let stdout = self.read_operation_stream(operation_id, "stdout", MAX_GUEST_STREAM)?;
         let stderr = self.read_operation_stream(operation_id, "stderr", MAX_GUEST_STREAM)?;
-        if outputs.len() != status.output_count {
-            bail!(
-                "operation {operation_id} requires exactly {} output destinations",
-                status.output_count
-            );
-        }
-        self.copy_outputs(operation_id, outputs)?;
+        let output_publication_error = (|| -> Result<()> {
+            if outputs.len() != status.output_count {
+                bail!(
+                    "operation {operation_id} requires exactly {} output destinations",
+                    status.output_count
+                );
+            }
+            self.copy_outputs(operation_id, outputs)
+        })()
+        .err()
+        .map(|error| format!("{error:#}"));
         Ok(AttachedOperation {
             operation_id,
             status,
             stdout,
             stderr,
+            output_publication_error,
         })
     }
 
@@ -409,11 +414,7 @@ impl HostVm {
             "Lima returned a different instance"
         );
         ensure!(instance.vm_type == "vz", "managed VM must use Lima VZ");
-        ensure!(
-            instance.lima_version == format!("v{LIMA_VERSION}"),
-            "managed VM must use Lima {LIMA_VERSION}, found {}",
-            instance.lima_version
-        );
+        validate_instance_lima_version(&instance.lima_version)?;
         ensure!(instance.config.plain, "managed VM must use Lima plain mode");
         ensure!(
             instance.config.mounts.is_empty(),
@@ -457,6 +458,14 @@ impl HostVm {
     fn ensure_ready_without_start(&self) -> Result<VmHandshake> {
         ready_handshake(self.status()?)
     }
+}
+
+fn validate_instance_lima_version(version: &str) -> Result<()> {
+    ensure!(
+        version == LIMA_VERSION,
+        "managed VM must use Lima {LIMA_VERSION}, found {version}"
+    );
+    Ok(())
 }
 
 fn ready_handshake(status: VmStatus) -> Result<VmHandshake> {
@@ -1082,6 +1091,13 @@ mod tests {
 
     use super::super::VmImage;
     use super::*;
+
+    #[test]
+    fn instance_version_matches_lima_2_2_json_shape() {
+        validate_instance_lima_version("2.2.0").unwrap();
+        assert!(validate_instance_lima_version("v2.2.0").is_err());
+        assert!(validate_instance_lima_version("2.2.1").is_err());
+    }
 
     fn staged(directory: &Path, destination: &str, bytes: &[u8]) -> StagedOutput {
         let mut temporary = NamedTempFile::new_in(directory).unwrap();

@@ -144,24 +144,28 @@ fn materialize_in(
         limits.layers,
         usize_to_u64(image.layers.len()),
     )?;
-    let mut plans = Vec::with_capacity(image.layers.len());
-    let mut entries = 0_u64;
-    let mut uncompressed = 0_u64;
-    for descriptor in &image.layers {
-        let remaining = limits
-            .total_uncompressed_bytes
-            .checked_sub(uncompressed)
-            .context("Layer byte count exceeds materialization limit")?;
-        let (plan, layer_entries, layer_bytes) = scan_layer(layout, descriptor, limits, remaining)?;
-        entries = entries
-            .checked_add(layer_entries)
-            .context("Layer entry count overflow")?;
-        enforce_limit("max_entries", limits.entries, entries)?;
-        uncompressed = uncompressed
-            .checked_add(layer_bytes)
-            .context("Layer byte count overflow")?;
-        plans.push((descriptor.clone(), plan, layer_bytes));
-    }
+    let plans = crate::profiling::measure("materialize.scan_layers", || {
+        let mut plans = Vec::with_capacity(image.layers.len());
+        let mut entries = 0_u64;
+        let mut uncompressed = 0_u64;
+        for descriptor in &image.layers {
+            let remaining = limits
+                .total_uncompressed_bytes
+                .checked_sub(uncompressed)
+                .context("Layer byte count exceeds materialization limit")?;
+            let (plan, layer_entries, layer_bytes) =
+                scan_layer(layout, descriptor, limits, remaining)?;
+            entries = entries
+                .checked_add(layer_entries)
+                .context("Layer entry count overflow")?;
+            enforce_limit("max_entries", limits.entries, entries)?;
+            uncompressed = uncompressed
+                .checked_add(layer_bytes)
+                .context("Layer byte count overflow")?;
+            plans.push((descriptor.clone(), plan, layer_bytes));
+        }
+        Ok::<_, anyhow::Error>(plans)
+    })?;
 
     let rootfs = workspace.path().join("rootfs");
     let staging = workspace.path().join("content");
@@ -182,12 +186,14 @@ fn materialize_in(
         cleanup: RefCell::new(CleanupBudget::new(limits)),
         ownership,
     };
-    let mut directory_metadata = DirectoryMetadata::new();
-    for (descriptor, plan, layer_bytes) in plans {
-        directory_metadata.apply(&plan)?;
-        writer.apply(&descriptor, plan, layer_bytes)?;
-    }
-    writer.apply_directory_metadata(directory_metadata.entries)?;
+    crate::profiling::measure("materialize.apply_layers", || {
+        let mut directory_metadata = DirectoryMetadata::new();
+        for (descriptor, plan, layer_bytes) in plans {
+            directory_metadata.apply(&plan)?;
+            writer.apply(&descriptor, plan, layer_bytes)?;
+        }
+        writer.apply_directory_metadata(directory_metadata.entries)
+    })?;
     Ok(MaterializedRootfs { workspace, rootfs })
 }
 
