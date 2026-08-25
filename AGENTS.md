@@ -59,13 +59,13 @@ Do not let the inherited language, package layout, models, tests, or architectur
 
 ## Rust Implementation
 
-- Maintain one Rust 2024 binary crate and one public `runlab` surface. Do not add a Python compatibility package, async runtime, SDK wrapper service, ORM, or speculative generic backend framework.
+- Maintain one Rust 2024 workspace with exactly three packages: the `run_protocol` library, the `run_engine` library, and the `runlab` binary. Keep one public `runlab` product surface. Do not add a Python compatibility package, async runtime, SDK wrapper service, ORM, or parallel protocol package.
 - Keep `rust-toolchain.toml` fixed for reproducible development and keep `package.rust-version` as the tested MSRV. `unsafe` is forbidden.
 - Prefer blocking standard-library process, filesystem, and thread primitives. OCI content identity is computed from exact bytes; typed JSON views never replace retained content-addressed bytes.
-- Keep Docker and future runtime mechanics behind narrow subprocess boundaries. Add a generic backend trait only after a second real backend demonstrates the shared capability boundary.
+- `NativeEngine` and `DockerEngine` implement `RunEngine` directly. Keep their runtime mechanics behind narrow subprocess boundaries, and add no additional generic backend trait unless both real implementations demonstrate a smaller stable private boundary.
 - Run `cargo fmt --check`, all-target tests, Clippy with warnings denied, the declared MSRV check, packaging, separate-process CLI contract tests, and the opt-in real Docker test before claiming completion.
 - Comments must explain a non-obvious invariant, safety boundary, protocol decision, or justified lint exception. Delete comments that merely restate the adjacent name, type, or control flow. Clap doc comments are user-facing help text and must earn their place as interface documentation.
-- Preserve the dependency direction `cli -> execution -> image/backend/storage -> oci/integrity/core`. Keep `integrity` as the shared exact-byte and private-file leaf; do not use OCI as a generic utility module. Do not let CLI own lifecycle semantics, Backend publish OCI assets, Image terminalize Runs, or Storage interpret process outcomes.
+- Preserve the package dependency direction `runlab -> run_engine -> run_protocol`, with `runlab` also allowed to depend directly on `run_protocol`. `run_protocol` owns no execution, product, or persistence concepts. `run_engine` owns no `run_id`, Run Record, Catalog, database, or recovery interface. Keep exact-byte content access narrow; do not let CLI own lifecycle semantics, Engine publish Run Records, or Storage interpret process outcomes.
 
 ## Verification
 
