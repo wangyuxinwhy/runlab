@@ -9,9 +9,18 @@ license = "MIT"
 publish = false
 
 [dependencies]
+anyhow = "1.0.104"
+flate2 = "1.1.9"
 oci-spec = { version = "0.10.0", default-features = false, features = ["image"] }
 run_protocol = { version = "0.1.0", path = "../run_protocol" }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process", "time"] }
+serde = "1.0.229"
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tar = "0.4.46"
+tempfile = "3.27.0"
 thiserror = "2.0.18"
+zstd = "0.13.3"
 
 [lints.rust]
 unsafe_code = "forbid"

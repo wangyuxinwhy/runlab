@@ -1336,9 +1336,18 @@ dependencies = [
 name = "run_engine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "flate2",
  "oci-spec",
  "run_protocol",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
  "thiserror",
+ "zstd",
 ]
 
 [[package]]

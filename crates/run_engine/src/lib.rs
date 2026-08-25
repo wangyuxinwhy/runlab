@@ -5,6 +5,16 @@
 
 mod cancellation;
 mod content;
+#[allow(
+    dead_code,
+    reason = "the private OCI pipeline is consumed by concrete Engines in the next feature gate"
+)]
+mod oci;
+#[allow(
+    dead_code,
+    reason = "the private rootfs pipeline is consumed by concrete Engines in the next feature gate"
+)]
+mod rootfs;
 
 pub use cancellation::CancellationToken;
 pub use content::{ContentError, ContentErrorKind, OciContent, OciContentStore};
