@@ -48,7 +48,15 @@ impl ContentError {
 /// Exact-byte access to a content-addressed OCI store.
 ///
 /// The store has no Catalog, tag, enumeration, deletion, Run identity, or
-/// database operations. Implementations must be safe for concurrent calls.
+/// database operations. It is a synchronous local data-plane boundary:
+/// implementations must not resolve remote references, perform network I/O,
+/// or detach work beyond the call that requested it. Implementations must be
+/// safe for concurrent calls.
+///
+/// Engines enforce operation budgets around bounded reads, seeks, and writes.
+/// As with Engine-owned rootfs I/O, an indefinitely blocked local filesystem or
+/// kernel syscall is a host-failure boundary; this interface does not pretend a
+/// deadline argument could cancel such a syscall.
 pub trait OciContentStore: Send + Sync {
     /// Opens the exact bytes identified by a complete OCI Descriptor.
     ///
@@ -66,7 +74,8 @@ pub trait OciContentStore: Send + Sync {
     ///
     /// Successful publication makes the complete bytes available to subsequent
     /// reads. Existing identical content is success; existing conflicting bytes
-    /// must not be replaced. The method must not publish partial content.
+    /// must not be replaced. The method must consume `content` synchronously,
+    /// must not retain the reader, and must not publish partial content.
     ///
     /// # Errors
     ///

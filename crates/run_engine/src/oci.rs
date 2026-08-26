@@ -151,6 +151,7 @@ pub(crate) struct VerifiedContent {
 }
 
 impl VerifiedContent {
+    #[cfg(test)]
     pub(crate) fn descriptor(&self) -> &Descriptor {
         &self.descriptor
     }
@@ -186,12 +187,14 @@ pub(crate) struct VerifiedImage {
     config_value: Value,
     platform: Platform,
     layers: Vec<VerifiedLayer>,
+    #[cfg(test)]
     diff_ids: Vec<Digest>,
     total_compressed_layer_bytes: u64,
     total_uncompressed_layer_bytes: u64,
 }
 
 impl VerifiedImage {
+    #[cfg(test)]
     pub(crate) fn manifest(&self) -> &VerifiedContent {
         &self.manifest
     }
@@ -208,16 +211,9 @@ impl VerifiedImage {
         &self.layers
     }
 
+    #[cfg(test)]
     pub(crate) fn diff_ids(&self) -> &[Digest] {
         &self.diff_ids
-    }
-
-    pub(crate) const fn total_compressed_layer_bytes(&self) -> u64 {
-        self.total_compressed_layer_bytes
-    }
-
-    pub(crate) const fn total_uncompressed_layer_bytes(&self) -> u64 {
-        self.total_uncompressed_layer_bytes
     }
 }
 
@@ -304,6 +300,7 @@ pub(crate) fn publish_expected(
 }
 
 /// Computes a complete sha256 Descriptor and atomically publishes its bytes.
+#[cfg(test)]
 pub(crate) fn publish_content<R: Read + Seek>(
     store: &dyn OciContentStore,
     media_type: MediaType,
@@ -395,6 +392,7 @@ fn inspect_image_with_limits(
         config_value,
         platform,
         layers,
+        #[cfg(test)]
         diff_ids,
         total_compressed_layer_bytes: total_compressed,
         total_uncompressed_layer_bytes: total_uncompressed,
@@ -1037,6 +1035,7 @@ fn digest_stream_limited<R: Read + ?Sized>(
     Ok((size, digest))
 }
 
+#[cfg(test)]
 fn digest_stream<R: Read + ?Sized>(reader: &mut R, path: &str) -> Result<(u64, Digest), OciError> {
     let mut hasher = Sha256::new();
     let mut size = 0_u64;

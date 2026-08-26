@@ -5,19 +5,21 @@
 
 mod cancellation;
 mod content;
-#[allow(
-    dead_code,
-    reason = "the private OCI pipeline is consumed by concrete Engines in the next feature gate"
-)]
+#[cfg(target_os = "linux")]
+mod native;
+#[cfg(target_os = "linux")]
 mod oci;
-#[allow(
-    dead_code,
-    reason = "the private rootfs pipeline is consumed by concrete Engines in the next feature gate"
-)]
+#[cfg(target_os = "linux")]
 mod rootfs;
+mod timeouts;
 
 pub use cancellation::CancellationToken;
 pub use content::{ContentError, ContentErrorKind, OciContent, OciContentStore};
+#[cfg(target_os = "linux")]
+pub use native::NativeEngine;
+pub use timeouts::{
+    MAX_OPERATION_TIMEOUT, OperationTimeoutError, OperationTimeouts, STOP_GRACE_PERIOD,
+};
 
 use run_protocol::{EngineError, RunInput, RunOutput};
 

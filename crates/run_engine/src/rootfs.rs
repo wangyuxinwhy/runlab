@@ -428,10 +428,6 @@ mod platform {
             &self.root_path
         }
 
-        pub(crate) fn workspace(&self) -> &Path {
-            &self.workspace
-        }
-
         /// Captures the complete stopped tree after proving all mounts are gone.
         pub(crate) fn capture(&self) -> Result<CapturedLayer> {
             self.ensure_no_mounts()?;
@@ -2584,6 +2580,7 @@ mod platform {
         Ok((finish_sha256(hasher), size))
     }
 
+    #[cfg(test)]
     fn sha256_digest(bytes: &[u8]) -> Digest {
         let mut hasher = Sha256::new();
         hasher.update(bytes);

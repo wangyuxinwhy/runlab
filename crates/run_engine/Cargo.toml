@@ -3,17 +3,18 @@ name = "run_engine"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Native and Docker implementations of the Run Protocol"
+description = "Native Linux implementation of the Run Protocol"
 repository = "https://github.com/wangyuxinwhy/runlab"
 license = "MIT"
 publish = false
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 flate2 = "1.1.9"
-oci-spec = { version = "0.10.0", default-features = false, features = ["image"] }
+oci-spec = { version = "0.10.0", default-features = false, features = ["image", "runtime"] }
 run_protocol = { version = "0.1.0", path = "../run_protocol" }
-rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process", "time"] }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "net", "process", "time"] }
 serde = "1.0.229"
 serde_json = "1.0.151"
 sha2 = "0.11.0"
