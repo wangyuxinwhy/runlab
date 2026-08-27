@@ -29,6 +29,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[cfg(target_os = "linux")]
+    #[command(name = "__managed-vm-handshake", hide = true)]
+    ManagedVmHandshake,
     /// Read paths from OCI Image filesystem views.
     Filesystem {
         #[command(subcommand)]
@@ -55,6 +58,11 @@ enum Command {
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Command::ManagedVmHandshake => {
+            emit(&crate::managed_vm::guest_handshake())?;
+            Ok(0)
+        }
         Command::Filesystem { command } => filesystem::execute(&resolve_state(cli.state)?, command),
         Command::Image { command } => image::execute(&resolve_state(cli.state)?, command),
         Command::Run { command } => run::execute(&resolve_state(cli.state)?, command),

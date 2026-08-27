@@ -36,11 +36,14 @@ On macOS, RunLab also exposes explicit lifecycle commands for the fixed local Li
 ```text
 runlab vm create
 runlab vm start
+runlab vm install
 runlab vm stop
 runlab vm status
 ```
 
-`vm status` is read-only. The other lifecycle commands are idempotent and never expose a general VM shell or command executor. Guest installation and ordinary command forwarding are not implemented yet.
+`vm status` is read-only. The other lifecycle commands are idempotent and never expose a general VM shell or command executor. `vm install` verifies and atomically installs the bundled, architecture-matched Linux `runlab` and `runc`, then checks the minimal NativeEngine reference profile. Release bundles place these files beside the macOS executable as `runlab-linux-<arch>` and `runc-linux-<arch>`; development builds can select them with `RUNLAB_GUEST_BINARY` and `RUNLAB_GUEST_RUNC`.
+
+Ordinary State commands are not forwarded to the VM yet.
 
 Image building and registry transport belong to external OCI tools. `image import` accepts a standard OCI Image Layout directory or an uncompressed tar archive containing one Image Manifest.
 

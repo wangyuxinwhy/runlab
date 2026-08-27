@@ -39,7 +39,9 @@ run get
 run list
 ```
 
-macOS 另外提供 `vm create/start/stop/status`。它们只管理固定名为 `runlab` 的 Lima 2.2.0/VZ 实例，要求宿主架构匹配、plain mode、零 host mounts 和 digest-pinned Ubuntu Image。`vm status` 不改变 VM；create/start/stop 均可安全重试。当前还没有 Guest 安装、握手、命令转发或文件传输。
+macOS 另外提供 `vm create/start/install/stop/status`。它们只管理固定名为 `runlab` 的 Lima 2.2.0/VZ 实例，要求宿主架构匹配、plain mode、零 host mounts 和 digest-pinned Ubuntu Image。`vm status` 不改变 VM；其他操作均可安全重试。
+
+`vm install` 从 macOS 可执行文件旁读取 `runlab-linux-<arch>` 与 `runc-linux-<arch>`，传输后复验 size 和 SHA-256，再以原子 rename 安装。开发构建可用 `RUNLAB_GUEST_BINARY` 与 `RUNLAB_GUEST_RUNC` 覆盖 bundle 路径。Guest 握手必须与 Host 的 RunLab version、transport version、Linux OS 和 architecture 完全一致。reference profile 当前固定 runc 1.5.1、`ip`、`iptables`、`ip6tables`、`nsenter`、cgroup v2、OverlayFS 与 IPv4 forwarding。
 
 `run config generate` 把完整 OCI Runtime Configuration JSON 写到 stdout，供 `jq` 等普通 JSON 工具继续处理。`run start` 省略 `--runtime-config` 时复用同一个生成器。生成器固定创建新的 network namespace，`isolated` 或 `egress` 仍只由 `run start --network` 选择，不写入 `config.json`。
 
@@ -53,7 +55,7 @@ Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调
 
 ## 已知边界
 
-- `NativeEngine` 只在 Linux 可执行；macOS 已能显式管理本地 Linux VM 生命周期，但普通 State 命令尚未转发到 VM，不能直接开始 Run。
+- `NativeEngine` 只在 Linux 可执行；macOS 已能显式管理本地 Linux VM 生命周期和安装 Guest appliance，但普通 State 命令尚未转发到 VM，不能直接开始 Run。
 - `NativeEngine` 支持 `Network::Isolated` 与 outbound-only `Network::Egress`。Egress 依赖宿主启用 IPv4 forwarding，并提供 `ip`、`iptables`、`ip6tables` 与 `nsenter`；Engine 不修改宿主级 forwarding 设置。
 - Image import 只接受包含单个 Image Manifest 的标准 OCI Image Layout 目录或未压缩 tar archive。
 - 支持 OCI tar、gzip 和 zstd Layer；不实现 registry pull 或 Image build。

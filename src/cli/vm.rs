@@ -21,6 +21,8 @@ pub(super) enum VmCommand {
     },
     /// Start the existing local Linux VM.
     Start,
+    /// Install and verify the bundled Linux `RunLab` execution appliance.
+    Install,
     /// Stop the local Linux VM while preserving its disk.
     Stop,
     /// Report VM lifecycle and compatibility facts without changing it.
@@ -36,6 +38,10 @@ pub(super) fn execute(command: VmCommand) -> Result<u8> {
             disk_gib,
         } => vm.create(cpus, memory_gib, disk_gib)?,
         VmCommand::Start => vm.start()?,
+        VmCommand::Install => {
+            emit(&vm.install()?)?;
+            return Ok(0);
+        }
         VmCommand::Stop => vm.stop()?,
         VmCommand::Status => vm.status()?,
     };

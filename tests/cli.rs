@@ -14,20 +14,20 @@ const PATCH: &[u8] = b"diff --git a/example.py b/example.py\n";
 fn help_exposes_only_the_minimal_product_surface() {
     let top = run(&["--help"]);
     assert_success(&top);
-    let stdout = text(&top.stdout);
-    assert!(stdout.contains("image"));
-    assert!(stdout.contains("run"));
-    assert!(stdout.contains("filesystem"));
+    let top_stdout = text(&top.stdout);
+    assert!(top_stdout.contains("image"));
+    assert!(top_stdout.contains("run"));
+    assert!(top_stdout.contains("filesystem"));
     for removed in ["docker", "managed-service", "runtime-config", "schema"] {
         assert!(
-            !stdout.contains(removed),
+            !top_stdout.contains(removed),
             "legacy command leaked: {removed}"
         );
     }
     #[cfg(target_os = "macos")]
-    assert!(stdout.contains("vm"));
+    assert!(top_stdout.contains("vm"));
     #[cfg(not(target_os = "macos"))]
-    assert!(!stdout.contains("vm"));
+    assert!(!top_stdout.contains("vm"));
 
     let image = run(&["image", "--help"]);
     assert_success(&image);
@@ -83,31 +83,50 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("compact JSON summary"));
     assert!(stdout.contains("Use run get for the complete persisted Run record"));
     assert!(stdout.contains("Examples:"));
+}
 
+#[test]
+fn managed_vm_surface_is_narrow() {
     #[cfg(target_os = "macos")]
     {
         let vm_help = run(&["vm", "--help"]);
         assert_success(&vm_help);
         let stdout = text(&vm_help.stdout);
         assert!(!stdout.contains("--state"));
-        for command in ["create", "start", "stop", "status"] {
-            assert!(
-                stdout.contains(&format!("\n  {command} ")),
-                "missing VM command: {command}"
-            );
+        for command in ["create", "start", "install", "stop", "status"] {
+            assert!(stdout.contains(&format!("\n  {command} ")));
         }
-        for deferred in ["install", "delete", "exec", "shell"] {
-            assert!(
-                !stdout.contains(&format!("\n  {deferred} ")),
-                "deferred VM command leaked: {deferred}"
-            );
+        for deferred in ["delete", "exec", "shell"] {
+            assert!(!stdout.contains(&format!("\n  {deferred} ")));
         }
+
+        let install_help = run(&["vm", "install", "--help"]);
+        assert_success(&install_help);
+        let stdout = text(&install_help.stdout);
+        assert!(!stdout.contains("--binary"));
+        assert!(!stdout.contains("--runc"));
 
         let state = tempfile::tempdir().expect("temporary state");
         let invalid = run_with_state(state.path(), &["vm", "status"]);
         assert!(!invalid.status.success());
         assert!(invalid.stdout.is_empty());
         assert!(text(&invalid.stderr).contains("--state does not apply"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let help = run(&["--help"]);
+        assert_success(&help);
+        assert!(!text(&help.stdout).contains("__managed-vm-handshake"));
+        let handshake = run(&["__managed-vm-handshake"]);
+        assert_success(&handshake);
+        let value: Value = serde_json::from_slice(&handshake.stdout).expect("handshake JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["transport_version"], 1);
+        assert_eq!(value["runlab_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["os"], "linux");
+        assert_eq!(value["architecture"], std::env::consts::ARCH);
+        assert_eq!(value["capabilities"], json!(["native-engine"]));
     }
 }
 
