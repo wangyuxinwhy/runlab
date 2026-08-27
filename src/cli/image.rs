@@ -32,25 +32,6 @@ pub(super) enum ImageCommand {
         /// Local Image name or complete sha256 Manifest digest.
         image: ImageSelector,
     },
-    /// Read one regular file from an Image into a new local file.
-    File {
-        #[command(subcommand)]
-        command: ImageFileCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(super) enum ImageFileCommand {
-    /// Write SOURCE from IMAGE to a new --output file.
-    Get {
-        /// Local Image name or complete sha256 Manifest digest.
-        image: ImageSelector,
-        /// Absolute path of one regular file inside the Image.
-        source: String,
-        /// New local file to create; an existing path is never overwritten.
-        #[arg(long)]
-        output: PathBuf,
-    },
 }
 
 pub(super) fn execute(state_path: &Path, command: ImageCommand) -> Result<u8> {
@@ -60,14 +41,6 @@ pub(super) fn execute(state_path: &Path, command: ImageCommand) -> Result<u8> {
         ImageCommand::Import { source, name } => emit(&images.import(&source, &name)?)?,
         ImageCommand::List { limit, after } => emit(&images.list(limit, after.as_deref())?)?,
         ImageCommand::Get { image } => emit(&images.get(&image)?)?,
-        ImageCommand::File {
-            command:
-                ImageFileCommand::Get {
-                    image,
-                    source,
-                    output,
-                },
-        } => emit(&images.get_file(&image, &source, &output)?)?,
     }
     Ok(0)
 }

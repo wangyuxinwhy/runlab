@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+mod filesystem;
 mod image;
 mod run;
 
@@ -26,6 +27,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Read paths from OCI Image filesystem views.
+    Filesystem {
+        #[command(subcommand)]
+        command: filesystem::FilesystemCommand,
+    },
     /// Import, discover, and read OCI Images.
     Image {
         #[command(subcommand)]
@@ -42,6 +48,7 @@ pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     let state = resolve_state(cli.state)?;
     match cli.command {
+        Command::Filesystem { command } => filesystem::execute(&state, command),
         Command::Image { command } => image::execute(&state, command),
         Command::Run { command } => run::execute(&state, command),
     }

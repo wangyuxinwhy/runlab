@@ -1,9 +1,8 @@
-use std::ffi::OsStr;
 use std::fmt;
 use std::fmt::Write as _;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Cursor, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::fs::{self, File};
+use std::io::{Cursor, Read};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -92,23 +91,24 @@ pub(crate) struct ImagePlatform {
     variant: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct ImageFileGetResult {
-    schema_version: u32,
-    requested: String,
-    manifest: Descriptor,
-    source: String,
-    output: String,
-    digest: String,
-    size: usize,
-}
-
 pub(crate) struct InspectedImage {
     pub(crate) manifest: Descriptor,
     pub(crate) config: Descriptor,
     pub(crate) layers: Vec<Descriptor>,
     pub(crate) platform: ImagePlatform,
     pub(crate) image_configuration: ImageConfiguration,
+}
+
+pub(crate) struct ImageFilesystem {
+    store: Arc<LocalOciStore>,
+    pub(crate) manifest: Descriptor,
+    pub(crate) layers: Vec<Descriptor>,
+}
+
+impl ImageFilesystem {
+    pub(crate) fn read_layer(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
+        self.store.read(descriptor)
+    }
 }
 
 impl<'a> Images<'a> {
@@ -169,52 +169,23 @@ impl<'a> Images<'a> {
         })
     }
 
-    pub(crate) fn get_file(
-        &self,
-        selector: &ImageSelector,
-        source: &str,
-        output: &Path,
-    ) -> Result<ImageFileGetResult> {
-        let target = normalize_absolute_image_path(source)?;
-        let image = self.inspect(selector)?;
-        let mut current = FileState::Missing;
-        for layer in &image.layers {
-            let bytes = self.store.read(layer)?;
-            current = apply_layer_to_target(layer, &bytes, &target, current)?;
-        }
-        let FileState::Regular(bytes) = current else {
-            match current {
-                FileState::Missing => bail!("Image path does not exist: {source}"),
-                FileState::NotRegular => bail!("Image path is not a regular file: {source}"),
-                FileState::Regular(_) => unreachable!(),
-            }
-        };
-        let mut destination = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(output)
-            .with_context(|| format!("failed to create output file {}", output.display()))?;
-        destination.write_all(&bytes)?;
-        destination.sync_all()?;
-        let output = output
-            .canonicalize()
-            .with_context(|| format!("failed to resolve output file {}", output.display()))?;
-        Ok(ImageFileGetResult {
-            schema_version: 1,
-            requested: selector.to_string(),
-            manifest: image.manifest,
-            source: source.to_owned(),
-            output: output
-                .to_str()
-                .context("output path is not valid UTF-8")?
-                .to_owned(),
-            digest: sha256_digest(&bytes),
-            size: bytes.len(),
-        })
-    }
-
     pub(crate) fn resolve(&self, selector: &ImageSelector) -> Result<InspectedImage> {
         self.inspect(selector)
+    }
+
+    pub(crate) fn filesystem(&self, selector: &ImageSelector) -> Result<ImageFilesystem> {
+        self.filesystem_from_manifest(self.resolve_descriptor(selector)?)
+    }
+
+    pub(crate) fn filesystem_from_manifest(&self, manifest: Descriptor) -> Result<ImageFilesystem> {
+        // A path read verifies every Descriptor it touches without turning the
+        // lookup into a full-Image DiffID verification pass.
+        let (manifest_view, _) = read_image_structure(&self.store, &manifest)?;
+        Ok(ImageFilesystem {
+            store: Arc::clone(&self.store),
+            manifest,
+            layers: manifest_view.layers().clone(),
+        })
     }
 
     fn resolve_descriptor(&self, selector: &ImageSelector) -> Result<Descriptor> {
@@ -291,16 +262,7 @@ impl<'a> Images<'a> {
 }
 
 fn inspect_descriptor(store: &LocalOciStore, manifest: Descriptor) -> Result<InspectedImage> {
-    if manifest.media_type() != &MediaType::ImageManifest {
-        bail!("selected descriptor is not an OCI Image Manifest");
-    }
-    let manifest_bytes = store.read(&manifest)?;
-    let manifest_view: ImageManifest =
-        serde_json::from_slice(&manifest_bytes).context("OCI Image Manifest is invalid")?;
-    let config_bytes = store.read(manifest_view.config())?;
-    let config: ImageConfiguration =
-        serde_json::from_slice(&config_bytes).context("OCI Image Config is invalid")?;
-    validate_config(&config, manifest_view.layers())?;
+    let (manifest_view, config) = read_image_structure(store, &manifest)?;
     for (layer, diff_id) in manifest_view
         .layers()
         .iter()
@@ -321,6 +283,23 @@ fn inspect_descriptor(store: &LocalOciStore, manifest: Descriptor) -> Result<Ins
         platform,
         image_configuration: config,
     })
+}
+
+fn read_image_structure(
+    store: &LocalOciStore,
+    manifest: &Descriptor,
+) -> Result<(ImageManifest, ImageConfiguration)> {
+    if manifest.media_type() != &MediaType::ImageManifest {
+        bail!("selected descriptor is not an OCI Image Manifest");
+    }
+    let manifest_bytes = store.read(manifest)?;
+    let manifest_view: ImageManifest =
+        serde_json::from_slice(&manifest_bytes).context("OCI Image Manifest is invalid")?;
+    let config_bytes = store.read(manifest_view.config())?;
+    let config: ImageConfiguration =
+        serde_json::from_slice(&config_bytes).context("OCI Image Config is invalid")?;
+    validate_config(&config, manifest_view.layers())?;
+    Ok((manifest_view, config))
 }
 
 fn validate_config(config: &ImageConfiguration, layers: &[Descriptor]) -> Result<()> {
@@ -407,7 +386,10 @@ fn verify_diff_id(descriptor: &Descriptor, bytes: &[u8], expected: &str) -> Resu
     Ok(())
 }
 
-fn layer_reader<'a>(descriptor: &Descriptor, bytes: &'a [u8]) -> Result<Box<dyn Read + 'a>> {
+pub(crate) fn layer_reader<'a>(
+    descriptor: &Descriptor,
+    bytes: &'a [u8],
+) -> Result<Box<dyn Read + 'a>> {
     let media_type = descriptor.media_type().to_string();
     match media_type.as_str() {
         "application/vnd.oci.image.layer.v1.tar" => Ok(Box::new(Cursor::new(bytes))),
@@ -419,108 +401,6 @@ fn layer_reader<'a>(descriptor: &Descriptor, bytes: &'a [u8]) -> Result<Box<dyn 
         )),
         _ => bail!("unsupported OCI Layer media type: {media_type}"),
     }
-}
-
-#[derive(Debug)]
-enum FileState {
-    Missing,
-    NotRegular,
-    Regular(Vec<u8>),
-}
-
-fn apply_layer_to_target(
-    descriptor: &Descriptor,
-    bytes: &[u8],
-    target: &Path,
-    previous: FileState,
-) -> Result<FileState> {
-    let reader = layer_reader(descriptor, bytes)?;
-    let mut archive = tar::Archive::new(reader);
-    let mut removes_lower = false;
-    let mut replacement = None;
-    for entry in archive.entries().context("failed to read OCI Layer tar")? {
-        let mut entry = entry.context("failed to read OCI Layer entry")?;
-        let path = normalize_layer_path(&entry.path()?)?;
-        if let Some(whiteout) = whiteout_target(&path) {
-            if target.starts_with(&whiteout) {
-                removes_lower = true;
-            }
-            continue;
-        }
-        if is_opaque_whiteout(&path) {
-            if path
-                .parent()
-                .is_some_and(|parent| target.starts_with(parent))
-            {
-                removes_lower = true;
-            }
-            continue;
-        }
-        if path == target {
-            if entry.header().entry_type().is_file() {
-                let mut content = Vec::new();
-                entry.read_to_end(&mut content)?;
-                replacement = Some(FileState::Regular(content));
-            } else {
-                replacement = Some(FileState::NotRegular);
-            }
-        } else if target.starts_with(&path)
-            && path != Path::new("")
-            && !entry.header().entry_type().is_dir()
-        {
-            replacement = Some(FileState::NotRegular);
-        }
-    }
-    Ok(replacement.unwrap_or({
-        if removes_lower {
-            FileState::Missing
-        } else {
-            previous
-        }
-    }))
-}
-
-fn normalize_absolute_image_path(value: &str) -> Result<PathBuf> {
-    let path = Path::new(value);
-    if !path.is_absolute() {
-        bail!("Image file path must be absolute: {value}");
-    }
-    let normalized = normalize_components(path.components().skip(1))?;
-    if normalized.as_os_str().is_empty() {
-        bail!("Image file path must identify a file");
-    }
-    Ok(normalized)
-}
-
-fn normalize_layer_path(path: &Path) -> Result<PathBuf> {
-    normalize_components(path.components())
-}
-
-fn normalize_components<'a>(components: impl Iterator<Item = Component<'a>>) -> Result<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in components {
-        match component {
-            Component::Normal(value) => normalized.push(value),
-            Component::CurDir | Component::RootDir => {}
-            Component::ParentDir | Component::Prefix(_) => {
-                bail!("OCI path escapes the Image root")
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-fn whiteout_target(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
-    let removed = name.strip_prefix(".wh.")?;
-    if removed == ".wh..opq" || removed.is_empty() {
-        return None;
-    }
-    Some(path.parent().unwrap_or_else(|| Path::new("")).join(removed))
-}
-
-fn is_opaque_whiteout(path: &Path) -> bool {
-    path.file_name() == Some(OsStr::new(".wh..wh..opq"))
 }
 
 fn validate_name(name: &str) -> Result<()> {

@@ -13,12 +13,13 @@ runlab ----------------> run_protocol
 
 `run_protocol` 和 `run_engine::NativeEngine` 保持原有稳定边界。根 `runlab` package 已从 legacy 实现重写，不保留 Docker、managed VM、recovery、reconcile、GC、schema、RunLab-specific runtime-config DSL、registry transport 或旧 Base/Overlay/Task 模型。
 
-`runlab` 当前由六个直接模块组成：
+`runlab` 当前由七个直接模块组成：
 
 | 模块 | 责任 |
 | --- | --- |
 | `cli` | 参数解析、命令分发、stdout JSON 与 stderr 错误边界 |
-| `image` | OCI Image Layout 导入、Catalog 查询、Image 检查与单文件读取 |
+| `filesystem` | 从 Run Final Environment 或 Image 读取文件系统路径 |
+| `image` | OCI Image Layout 导入、Catalog 查询与 Image 检查 |
 | `run` | Run identity、协议输入构造、NativeEngine 调用、结果投影与持久化 |
 | `runtime_config` | 从 OCI Image Config 与固定 Linux 执行骨架生成标准 OCI Runtime Configuration |
 | `state` | 本地 State 打开及组件装配 |
@@ -30,7 +31,7 @@ runlab ----------------> run_protocol
 image import
 image list
 image get
-image file get
+filesystem get
 run config generate
 run start
 run get
@@ -53,7 +54,7 @@ Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调
 - `NativeEngine` 支持 `Network::Isolated` 与 outbound-only `Network::Egress`。Egress 依赖宿主启用 IPv4 forwarding，并提供 `ip`、`iptables`、`ip6tables` 与 `nsenter`；Engine 不修改宿主级 forwarding 设置。
 - Image import 只接受包含单个 Image Manifest 的标准 OCI Image Layout 目录或未压缩 tar archive。
 - 支持 OCI tar、gzip 和 zstd Layer；不实现 registry pull 或 Image build。
-- `image file get` 只提取一个 regular file，并以 create-new 方式写目标路径。
+- `filesystem get` 从 Run Program 的 Final Environment 或指定 Image 读取普通文件、目录或 symlink。目标路径必须尚不存在；单文件从最新 Layer 向前解析，目录只合并目标子树。
 - stdout/stderr 当前作为协议事实保存在完整 Run record 中；独立 stream 命令尚未因真实场景而引入。
 - 不实现恢复、验证、评分、golden comparison 或实验编排。
 
@@ -68,12 +69,14 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Rust 1.95 MSRV all-target check 已通过。独立进程 CLI 测试覆盖最小命令面、OCI Layout 导入、名称和 digest 查询、包含常见根目录条目的 Layer 单文件提取、拒绝覆盖目标，以及错误请求不输出成功 JSON。
+Rust 1.95 MSRV all-target check 已通过。独立进程 CLI 测试覆盖最小命令面、OCI Layout 导入、名称和 digest 查询、通过 Run 或 Image 读取文件系统路径、跨 Layer 目录合并、whiteout、opaque 目录、symlink、拒绝覆盖目标，以及错误请求不输出成功 JSON。
 
 真实 Linux CLI 纵切已通过 `runc 1.5.1`：导入 arm64 OCI Image，执行返回 exit 7 的 Run，保存独立 stdout/stderr 与 Final Image，通过 Final Image digest 提取 `/result/value` 的精确字节，并验证同 identity 重试返回 `created: false`。单独的长运行进程收到 SIGINT 后得到 terminal、`cancelled: true` 的 RunOutput，Engine workspace 无残留。
 
 真实 `NativeEngine` E2E 还覆盖了 `Network::Egress`：Program 从独立 OCI network namespace 主动连接 VM 上的 TCP 服务并取得响应；调用返回后临时 veth 与对应 IPv4/IPv6 firewall rules 均无残留。
 
 Runtime Configuration 生成能力已在同一 Linux VM 通过真实 CLI 纵切验证：`run config generate` 的精确 stdout 字节分别被省略 `--runtime-config` 的 `isolated` 和 `egress` Run 原样保存，两个 Run 都通过 `runc` 正常退出。生成的 JSON 包含新的 network namespace，但不包含 Run Protocol 的 `network` 字段。另一路径通过 `jq` 修改生成配置的 `process.args`，再以显式 `--runtime-config` 执行并取得预期 stdout。
+
+`filesystem get --run` 已在同一 Linux VM 对真实 SWE-bench Run 验证。命令从最终 Image 取出 571-byte `/artifacts/solution.patch`，内容 digest 为 `sha256:adfa5771ae09b6ff1d91eb2a57943d20f0a899df777528a2233821e8f73fc20a`。最终代码的 release 构建首次观测为 27 ms，随后六次为 17–20 ms；debug 构建随后六次约为 179–180 ms。此前正序读取并重复校验全部 Layer 的实现稳定约为 30.8–31.0 s。
 
 `cargo package -p run_protocol --no-verify --locked --allow-dirty` 成功。完整 workspace packaging 当前不能成立：`run_engine` 打包时会从 crates.io 解析 `run_protocol 0.1.0`，而该版本尚未发布。没有为绕过这一发布顺序去修改 manifest 或评价路径。

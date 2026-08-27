@@ -24,7 +24,7 @@ RunLab intentionally starts with eight commands:
 runlab image import
 runlab image list
 runlab image get
-runlab image file get
+runlab filesystem get
 runlab run config generate
 runlab run start
 runlab run get
@@ -41,7 +41,17 @@ state=./runlab-state
 $runlab --state "$state" image import ./image-layout --name agent-base
 $runlab --state "$state" image list
 $runlab --state "$state" image get agent-base
-$runlab --state "$state" image file get agent-base /workspace/result.patch --output ./result.patch
+$runlab --state "$state" filesystem get --image agent-base /workspace/result.patch --output ./result.patch
+```
+
+`filesystem get` can also resolve the Final Environment of one Run Program. It copies a regular file, directory, or symlink to a new local path and never merges with or overwrites an existing path:
+
+```bash
+$runlab --state "$state" filesystem get \
+  --run <run-id> \
+  --program primary \
+  /artifacts/solution.patch \
+  --output ./solution.patch
 ```
 
 `run config generate` writes a complete OCI Runtime Configuration 1.3.0 to stdout. It combines the Image Config execution defaults with RunLab's fixed Linux execution scaffold, so ordinary JSON tools can inspect or change the result without a RunLab-specific configuration language:

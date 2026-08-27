@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod cli;
+mod filesystem;
 mod image;
 mod run;
 mod runtime_config;

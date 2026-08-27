@@ -17,6 +17,7 @@ fn help_exposes_only_the_minimal_product_surface() {
     let stdout = text(&top.stdout);
     assert!(stdout.contains("image"));
     assert!(stdout.contains("run"));
+    assert!(stdout.contains("filesystem"));
     for removed in [
         "docker",
         "managed-service",
@@ -33,9 +34,27 @@ fn help_exposes_only_the_minimal_product_surface() {
     let image = run(&["image", "--help"]);
     assert_success(&image);
     let stdout = text(&image.stdout);
-    for command in ["import", "list", "get", "file"] {
+    for command in ["import", "list", "get"] {
         assert!(stdout.contains(command), "missing image command: {command}");
     }
+    assert!(!stdout.contains("file"));
+
+    let filesystem = run(&["filesystem", "--help"]);
+    assert_success(&filesystem);
+    let stdout = text(&filesystem.stdout);
+    assert!(stdout.contains("get"));
+    assert!(!stdout.contains("tree"));
+
+    let filesystem_get = run(&["filesystem", "get", "--help"]);
+    assert_success(&filesystem_get);
+    let stdout = text(&filesystem_get.stdout);
+    for argument in ["--run", "--image", "--program", "--output"] {
+        assert!(
+            stdout.contains(argument),
+            "missing filesystem get argument: {argument}"
+        );
+    }
+    assert!(stdout.contains("existing path is never overwritten"));
 
     let run_help = run(&["run", "--help"]);
     assert_success(&run_help);
@@ -67,25 +86,14 @@ fn help_exposes_only_the_minimal_product_surface() {
 }
 
 #[test]
-fn image_commands_import_discover_and_read_one_file() {
+fn image_and_filesystem_commands_import_discover_and_get_paths() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let state = temporary.path().join("state");
     let layout = create_layout(temporary.path());
-
-    let imported = run_with_state(
-        &state,
-        &[
-            "image",
-            "import",
-            path(&layout),
-            "--name",
-            "swebench/example:v1",
-        ],
-    );
-    assert_success(&imported);
-    let imported = json_output(&imported);
+    let imported = import_image(&state, &layout, "swebench/example:v1");
     assert_eq!(imported["name"], "swebench/example:v1");
-    let manifest = imported["manifest"]["digest"]
+    let manifest_descriptor = imported["manifest"].clone();
+    let manifest = manifest_descriptor["digest"]
         .as_str()
         .expect("manifest digest")
         .to_owned();
@@ -108,9 +116,9 @@ fn image_commands_import_discover_and_read_one_file() {
     let file = run_with_state(
         &state,
         &[
-            "image",
-            "file",
+            "filesystem",
             "get",
+            "--image",
             &manifest,
             "/workspace/result.patch",
             "--output",
@@ -120,15 +128,59 @@ fn image_commands_import_discover_and_read_one_file() {
     assert_success(&file);
     assert_eq!(fs::read(&output).expect("output file"), PATCH);
     let file_json = json_output(&file);
-    assert_eq!(file_json["source"], "/workspace/result.patch");
+    assert_eq!(file_json["source"]["kind"], "image");
+    assert_eq!(file_json["path"], "/workspace/result.patch");
+    assert_eq!(file_json["kind"], "file");
     assert_eq!(file_json["size"], PATCH.len());
+
+    let directory = temporary.path().join("workspace");
+    let directory_get = run_with_state(
+        &state,
+        &[
+            "filesystem",
+            "get",
+            "--image",
+            "swebench/example:v1",
+            "/workspace",
+            "--output",
+            path(&directory),
+        ],
+    );
+    assert_success(&directory_get);
+    assert_eq!(
+        fs::read(directory.join("result.patch")).expect("directory file"),
+        PATCH
+    );
+    assert_eq!(json_output(&directory_get)["kind"], "directory");
+
+    let run_id = "550e8400-e29b-41d4-a716-446655440000";
+    insert_terminal_run(&state, run_id, &manifest_descriptor);
+    let run_output = temporary.path().join("from-run.patch");
+    let from_run = run_with_state(
+        &state,
+        &[
+            "filesystem",
+            "get",
+            "--run",
+            run_id,
+            "/workspace/result.patch",
+            "--output",
+            path(&run_output),
+        ],
+    );
+    assert_success(&from_run);
+    assert_eq!(fs::read(&run_output).expect("Run output file"), PATCH);
+    let run_json = json_output(&from_run);
+    assert_eq!(run_json["source"]["kind"], "run");
+    assert_eq!(run_json["source"]["run_id"], run_id);
+    assert_eq!(run_json["source"]["program"], "primary");
 
     let overwrite = run_with_state(
         &state,
         &[
-            "image",
-            "file",
+            "filesystem",
             "get",
+            "--image",
             &manifest,
             "/workspace/result.patch",
             "--output",
@@ -137,7 +189,135 @@ fn image_commands_import_discover_and_read_one_file() {
     );
     assert!(!overwrite.status.success());
     assert!(overwrite.stdout.is_empty());
-    assert!(text(&overwrite.stderr).contains("failed to create output file"));
+    assert!(text(&overwrite.stderr).contains("output path already exists"));
+}
+
+fn import_image(state: &Path, layout: &Path, name: &str) -> Value {
+    let imported = run_with_state(state, &["image", "import", path(layout), "--name", name]);
+    assert_success(&imported);
+    json_output(&imported)
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_directory_get_applies_layers_whiteouts_and_symlinks() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let lower = filesystem_layer(|builder| {
+        append_file(builder, "workspace/keep.txt", b"keep");
+        append_file(builder, "workspace/remove.txt", b"remove");
+        append_file(builder, "workspace/sub/old.txt", b"old");
+        append_symlink(builder, "workspace/latest", "keep.txt");
+    });
+    let upper = filesystem_layer(|builder| {
+        append_file(builder, "workspace/.wh.remove.txt", b"");
+        append_file(builder, "workspace/sub/.wh..wh..opq", b"");
+        append_file(builder, "workspace/sub/new.txt", b"new");
+        append_file(builder, "workspace/added.txt", b"added");
+    });
+    let layout = create_layout_with_layers(temporary.path(), &[lower, upper]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "layered"],
+    );
+    assert_success(&imported);
+
+    let output = temporary.path().join("workspace");
+    let directory = run_with_state(
+        &state,
+        &[
+            "filesystem",
+            "get",
+            "--image",
+            "layered",
+            "/workspace",
+            "--output",
+            path(&output),
+        ],
+    );
+    assert_success(&directory);
+    assert_eq!(fs::read(output.join("keep.txt")).expect("keep"), b"keep");
+    assert_eq!(fs::read(output.join("added.txt")).expect("added"), b"added");
+    assert_eq!(fs::read(output.join("sub/new.txt")).expect("new"), b"new");
+    assert!(!output.join("remove.txt").exists());
+    assert!(!output.join("sub/old.txt").exists());
+    assert_eq!(
+        fs::read_link(output.join("latest")).expect("symlink"),
+        Path::new("keep.txt")
+    );
+
+    let link_output = temporary.path().join("latest");
+    let symlink = run_with_state(
+        &state,
+        &[
+            "filesystem",
+            "get",
+            "--image",
+            "layered",
+            "/workspace/latest",
+            "--output",
+            path(&link_output),
+        ],
+    );
+    assert_success(&symlink);
+    assert_eq!(json_output(&symlink)["kind"], "symlink");
+    assert_eq!(
+        fs::read_link(link_output).expect("direct symlink"),
+        Path::new("keep.txt")
+    );
+
+    let removed_output = temporary.path().join("removed");
+    let removed = run_with_state(
+        &state,
+        &[
+            "filesystem",
+            "get",
+            "--image",
+            "layered",
+            "/workspace/remove.txt",
+            "--output",
+            path(&removed_output),
+        ],
+    );
+    assert!(!removed.status.success());
+    assert!(removed.stdout.is_empty());
+    assert!(text(&removed.stderr).contains("does not exist"));
+}
+
+fn insert_terminal_run(state: &Path, run_id: &str, manifest: &Value) {
+    let connection =
+        rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("Run database");
+    let completion = json!({
+        "kind": "engine_returned",
+        "result": {
+            "kind": "output",
+            "output": {
+                "programs": {
+                    "primary": {
+                        "final_environment": {
+                            "availability": "available",
+                            "value": manifest,
+                        }
+                    }
+                }
+            }
+        }
+    });
+    connection
+        .execute(
+            "INSERT INTO runs(
+                run_id, accepted_at, input_json, input_identity_json, terminal_at, completion_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                run_id,
+                "2026-08-27T00:00:00Z",
+                "{}",
+                "{}",
+                "2026-08-27T00:00:01Z",
+                serde_json::to_string(&completion).expect("completion JSON"),
+            ],
+        )
+        .expect("insert terminal Run");
 }
 
 #[test]
@@ -190,18 +370,27 @@ fn invalid_requests_do_not_emit_success_json() {
 }
 
 fn create_layout(root: &Path) -> PathBuf {
+    create_layout_with_layers(root, &[layer_bytes()])
+}
+
+fn create_layout_with_layers(root: &Path, layers: &[Vec<u8>]) -> PathBuf {
     let layout = root.join("layout");
     fs::create_dir_all(layout.join("blobs/sha256")).expect("blob directory");
 
-    let layer = layer_bytes();
-    let layer_descriptor = descriptor(&MediaType::ImageLayer, &layer);
-    let diff_id = sha256_digest(&layer);
+    let layer_descriptors = layers
+        .iter()
+        .map(|layer| descriptor(&MediaType::ImageLayer, layer))
+        .collect::<Vec<_>>();
+    let diff_ids = layers
+        .iter()
+        .map(|layer| sha256_digest(layer))
+        .collect::<Vec<_>>();
     let config = serde_json::to_vec(&json!({
         "architecture": "amd64",
         "os": "linux",
         "rootfs": {
             "type": "layers",
-            "diff_ids": [diff_id],
+            "diff_ids": diff_ids,
         },
         "config": {
             "User": "1000:1001",
@@ -217,12 +406,14 @@ fn create_layout(root: &Path) -> PathBuf {
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
         "config": config_descriptor,
-        "layers": [layer_descriptor],
+        "layers": layer_descriptors,
     }))
     .expect("manifest JSON");
     let manifest_descriptor = descriptor(&MediaType::ImageManifest, &manifest);
 
-    write_blob(&layout, &layer_descriptor, &layer);
+    for (descriptor, layer) in layer_descriptors.iter().zip(layers) {
+        write_blob(&layout, descriptor, layer);
+    }
     write_blob(&layout, &config_descriptor, &config);
     write_blob(&layout, &manifest_descriptor, &manifest);
     fs::write(
@@ -240,6 +431,44 @@ fn create_layout(root: &Path) -> PathBuf {
     )
     .expect("write layout marker");
     layout
+}
+
+fn filesystem_layer(build: impl FnOnce(&mut tar::Builder<&mut Vec<u8>>)) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut bytes);
+        build(&mut builder);
+        builder.finish().expect("finish filesystem layer");
+    }
+    bytes
+}
+
+fn append_file(builder: &mut tar::Builder<&mut Vec<u8>>, path: &str, bytes: &[u8]) {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(u64::try_from(bytes.len()).expect("file size"));
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, Cursor::new(bytes))
+        .expect("append file");
+}
+
+fn append_symlink(builder: &mut tar::Builder<&mut Vec<u8>>, path: &str, target: &str) {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(0);
+    header.set_mode(0o777);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_link_name(target).expect("symlink target");
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, Cursor::new([]))
+        .expect("append symlink");
 }
 
 fn layer_bytes() -> Vec<u8> {
