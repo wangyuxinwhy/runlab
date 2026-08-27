@@ -75,7 +75,9 @@ pub(crate) struct Runs<'a> {
 pub(crate) struct RunStartResult {
     schema_version: u32,
     created: bool,
-    run: Value,
+    run_id: String,
+    lifecycle: &'static str,
+    completion: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,11 +166,7 @@ impl<'a> Runs<'a> {
             if existing.input_identity != identity {
                 bail!("Run identity is already bound to a different RunInput: {run_id}");
             }
-            return Ok(RunStartResult {
-                schema_version: 1,
-                created: false,
-                run: record_json(&existing),
-            });
+            return start_result(&existing, false);
         }
 
         let cancellation = CancellationToken::new();
@@ -198,11 +196,7 @@ impl<'a> Runs<'a> {
             .database
             .run_get(&run_id)?
             .context("completed Run disappeared")?;
-        Ok(RunStartResult {
-            schema_version: 1,
-            created: true,
-            run: record_json(&record),
-        })
+        start_result(&record, true)
     }
 
     pub(crate) fn get(&self, run_id: RunId) -> Result<Value> {
@@ -341,6 +335,93 @@ fn record_json(record: &StoredRun) -> Value {
         "terminal_at": record.terminal_at,
         "completion": record.completion,
     })
+}
+
+fn start_result(record: &StoredRun, created: bool) -> Result<RunStartResult> {
+    Ok(RunStartResult {
+        schema_version: 1,
+        created,
+        run_id: record.run_id.clone(),
+        lifecycle: if record.completion.is_some() {
+            "terminal"
+        } else {
+            "accepted"
+        },
+        completion: record
+            .completion
+            .as_ref()
+            .map(completion_summary)
+            .transpose()?,
+    })
+}
+
+fn completion_summary(completion: &Value) -> Result<Value> {
+    let completion_kind = completion
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("persisted Run completion has no kind")?;
+    if completion_kind != "engine_returned" {
+        bail!("persisted Run completion has unsupported kind: {completion_kind}");
+    }
+
+    let result = completion
+        .get("result")
+        .and_then(Value::as_object)
+        .context("persisted engine completion has no result")?;
+    match result.get("kind").and_then(Value::as_str) {
+        Some("output") => output_summary(
+            result
+                .get("output")
+                .context("persisted engine output is missing")?,
+        ),
+        Some("engine_error") => Ok(json!({
+            "kind": "engine_error",
+            "error": result
+                .get("error")
+                .context("persisted EngineError is missing")?,
+        })),
+        Some(kind) => bail!("persisted engine result has unsupported kind: {kind}"),
+        None => bail!("persisted engine result has no kind"),
+    }
+}
+
+fn output_summary(output: &Value) -> Result<Value> {
+    let execution = output
+        .get("execution")
+        .and_then(Value::as_object)
+        .context("persisted RunOutput has no execution facts")?;
+    let programs = output
+        .get("programs")
+        .and_then(Value::as_object)
+        .context("persisted RunOutput has no programs")?;
+    let program_summaries = programs
+        .iter()
+        .map(|(program_id, program)| {
+            let program = program
+                .as_object()
+                .with_context(|| format!("persisted ProgramOutput is invalid: {program_id}"))?;
+            Ok((
+                program_id.clone(),
+                json!({
+                    "process": program
+                        .get("process")
+                        .with_context(|| format!("persisted ProgramOutput has no process facts: {program_id}"))?,
+                    "final_environment": program
+                        .get("final_environment")
+                        .with_context(|| format!("persisted ProgramOutput has no final environment: {program_id}"))?,
+                    "errors": program
+                        .get("errors")
+                        .with_context(|| format!("persisted ProgramOutput has no errors: {program_id}"))?,
+                }),
+            ))
+        })
+        .collect::<Result<serde_json::Map<_, _>>>()?;
+
+    Ok(json!({
+        "kind": "output",
+        "execution": execution,
+        "programs": program_summaries,
+    }))
 }
 
 fn run_summary(record: StoredRun) -> RunSummary {
@@ -592,5 +673,129 @@ impl SignalCancellation {
                 .map_err(|_| anyhow::anyhow!("signal handler thread panicked"))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_result_keeps_execution_facts_without_record_payloads() {
+        let completion = json!({
+            "kind": "engine_returned",
+            "result": {
+                "kind": "output",
+                "output": {
+                    "execution": {
+                        "interval": {"kind": "entered"},
+                        "timed_out": false,
+                        "cancelled": false,
+                        "errors": [],
+                    },
+                    "programs": {
+                        "primary": {
+                            "create": {"status": "succeeded"},
+                            "start": {"status": "succeeded"},
+                            "process": {"kind": "exited", "code": 0},
+                            "stdin": {"write": {"status": "succeeded"}},
+                            "stdout": {"facts": {"bytes": {"value": "large-output"}}},
+                            "stderr": {"facts": {"bytes": {"value": "large-error"}}},
+                            "final_environment": {
+                                "availability": "available",
+                                "value": {"digest": "sha256:final"},
+                            },
+                            "errors": [],
+                        }
+                    }
+                }
+            }
+        });
+        let record = stored_run(Some(completion));
+
+        let value = serde_json::to_value(start_result(&record, true).expect("start result"))
+            .expect("start result JSON");
+
+        assert_eq!(
+            value,
+            json!({
+                "schema_version": 1,
+                "created": true,
+                "run_id": "550e8400-e29b-41d4-a716-446655440000",
+                "lifecycle": "terminal",
+                "completion": {
+                    "kind": "output",
+                    "execution": {
+                        "interval": {"kind": "entered"},
+                        "timed_out": false,
+                        "cancelled": false,
+                        "errors": [],
+                    },
+                    "programs": {
+                        "primary": {
+                            "process": {"kind": "exited", "code": 0},
+                            "final_environment": {
+                                "availability": "available",
+                                "value": {"digest": "sha256:final"},
+                            },
+                            "errors": [],
+                        }
+                    }
+                }
+            })
+        );
+        let encoded = serde_json::to_string(&value).expect("encoded start result");
+        assert!(!encoded.contains("large-output"));
+        assert!(!encoded.contains("large-error"));
+        assert!(!encoded.contains("input-payload"));
+    }
+
+    #[test]
+    fn start_result_summarizes_engine_error_and_idempotent_retry() {
+        let completion = json!({
+            "kind": "engine_returned",
+            "result": {
+                "kind": "engine_error",
+                "error": {
+                    "kind": "unsupported_input",
+                    "path": "network",
+                    "reason": "unsupported",
+                }
+            }
+        });
+        let record = stored_run(Some(completion));
+
+        let value = serde_json::to_value(start_result(&record, false).expect("start result"))
+            .expect("start result JSON");
+
+        assert_eq!(value["created"], false);
+        assert_eq!(value["lifecycle"], "terminal");
+        assert_eq!(value["completion"]["kind"], "engine_error");
+        assert_eq!(value["completion"]["error"]["kind"], "unsupported_input");
+    }
+
+    #[test]
+    fn start_result_preserves_accepted_state_without_completion() {
+        let record = stored_run(None);
+
+        let value = serde_json::to_value(start_result(&record, false).expect("start result"))
+            .expect("start result JSON");
+
+        assert_eq!(value["created"], false);
+        assert_eq!(value["lifecycle"], "accepted");
+        assert!(value["completion"].is_null());
+    }
+
+    fn stored_run(completion: Option<Value>) -> StoredRun {
+        StoredRun {
+            run_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+            accepted_at: "2026-08-27T00:00:00Z".to_owned(),
+            input: json!({"stdin": "input-payload"}),
+            input_identity: json!({}),
+            terminal_at: completion
+                .as_ref()
+                .map(|_| "2026-08-27T00:00:01Z".to_owned()),
+            completion,
+        }
     }
 }

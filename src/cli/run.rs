@@ -19,6 +19,7 @@ pub(super) enum RunCommand {
     },
     /// Start one persistent Run and wait for the Engine to return.
     #[command(
+        long_about = "Start one persistent Run and wait for the Engine to return. Success writes a compact JSON summary containing the Run identity, lifecycle, execution facts, process results, final environments, and errors. Use run get for the complete persisted Run record, including captured streams and exact input bytes.",
         after_long_help = "Examples:\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --runtime-config config.json --network egress"
     )]
     Start(RunStartArgs),

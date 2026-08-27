@@ -82,6 +82,8 @@ $runlab --state "$state" run get <run-id>
 
 The same Run identity and semantically identical input make `run start` idempotent. Reusing the identity with different input fails.
 
+`run start` writes a compact JSON result containing the Run identity, lifecycle, execution facts, process results, final environments, and errors. It does not repeat the exact input or captured stdout/stderr. Use `run get RUN_ID` only when the complete persisted Run record is required.
+
 `--state` can be replaced by `RUNLAB_STATE`. Otherwise RunLab uses `$XDG_DATA_HOME/runlab` or `$HOME/.local/share/runlab`.
 
 ## Development checks

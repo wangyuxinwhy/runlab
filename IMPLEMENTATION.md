@@ -44,7 +44,7 @@ run list
 
 State 目录包含 `oci/blobs/sha256`、`runlab.sqlite3` 和 Linux 执行时使用的 `engine` workspace。OCI 内容按 Descriptor 的 size 与 digest 校验，并通过同目录临时文件原子发布。Image 名称只在完整 Manifest、Config、Layers 和 DiffIDs 验证后写入 Catalog。
 
-Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调用 Engine 前写入 accepted record；同一 identity 与语义相同的输入返回已有记录，输入不同则拒绝。Engine 正常返回 `RunOutput` 或 `EngineError` 后写入 terminal completion。
+Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调用 Engine 前写入 accepted record；同一 identity 与语义相同的输入返回已有记录，输入不同则拒绝。Engine 正常返回 `RunOutput` 或 `EngineError` 后写入 terminal completion。命令只返回有界摘要，包括 lifecycle、execution、各 Program 的 process、final environment 与 errors；完整输入和标准流仍通过显式 `run get` 读取。
 
 当前不实现跨进程恢复。进程在 accepted 之后、terminal 写入之前崩溃时，记录会诚实地保持 accepted 状态；没有 reconcile 或隐式重试。
 
@@ -72,6 +72,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 Rust 1.95 MSRV all-target check 已通过。独立进程 CLI 测试覆盖最小命令面、OCI Layout 导入、名称和 digest 查询、通过 Run 或 Image 读取文件系统路径、跨 Layer 目录合并、whiteout、opaque 目录、symlink、拒绝覆盖目标，以及错误请求不输出成功 JSON。
 
 真实 Linux CLI 纵切已通过 `runc 1.5.1`：导入 arm64 OCI Image，执行返回 exit 7 的 Run，保存独立 stdout/stderr 与 Final Image，通过 Final Image digest 提取 `/result/value` 的精确字节，并验证同 identity 重试返回 `created: false`。单独的长运行进程收到 SIGINT 后得到 terminal、`cancelled: true` 的 RunOutput，Engine workspace 无残留。
+
+紧凑 `run start` 结果也已通过真实 Linux CLI 验证：确定性 Program 分别写入 `compact-stdout` 与 `compact-stderr` 后 exit 7，命令返回 663-byte 摘要，保留 process 与 Final Environment 且不包含两个 stream payload；随后 `run get` 从完整 Record 精确恢复两段字节。同 identity 重试只把 `created` 改为 `false`，其余摘要一致。
 
 真实 `NativeEngine` E2E 还覆盖了 `Network::Egress`：Program 从独立 OCI network namespace 主动连接 VM 上的 TCP 服务并取得响应；调用返回后临时 veth 与对应 IPv4/IPv6 firewall rules 均无残留。
 

@@ -82,6 +82,8 @@ fn help_exposes_only_the_minimal_product_surface() {
     let stdout = text(&start_help.stdout);
     assert!(stdout.contains("generated from the Image when omitted"));
     assert!(stdout.contains("possible values: isolated, egress"));
+    assert!(stdout.contains("compact JSON summary"));
+    assert!(stdout.contains("Use run get for the complete persisted Run record"));
     assert!(stdout.contains("Examples:"));
 }
 
