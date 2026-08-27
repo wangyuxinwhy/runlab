@@ -18,7 +18,9 @@ use super::budget::OperationBudget;
 use super::cgroup::current_cgroup_base;
 use super::container_path::{reject_symlink_ancestor, safe_container_path};
 use super::network::{EgressPlan, EgressTools};
-use super::profile::{validate_host_resources, validate_platform, validate_runtime};
+use super::profile::{
+    validate_host_resources, validate_platform, validate_runtime, validate_secrets,
+};
 use super::runc::helper_message;
 use super::subprocess::{InvocationSupervisor, run_helper};
 use crate::oci::{OciSourceCategory, VerifiedImage, inspect_image};
@@ -157,21 +159,29 @@ impl Preparation<'_> {
         let rootfs = materialize_program_rootfs(program.id, &bundle, program.image, self.store);
         self.check_budget()?;
         let rootfs = rootfs?;
-        write_exact_config(&bundle, program.input.runtime_config().as_bytes()).map_err(
-            |error| {
-                EngineError::internal(format!(
-                    "failed to write Program {:?} config.json: {error:#}",
-                    program.id
-                ))
-            },
-        )?;
-        let artifacts = mount_artifacts(rootfs.path(), program.input.runtime_config().as_json())
-            .map_err(|error| {
-                EngineError::internal(format!(
-                    "failed to inventory Program {:?} mount destinations: {error:#}",
-                    program.id
-                ))
-            })?;
+        let (config_bytes, config, mut sensitive_artifacts) =
+            derived_runtime_config(program.invocation.path(), program.index, program.input)
+                .map_err(|error| {
+                    EngineError::internal(format!(
+                        "failed to deliver Program {:?} Secrets: {error:#}",
+                        program.id
+                    ))
+                })?;
+        write_config(&bundle, &config_bytes).map_err(|error| {
+            EngineError::internal(format!(
+                "failed to write Program {:?} config.json: {error:#}",
+                program.id
+            ))
+        })?;
+        if !program.input.secrets().is_empty() {
+            sensitive_artifacts.push(bundle.join("config.json"));
+        }
+        let artifacts = mount_artifacts(rootfs.path(), &config).map_err(|error| {
+            EngineError::internal(format!(
+                "failed to inventory Program {:?} mount destinations: {error:#}",
+                program.id
+            ))
+        })?;
         let suffix = INVOCATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let runtime_id = format!(
             "run-engine-{}-{}-{suffix}",
@@ -202,6 +212,7 @@ impl Preparation<'_> {
             rootfs,
             parent: program.input.initial_environment().clone(),
             artifacts,
+            sensitive_artifacts,
             egress: program
                 .egress
                 .map(|tools| tools.plan(std::process::id(), suffix)),
@@ -250,6 +261,7 @@ fn validate_input_capabilities(input: &RunInput) -> Result<(), EngineError> {
     }
     for (program_id, program) in input.programs() {
         validate_runtime(program_id, program, input.network())?;
+        validate_secrets(program_id, program)?;
         validate_host_resources(program_id, program)?;
     }
     if geteuid().as_raw() != 0 {
@@ -307,6 +319,7 @@ pub(super) struct PreparedProgram {
     pub(super) rootfs: Rootfs,
     pub(super) parent: ImageDescriptor,
     pub(super) artifacts: Vec<PathBuf>,
+    pub(super) sensitive_artifacts: Vec<PathBuf>,
     pub(super) egress: Option<EgressPlan>,
 }
 
@@ -477,7 +490,7 @@ pub(super) fn create_private_directory(path: &Path) -> AnyResult<()> {
     Ok(())
 }
 
-fn write_exact_config(bundle: &Path, bytes: &[u8]) -> AnyResult<()> {
+fn write_config(bundle: &Path, bytes: &[u8]) -> AnyResult<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -486,6 +499,72 @@ fn write_exact_config(bundle: &Path, bytes: &[u8]) -> AnyResult<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+fn derived_runtime_config(
+    invocation: &Path,
+    program_index: usize,
+    program: &run_protocol::ProgramInput,
+) -> AnyResult<(Vec<u8>, serde_json::Value, Vec<PathBuf>)> {
+    if program.secrets().is_empty() {
+        return Ok((
+            program.runtime_config().as_bytes().to_vec(),
+            program.runtime_config().as_json().clone(),
+            Vec::new(),
+        ));
+    }
+
+    let mut config = program.runtime_config().as_json().clone();
+    let mut sensitive_artifacts = Vec::new();
+    let process = config
+        .get_mut("process")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("validated Runtime Configuration process is absent")?;
+    let environment = process
+        .entry("env")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("validated Runtime Configuration process.env is not an array")?;
+    for (name, value) in program.secrets().env() {
+        let value = std::str::from_utf8(value.as_bytes())
+            .expect("Run Protocol validates Secret environment values as UTF-8");
+        environment.push(serde_json::Value::String(format!("{name}={value}")));
+    }
+
+    if !program.secrets().files().is_empty() {
+        let secret_directory = invocation.join(format!("secrets-{program_index}"));
+        create_private_directory(&secret_directory)?;
+        let mounts = config
+            .as_object_mut()
+            .context("validated Runtime Configuration is not an object")?
+            .entry("mounts")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .context("validated Runtime Configuration mounts is not an array")?;
+        for (index, (destination, value)) in program.secrets().files().iter().enumerate() {
+            let source = secret_directory.join(index.to_string());
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o444)
+                .open(&source)?;
+            file.write_all(value.as_bytes())?;
+            file.sync_all()?;
+            sensitive_artifacts.push(source.clone());
+            let source = source
+                .to_str()
+                .context("NativeEngine Secret source path is not UTF-8")?;
+            mounts.push(serde_json::json!({
+                "destination": destination,
+                "source": source,
+                "type": "bind",
+                "options": ["bind", "ro", "nosuid", "nodev", "noexec"]
+            }));
+        }
+    }
+
+    let bytes = serde_json::to_vec(&config).context("failed to encode derived config.json")?;
+    Ok((bytes, config, sensitive_artifacts))
 }
 
 fn mount_artifacts(rootfs: &Path, config: &serde_json::Value) -> AnyResult<Vec<PathBuf>> {

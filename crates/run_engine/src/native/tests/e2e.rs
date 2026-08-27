@@ -161,6 +161,21 @@ fn real_runc_exercises_native_engine_contract() {
     );
     assert_workspace_empty(workspace.path());
 
+    let secrets = engine
+        .run(e2e_input_with_secrets(&initial), CancellationToken::new())
+        .expect("Secret delivery output");
+    let secret_program = &secrets.programs()[&ProgramId::primary()];
+    assert!(matches!(
+        secret_program.process(),
+        ProcessResult::Exited { code: 0, .. }
+    ));
+    let secret_final = secret_program
+        .final_environment()
+        .value()
+        .expect("final image after Secret delivery");
+    assert_final_delta(store.as_ref(), secret_final);
+    assert_workspace_empty(workspace.path());
+
     let exit_zero = engine
         .run(
             e2e_input(&initial, "exit-zero", "sleep .2; exit 0", b"", None),

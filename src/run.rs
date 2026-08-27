@@ -15,7 +15,8 @@ use run_engine::{CancellationToken, RunEngine};
 use run_protocol::{
     Availability, EngineError, ExecutionInterval, ImageDescriptor, Network, OperationError,
     OperationReport, OperationStage, OperationStatus, ProcessResult, ProgramId, ProgramInput,
-    ProgramOutput, RunInput, RunOutput, RuntimeConfig, StopActionResult, StopSignal, StreamFacts,
+    ProgramOutput, RunInput, RunOutput, RuntimeConfig, Secrets, StopActionResult, StopSignal,
+    StreamFacts,
 };
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
@@ -62,6 +63,7 @@ pub(crate) struct RunRequest {
     pub(crate) image: ImageSelector,
     pub(crate) runtime_config: Option<PathBuf>,
     pub(crate) stdin: Option<PathBuf>,
+    pub(crate) secrets: Secrets,
     pub(crate) execution_timeout_ms: Option<NonZeroU64>,
     pub(crate) network: Network,
 }
@@ -131,7 +133,12 @@ impl<'a> Runs<'a> {
             .transpose()?
             .unwrap_or_default();
         let protocol_image = ImageDescriptor::new(image.manifest.clone())?;
-        let program = ProgramInput::new(protocol_image, runtime.clone(), stdin.clone())?;
+        let program = ProgramInput::new(
+            protocol_image,
+            runtime.clone(),
+            stdin.clone(),
+            request.secrets.clone(),
+        )?;
         let input = RunInput::new(
             BTreeMap::from([(ProgramId::primary(), program)]),
             request.execution_timeout_ms,
@@ -141,6 +148,7 @@ impl<'a> Runs<'a> {
             &image.manifest,
             &runtime_bytes,
             &stdin,
+            &request.secrets,
             request.execution_timeout_ms,
             request.network,
         )?;
@@ -148,6 +156,7 @@ impl<'a> Runs<'a> {
             &image.manifest,
             runtime.as_json(),
             &stdin,
+            &request.secrets,
             request.execution_timeout_ms,
             request.network,
         )?;
@@ -276,6 +285,7 @@ fn input_json(
     image: &oci_spec::image::Descriptor,
     runtime: &[u8],
     stdin: &[u8],
+    secrets: &Secrets,
     timeout: Option<NonZeroU64>,
     network: Network,
 ) -> Result<Value> {
@@ -290,7 +300,8 @@ fn input_json(
                 "stdin": {
                     "encoding": "base64",
                     "bytes": BASE64.encode(stdin),
-                }
+                },
+                "secrets": redacted_secrets(secrets),
             }
         },
         "execution_timeout_ms": timeout.map(NonZeroU64::get),
@@ -302,6 +313,7 @@ fn input_identity_json(
     image: &oci_spec::image::Descriptor,
     runtime: &Value,
     stdin: &[u8],
+    secrets: &Secrets,
     timeout: Option<NonZeroU64>,
     network: Network,
 ) -> Result<Value> {
@@ -311,11 +323,53 @@ fn input_identity_json(
                 "initial_environment": serde_json::to_value(image)?,
                 "runtime_config": runtime,
                 "stdin": BASE64.encode(stdin),
+                "secrets": secret_identity(secrets),
             }
         },
         "execution_timeout_ms": timeout.map(NonZeroU64::get),
         "network": network_name(network),
     }))
+}
+
+fn redacted_secrets(secrets: &Secrets) -> Value {
+    json!({
+        "env": secrets
+            .env()
+            .keys()
+            .map(|name| (name.clone(), json!({"retained": false})))
+            .collect::<serde_json::Map<_, _>>(),
+        "files": secrets
+            .files()
+            .keys()
+            .map(|path| (path.clone(), json!({"retained": false})))
+            .collect::<serde_json::Map<_, _>>(),
+    })
+}
+
+fn secret_identity(secrets: &Secrets) -> Value {
+    json!({
+        "env": secrets
+            .env()
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::String(sha256_digest(value.as_bytes()))))
+            .collect::<serde_json::Map<_, _>>(),
+        "files": secrets
+            .files()
+            .iter()
+            .map(|(path, value)| (path.clone(), Value::String(sha256_digest(value.as_bytes()))))
+            .collect::<serde_json::Map<_, _>>(),
+    })
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    format!("sha256:{encoded}")
 }
 
 fn network_name(network: Network) -> &'static str {
@@ -679,6 +733,59 @@ impl SignalCancellation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_input_redacts_secret_bytes_but_identity_distinguishes_them() {
+        let image: oci_spec::image::Descriptor = serde_json::from_value(json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1
+        }))
+        .expect("descriptor");
+        let first = Secrets::new(
+            BTreeMap::from([(
+                "TOKEN".to_owned(),
+                run_protocol::SecretValue::new(b"plain-environment-secret".to_vec()),
+            )]),
+            BTreeMap::from([(
+                "/run/secret".to_owned(),
+                run_protocol::SecretValue::new(b"plain-file-secret".to_vec()),
+            )]),
+        )
+        .expect("Secrets");
+        let second = Secrets::new(
+            BTreeMap::from([(
+                "TOKEN".to_owned(),
+                run_protocol::SecretValue::new(b"different".to_vec()),
+            )]),
+            BTreeMap::from([(
+                "/run/secret".to_owned(),
+                run_protocol::SecretValue::new(b"plain-file-secret".to_vec()),
+            )]),
+        )
+        .expect("Secrets");
+
+        let record =
+            input_json(&image, b"{}", b"", &first, None, Network::Isolated).expect("record input");
+        let encoded = serde_json::to_string(&record).expect("record JSON");
+        assert!(!encoded.contains("plain-environment-secret"));
+        assert!(!encoded.contains("plain-file-secret"));
+        assert_eq!(
+            record["programs"]["primary"]["secrets"]["env"]["TOKEN"]["retained"],
+            false
+        );
+
+        let first_identity =
+            input_identity_json(&image, &json!({}), b"", &first, None, Network::Isolated)
+                .expect("first identity");
+        let second_identity =
+            input_identity_json(&image, &json!({}), b"", &second, None, Network::Isolated)
+                .expect("second identity");
+        assert_ne!(first_identity, second_identity);
+        let identity = serde_json::to_string(&first_identity).expect("identity JSON");
+        assert!(!identity.contains("plain-environment-secret"));
+        assert!(!identity.contains("plain-file-secret"));
+    }
 
     #[test]
     fn start_result_keeps_execution_facts_without_record_payloads() {

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -66,6 +67,48 @@ pub(super) fn validate_runtime(
             base.child("linux").child("rootfsPropagation"),
             "NativeEngine requires rootfs propagation that cannot propagate mounts back to the host",
         ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_secrets(id: &ProgramId, program: &ProgramInput) -> Result<(), EngineError> {
+    let base = program_path(id);
+    let runtime = program.runtime_config().as_json();
+    let environment_names = runtime
+        .pointer("/process/env")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
+        .collect::<BTreeSet<_>>();
+    for name in program.secrets().env().keys() {
+        if environment_names.contains(name.as_str()) {
+            return Err(EngineError::invalid(
+                base.clone().child("secrets").child("env").key(name),
+                "secret environment name conflicts with process.env",
+            ));
+        }
+    }
+
+    let mount_destinations = runtime
+        .get("mounts")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|mount| mount.get("destination"))
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    for destination in program.secrets().files().keys() {
+        if mount_destinations.contains(destination.as_str()) {
+            return Err(EngineError::invalid(
+                base.clone()
+                    .child("secrets")
+                    .child("files")
+                    .key(destination),
+                "secret file destination conflicts with a Runtime Configuration mount",
+            ));
+        }
     }
     Ok(())
 }

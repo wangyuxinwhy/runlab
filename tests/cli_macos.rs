@@ -18,6 +18,13 @@ fn help_exposes_the_managed_vm_product_surface() {
         assert!(!stdout.contains(removed));
     }
 
+    let start = run(&["run", "start", "--help"]);
+    assert_success(&start);
+    let stdout = text(&start.stdout);
+    assert!(stdout.contains("--secret-env"));
+    assert!(stdout.contains("--secret-file"));
+    assert!(!stdout.contains("--secret-env-file"));
+
     let vm = run(&["vm", "--help"]);
     assert_success(&vm);
     let stdout = text(&vm.stdout);

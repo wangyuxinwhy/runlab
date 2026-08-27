@@ -11,4 +11,4 @@ pub(crate) use guest::{GuestHandshake, TRANSPORT_VERSION};
 #[cfg(target_os = "macos")]
 pub(crate) use host::ManagedVm;
 #[cfg(target_os = "macos")]
-pub(crate) use transport::ForwardedOutput;
+pub(crate) use transport::{ForwardRunStart, ForwardedOutput};

@@ -1,4 +1,6 @@
+use std::env;
 use std::ffi::{OsStr, OsString};
+use std::io::Write as _;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -11,10 +13,22 @@ use super::host::{
     INSTANCE, ManagedVm, STATE_PATH, ensure_remote_identity, ensure_success, file_identity,
     guest_binary_path,
 };
+use crate::cli::run::SecretFileArg;
 
 pub(crate) struct ForwardedOutput {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+}
+
+pub(crate) struct ForwardRunStart<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) image: &'a str,
+    pub(crate) runtime_config: Option<&'a Path>,
+    pub(crate) stdin: Option<&'a Path>,
+    pub(crate) secret_env: &'a [String],
+    pub(crate) secret_files: &'a [SecretFileArg],
+    pub(crate) execution_timeout_ms: Option<NonZeroU64>,
+    pub(crate) network: &'a str,
 }
 
 impl From<Output> for ForwardedOutput {
@@ -76,51 +90,97 @@ impl ManagedVm {
 
     pub(crate) fn forward_run_start(
         &self,
-        id: &str,
-        image: &str,
-        runtime_config: Option<&Path>,
-        stdin: Option<&Path>,
-        execution_timeout_ms: Option<NonZeroU64>,
-        network: &str,
+        request: &ForwardRunStart<'_>,
     ) -> Result<ForwardedOutput> {
         self.ensure_ready()?;
-        let runtime_config = runtime_config
-            .map(|path| self.stage_input(path, "runtime-config"))
-            .transpose()?;
-        let stdin = stdin
-            .map(|path| self.stage_input(path, "stdin"))
-            .transpose();
-        let stdin = match stdin {
-            Ok(stdin) => stdin,
+        let mut staged = Vec::new();
+        let arguments = (|| {
+            let runtime_config = request
+                .runtime_config
+                .map(|path| self.stage_input(path, "runtime-config"))
+                .transpose()?;
+            if let Some(path) = &runtime_config {
+                staged.push(path.clone());
+            }
+            let stdin = request
+                .stdin
+                .map(|path| self.stage_input(path, "stdin"))
+                .transpose()?;
+            if let Some(path) = &stdin {
+                staged.push(path.clone());
+            }
+
+            let mut secret_environment = Vec::new();
+            for name in request.secret_env {
+                let value = env::var(name).with_context(|| {
+                    format!("Secret environment variable is unavailable: {name}")
+                })?;
+                let mut temporary = tempfile::NamedTempFile::new()
+                    .context("failed to stage Secret environment value")?;
+                temporary
+                    .write_all(value.as_bytes())
+                    .context("failed to stage Secret environment value")?;
+                temporary
+                    .flush()
+                    .context("failed to stage Secret environment value")?;
+                let remote = self.stage_secret_input(temporary.path(), "secret-env")?;
+                staged.push(remote.clone());
+                secret_environment.push((name, remote));
+            }
+
+            let mut secret_file_sources = Vec::new();
+            for secret in request.secret_files {
+                let remote = self.stage_secret_input(&secret.source, "secret-file")?;
+                staged.push(remote.clone());
+                secret_file_sources.push((&secret.destination, remote));
+            }
+
+            let mut arguments: Vec<OsString> = vec![
+                "run".into(),
+                "start".into(),
+                "--id".into(),
+                request.id.into(),
+                "--image".into(),
+                request.image.into(),
+                "--network".into(),
+                request.network.into(),
+            ];
+            if let Some(path) = &runtime_config {
+                arguments.extend(["--runtime-config".into(), path.into()]);
+            }
+            if let Some(path) = &stdin {
+                arguments.extend(["--stdin".into(), path.into()]);
+            }
+            for (name, source) in secret_environment {
+                arguments.extend([
+                    "--secret-env-file".into(),
+                    format!("{name}={source}").into(),
+                ]);
+            }
+            for (destination, source) in secret_file_sources {
+                arguments.extend([
+                    "--secret-file".into(),
+                    format!("{source}={destination}").into(),
+                ]);
+            }
+            if let Some(timeout) = request.execution_timeout_ms {
+                arguments.extend([
+                    "--execution-timeout-ms".into(),
+                    timeout.get().to_string().into(),
+                ]);
+            }
+            Ok(arguments)
+        })();
+        let arguments = match arguments {
+            Ok(arguments) => arguments,
             Err(error) => {
-                self.cleanup_inputs(&runtime_config.iter().collect::<Vec<_>>());
+                self.cleanup_inputs(&staged.iter().collect::<Vec<_>>());
                 return Err(error);
             }
         };
-        let mut arguments: Vec<OsString> = vec![
-            "run".into(),
-            "start".into(),
-            "--id".into(),
-            id.into(),
-            "--image".into(),
-            image.into(),
-            "--network".into(),
-            network.into(),
-        ];
-        if let Some(path) = &runtime_config {
-            arguments.extend(["--runtime-config".into(), path.into()]);
-        }
-        if let Some(path) = &stdin {
-            arguments.extend(["--stdin".into(), path.into()]);
-        }
-        if let Some(timeout) = execution_timeout_ms {
-            arguments.extend([
-                "--execution-timeout-ms".into(),
-                timeout.get().to_string().into(),
-            ]);
-        }
-        let staged = runtime_config.iter().chain(&stdin).collect::<Vec<_>>();
-        let output = self.systemd_state_command(arguments, &staged);
+        let references = staged.iter().collect::<Vec<_>>();
+        let output = self.systemd_state_command(arguments, &references);
+        self.cleanup_inputs(&references);
         output.map(Into::into)
     }
 
@@ -260,6 +320,15 @@ impl ManagedVm {
         let remote = format!("/var/tmp/runlab-{label}-{}", Uuid::new_v4());
         let identity = file_identity(source)?;
         self.copy_checked(source, &identity, &remote)?;
+        Ok(remote)
+    }
+
+    fn stage_secret_input(&self, source: &Path, label: &str) -> Result<String> {
+        let remote = self.stage_input(source, label)?;
+        if let Err(error) = self.guest_success(["chmod", "0600", &remote]) {
+            self.cleanup_inputs(&[&remote]);
+            return Err(error);
+        }
         Ok(remote)
     }
 

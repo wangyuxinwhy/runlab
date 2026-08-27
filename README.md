@@ -90,6 +90,8 @@ $runlab --state "$state" run start \
   --id "$(uuidgen | tr '[:upper:]' '[:lower:]')" \
   --image agent-base \
   --runtime-config ./config.json \
+  --secret-env API_KEY \
+  --secret-file ./auth.json=/run/secrets/auth.json \
   --network egress
 
 $runlab --state "$state" run list
@@ -97,6 +99,8 @@ $runlab --state "$state" run get <run-id>
 ```
 
 The same Run identity and semantically identical input make `run start` idempotent. Reusing the identity with different input fails.
+
+`--secret-env NAME` reads one variable from the caller environment. `--secret-file HOST_FILE=CONTAINER_PATH` reads one host file and exposes its exact bytes as a read-only regular file during execution. Secret values are part of the in-memory Run Protocol input, but RunLab does not serialize them from the Secret fields into the public Run record or Final Environment. A Program can still disclose a Secret by writing it to stdout, stderr, or its writable filesystem.
 
 `run start` writes a compact JSON result containing the Run identity, lifecycle, execution facts, process results, final environments, and errors. It does not repeat the exact input or captured stdout/stderr. Use `run get RUN_ID` only when the complete persisted Run record is required.
 

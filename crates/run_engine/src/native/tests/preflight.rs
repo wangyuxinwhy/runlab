@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
-use run_protocol::{Network, ProgramId, ProgramInput, RunInput, RuntimeConfig};
+use run_protocol::{
+    Network, ProgramId, ProgramInput, RunInput, RuntimeConfig, SecretValue, Secrets,
+};
 use serde_json::json;
 
 use super::fixtures::*;
 use crate::native::prepare::{MAX_EXECUTION_TIMEOUT, MAX_PROGRAMS};
-use crate::native::profile::{validate_host_resources, validate_platform, validate_runtime};
+use crate::native::profile::{
+    validate_host_resources, validate_platform, validate_runtime, validate_secrets,
+};
 use crate::oci::inspect_image;
 use crate::{CancellationToken, RunEngine};
 
@@ -52,7 +56,8 @@ fn isolated_profile_requires_one_new_network_namespace() {
             br#"{"ociVersion":"1.3.0","root":{"path":"rootfs"},"process":{"terminal":false,"args":["/bin/true"],"cwd":"/","user":{"uid":0,"gid":0},"noNewPrivileges":true,"capabilities":{"bounding":[],"effective":[],"inheritable":[],"permitted":[],"ambient":[]}},"linux":{"namespaces":[{"type":"pid"},{"type":"network","path":"/proc/1/ns/net"},{"type":"ipc"},{"type":"uts"},{"type":"mount"},{"type":"cgroup"}]}}"#.to_vec(),
         )
         .expect("runtime");
-    let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
+    let program =
+        ProgramInput::new(test_image(), runtime, Vec::new(), Secrets::empty()).expect("program");
     let error = validate_runtime(&id, &program, Network::Isolated).expect_err("existing namespace");
     assert!(
         error
@@ -169,7 +174,8 @@ fn native_profile_delegates_oci_runtime_semantics_to_runc() {
         .insert("noNewPrivileges".to_owned(), json!(false));
     let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
         .expect("structurally valid runtime config");
-    let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
+    let program =
+        ProgramInput::new(test_image(), runtime, Vec::new(), Secrets::empty()).expect("program");
 
     validate_runtime(&ProgramId::primary(), &program, Network::Isolated)
         .expect("runc, not NativeEngine, owns these OCI field semantics");
@@ -184,7 +190,8 @@ fn host_hooks_are_rejected_without_a_containment_model() {
     );
     let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
         .expect("structurally valid runtime config");
-    let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
+    let program =
+        ProgramInput::new(test_image(), runtime, Vec::new(), Secrets::empty()).expect("program");
 
     let error = validate_runtime(&ProgramId::primary(), &program, Network::Isolated)
         .expect_err("host hooks");
@@ -214,7 +221,8 @@ fn missing_bind_source_is_rejected_before_execution() {
     );
     let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
         .expect("structurally valid runtime config");
-    let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
+    let program =
+        ProgramInput::new(test_image(), runtime, Vec::new(), Secrets::empty()).expect("program");
 
     let error =
         validate_host_resources(&ProgramId::primary(), &program).expect_err("missing bind source");
@@ -229,6 +237,57 @@ fn missing_bind_source_is_rejected_before_execution() {
 }
 
 #[test]
+fn secrets_cannot_ambiguously_replace_runtime_environment_or_mounts() {
+    let mut value = test_program().runtime_config().as_json().clone();
+    value["process"]["env"] = json!(["TOKEN=runtime"]);
+    value.as_object_mut().expect("runtime object").insert(
+        "mounts".to_owned(),
+        json!([{"destination": "/run/credential", "type": "tmpfs", "source": "tmpfs"}]),
+    );
+    let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
+        .expect("structurally valid runtime config");
+
+    let environment_conflict = ProgramInput::new(
+        test_image(),
+        runtime.clone(),
+        Vec::new(),
+        Secrets::new(
+            BTreeMap::from([("TOKEN".to_owned(), SecretValue::new(b"secret".to_vec()))]),
+            BTreeMap::new(),
+        )
+        .expect("Secrets"),
+    )
+    .expect("program");
+    let error = validate_secrets(&ProgramId::primary(), &environment_conflict)
+        .expect_err("environment collision");
+    assert_eq!(
+        error.path().map(ToString::to_string).as_deref(),
+        Some("programs[\"primary\"].secrets.env[\"TOKEN\"]")
+    );
+
+    let file_conflict = ProgramInput::new(
+        test_image(),
+        runtime,
+        Vec::new(),
+        Secrets::new(
+            BTreeMap::new(),
+            BTreeMap::from([(
+                "/run/credential".to_owned(),
+                SecretValue::new(b"secret".to_vec()),
+            )]),
+        )
+        .expect("Secrets"),
+    )
+    .expect("program");
+    let error =
+        validate_secrets(&ProgramId::primary(), &file_conflict).expect_err("mount collision");
+    assert_eq!(
+        error.path().map(ToString::to_string).as_deref(),
+        Some("programs[\"primary\"].secrets.files[\"/run/credential\"]")
+    );
+}
+
+#[test]
 fn caller_selected_cgroup_is_rejected_at_the_owned_boundary() {
     let mut value = test_program().runtime_config().as_json().clone();
     value
@@ -238,7 +297,8 @@ fn caller_selected_cgroup_is_rejected_at_the_owned_boundary() {
         .insert("cgroupsPath".to_owned(), json!("/shared"));
     let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
         .expect("structurally valid runtime config");
-    let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
+    let program =
+        ProgramInput::new(test_image(), runtime, Vec::new(), Secrets::empty()).expect("program");
 
     let error = validate_runtime(&ProgramId::primary(), &program, Network::Isolated)
         .expect_err("owned cgroup");
@@ -290,5 +350,5 @@ fn image_platform_requirements_are_rejected_at_exact_paths() {
 fn program_with_runtime(value: &serde_json::Value) -> ProgramInput {
     let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
         .expect("structurally valid runtime config");
-    ProgramInput::new(test_image(), runtime, Vec::new()).expect("program")
+    ProgramInput::new(test_image(), runtime, Vec::new(), Secrets::empty()).expect("program")
 }

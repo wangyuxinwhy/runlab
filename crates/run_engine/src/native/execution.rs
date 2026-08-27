@@ -40,6 +40,13 @@ pub(super) fn execute(
 ) -> Result<RunOutput, EngineError> {
     let mut lifecycle = ExecutionLifecycle::new(input, &prepared.supervisor);
     lifecycle.start_programs(context, input, cancellation, prepared);
+    let secret_cleanup_error = scrub_sensitive_artifacts(prepared).err().map(|error| {
+        operation_error(
+            OperationStage::Cleanup,
+            format!("failed to remove transient Secret material after OCI create: {error:#}"),
+            None,
+        )
+    });
     lifecycle.wait_for_termination(cancellation);
     for run in lifecycle.runs.values_mut() {
         run.freeze_stdin();
@@ -71,7 +78,10 @@ pub(super) fn execute(
             let (message, code) = issue.into_parts();
             operation_error(OperationStage::Cleanup, message, code)
         });
-    let execution_errors = cleanup_error.into_iter().collect::<Vec<_>>();
+    let execution_errors = secret_cleanup_error
+        .into_iter()
+        .chain(cleanup_error)
+        .collect::<Vec<_>>();
     let interval = lifecycle
         .interval_start
         .map_or_else(
@@ -92,6 +102,23 @@ pub(super) fn execute(
         ));
     }
     RunOutput::new(input, execution, outputs).map_err(output_internal)
+}
+
+fn scrub_sensitive_artifacts(prepared: &PreparedInvocation) -> AnyResult<()> {
+    // OCI create has consumed config.json and pinned each bind source; unlinking
+    // their host paths does not invalidate the files visible to the Program.
+    for path in prepared
+        .programs
+        .values()
+        .flat_map(|program| &program.sensitive_artifacts)
+    {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 struct ExecutionLifecycle {

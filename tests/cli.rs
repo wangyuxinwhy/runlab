@@ -84,6 +84,8 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("possible values: isolated, egress"));
     assert!(stdout.contains("compact JSON summary"));
     assert!(stdout.contains("Use run get for the complete persisted Run record"));
+    assert!(stdout.contains("--secret-env"));
+    assert!(stdout.contains("--secret-file"));
     assert!(stdout.contains("Examples:"));
 }
 

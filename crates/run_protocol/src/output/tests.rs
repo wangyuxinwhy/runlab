@@ -7,6 +7,7 @@ use super::stdio::validate_stream_shape;
 use super::*;
 use crate::{
     ImageDescriptor, Network, OutputError, ProgramId, ProgramInput, RunInput, RuntimeConfig,
+    Secrets,
 };
 
 fn at(second: u32) -> DateTime<FixedOffset> {
@@ -48,7 +49,8 @@ fn input(program_ids: &[&str]) -> RunInput {
         .map(|program_id| {
             (
                 ProgramId::new(*program_id),
-                ProgramInput::new(image('a'), runtime(), Vec::new()).expect("ProgramInput"),
+                ProgramInput::new(image('a'), runtime(), Vec::new(), Secrets::empty())
+                    .expect("ProgramInput"),
             )
         })
         .collect();

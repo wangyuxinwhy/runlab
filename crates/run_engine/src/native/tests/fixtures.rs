@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result as AnyResult;
 use oci_spec::image::{Descriptor, Digest, ImageIndex, ImageManifest, MediaType};
-use run_protocol::{ImageDescriptor, Network, ProgramId, ProgramInput, RunInput, RuntimeConfig};
+use run_protocol::{
+    ImageDescriptor, Network, ProgramId, ProgramInput, RunInput, RuntimeConfig, SecretValue,
+    Secrets,
+};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
@@ -75,6 +78,7 @@ pub(super) fn empty_prepared_invocation(
         rootfs,
         parent: test_image(),
         artifacts: Vec::new(),
+        sensitive_artifacts: Vec::new(),
         egress: None,
     };
     PreparedInvocation {
@@ -331,7 +335,43 @@ pub(super) fn e2e_input_with_file_bind(image: &ImageDescriptor, source: &Path) -
         }));
     let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime JSON"))
         .expect("runtime config");
-    let program = ProgramInput::new(image.clone(), runtime, Vec::new()).expect("program");
+    let program =
+        ProgramInput::new(image.clone(), runtime, Vec::new(), Secrets::empty()).expect("program");
+    RunInput::new(
+        BTreeMap::from([(ProgramId::primary(), program)]),
+        None,
+        Network::Isolated,
+    )
+    .expect("RunInput")
+}
+
+pub(super) fn e2e_input_with_secrets(image: &ImageDescriptor) -> RunInput {
+    let base = e2e_program_with_options(
+        image,
+        "secrets",
+        "test \"$TOKEN\" = environment-secret; test \"$(cat /run/secrets/token)\" = file-secret; mkdir -p /result; printf delta >/result/value; cat /proc/self/cgroup >/result/cgroup",
+        b"",
+        "/",
+        false,
+    );
+    let secrets = Secrets::new(
+        BTreeMap::from([(
+            "TOKEN".to_owned(),
+            SecretValue::new(b"environment-secret".to_vec()),
+        )]),
+        BTreeMap::from([(
+            "/run/secrets/token".to_owned(),
+            SecretValue::new(b"file-secret".to_vec()),
+        )]),
+    )
+    .expect("Secrets");
+    let program = ProgramInput::new(
+        image.clone(),
+        base.runtime_config().clone(),
+        Vec::new(),
+        secrets,
+    )
+    .expect("program");
     RunInput::new(
         BTreeMap::from([(ProgramId::primary(), program)]),
         None,
@@ -410,7 +450,7 @@ pub(super) fn e2e_program_with_options(
     }
     let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime JSON"))
         .expect("runtime config");
-    ProgramInput::new(image.clone(), runtime, stdin.to_vec()).expect("program")
+    ProgramInput::new(image.clone(), runtime, stdin.to_vec(), Secrets::empty()).expect("program")
 }
 
 pub(super) fn assert_final_delta(store: &MemoryStore, image: &ImageDescriptor) {
@@ -440,6 +480,7 @@ pub(super) fn assert_final_delta(store: &MemoryStore, image: &ImageDescriptor) {
     assert!(rootfs.path().join("result/cgroup").is_file());
     assert!(!rootfs.path().join("runtime-created").exists());
     assert!(!rootfs.path().join("runtime-created/nested").exists());
+    assert!(!rootfs.path().join("run/secrets/token").exists());
 }
 
 pub(super) fn assert_workspace_empty(path: &Path) {
@@ -483,7 +524,7 @@ pub(super) fn test_program() -> ProgramInput {
             br#"{"ociVersion":"1.3.0","root":{"path":"rootfs"},"process":{"terminal":false,"args":["/bin/true"],"cwd":"/","user":{"uid":0,"gid":0},"noNewPrivileges":true,"capabilities":{"bounding":[],"effective":[],"inheritable":[],"permitted":[],"ambient":[]}},"linux":{"namespaces":[{"type":"pid"},{"type":"network"},{"type":"ipc"},{"type":"uts"},{"type":"mount"},{"type":"cgroup"}]}}"#.to_vec(),
         )
         .expect("runtime");
-    ProgramInput::new(test_image(), runtime, Vec::new()).expect("program")
+    ProgramInput::new(test_image(), runtime, Vec::new(), Secrets::empty()).expect("program")
 }
 
 pub(super) fn test_image() -> ImageDescriptor {

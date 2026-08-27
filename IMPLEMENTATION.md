@@ -11,7 +11,7 @@ runlab -> run_engine -> run_protocol
 runlab ----------------> run_protocol
 ```
 
-`run_protocol` 和 `run_engine::NativeEngine` 保持原有稳定边界。根 `runlab` package 已从 legacy 实现重写，不保留 Docker、managed VM、recovery、reconcile、GC、schema、RunLab-specific runtime-config DSL、registry transport 或旧 Base/Overlay/Task 模型。
+`run_protocol` 以 `ProgramInput.secrets` 表达精确的敏感环境变量和文件字节；`run_engine::NativeEngine` 在调用内交付它们，不拥有 Secret 来源或持久化。根 `runlab` package 已从 legacy 实现重写，不保留 Docker、managed service、recovery、reconcile、GC、schema、RunLab-specific runtime-config DSL、registry transport 或旧 Base/Overlay/Task 模型。
 
 `runlab` 当前由八个直接模块组成：
 
@@ -48,6 +48,8 @@ macOS 上所有 State 命令都在固定 Guest State `/var/lib/runlab` 执行，
 `filesystem get` 当前只跨 VM 传回普通文件。Guest 与 Host 文件 identity 一致后才以 no-clobber 方式发布到请求的 macOS 路径，返回 JSON 中只出现该路径，不泄露 Guest staging path。
 
 `run config generate` 把完整 OCI Runtime Configuration JSON 写到 stdout，供 `jq` 等普通 JSON 工具继续处理。`run start` 省略 `--runtime-config` 时复用同一个生成器。生成器固定创建新的 network namespace，`isolated` 或 `egress` 仍只由 `run start --network` 选择，不写入 `config.json`。
+
+`run start --secret-env NAME` 从调用方环境读取一个值，`--secret-file HOST_FILE=CONTAINER_PATH` 读取一个宿主文件。RunLab 在内存中构造 Protocol `Secrets`，公开 Run Record 只保存名称、目标和 `retained: false`；内部 identity 只保存内容摘要。NativeEngine 仅在私有调用 workspace 中派生 Runtime config 和只读 file mounts，Secret file 会在 Final Environment 捕获前移除。macOS transport 只传输 mode 0600 的临时 Secret 文件，不把值放入 argv，并在 transient systemd unit 结束后清理。
 
 ## State 与生命周期
 
@@ -86,6 +88,10 @@ Rust 1.95 MSRV all-target check 已通过。独立进程 CLI 测试覆盖最小�
 紧凑 `run start` 结果也已通过真实 Linux CLI 验证：确定性 Program 分别写入 `compact-stdout` 与 `compact-stderr` 后 exit 7，命令返回 663-byte 摘要，保留 process 与 Final Environment 且不包含两个 stream payload；随后 `run get` 从完整 Record 精确恢复两段字节。同 identity 重试只把 `created` 改为 `false`，其余摘要一致。
 
 真实 `NativeEngine` E2E 还覆盖了 `Network::Egress`：Program 从独立 OCI network namespace 主动连接 VM 上的 TCP 服务并取得响应；调用返回后临时 veth 与对应 IPv4/IPv6 firewall rules 均无残留。
+
+Secret 纵切已从 macOS CLI 经 Managed VM 和真实 `runc` 验证：Program 同时读取一个 Secret 环境变量和一个只读 Secret 文件并退出 0；`run get` 只返回 `retained: false`，Final Environment 可以取得普通结果文件但无法取得 Secret file。NativeEngine opt-in real-runc 全生命周期测试也覆盖同样的 env/file 交付、Final Environment 排除和 workspace 清理。
+
+Secret 环境变量还通过一次完整 macOS Agent User Story 验证：`pi + deepseek-v4-flash` 在 SWE-bench `psf/requests-5414` Image 中通过 `--secret-env DEEPSEEK_API_KEY` 完成任务，Program exit 0，无 execution/program error。`filesystem get --run` 取出的 571-byte `/artifacts/solution.patch` 与既有 golden patch 字节相同，SHA-256 均为 `adfa5771ae09b6ff1d91eb2a57943d20f0a899df777528a2233821e8f73fc20a`。
 
 Runtime Configuration 生成能力已在同一 Linux VM 通过真实 CLI 纵切验证：`run config generate` 的精确 stdout 字节分别被省略 `--runtime-config` 的 `isolated` 和 `egress` Run 原样保存，两个 Run 都通过 `runc` 正常退出。生成的 JSON 包含新的 network namespace，但不包含 Run Protocol 的 `network` 字段。另一路径通过 `jq` 修改生成配置的 `process.args`，再以显式 `--runtime-config` 执行并取得预期 stdout。
 

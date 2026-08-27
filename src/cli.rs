@@ -11,7 +11,7 @@ mod filesystem;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod image;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-mod run;
+pub(crate) mod run;
 #[cfg(target_os = "macos")]
 mod vm;
 

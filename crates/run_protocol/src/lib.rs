@@ -10,7 +10,10 @@ mod oci;
 mod output;
 
 pub use error::{EngineError, InputError, InputPath, OutputError};
-pub use input::{MAX_STDIN_BYTES, Network, ProgramId, ProgramInput, RunInput, RuntimeConfig};
+pub use input::{
+    MAX_STDIN_BYTES, Network, ProgramId, ProgramInput, RunInput, RuntimeConfig, SecretValue,
+    Secrets,
+};
 pub use oci::{ImageDescriptor, ImageDescriptorError};
 pub use output::{
     Availability, CreateFacts, ExecutionInterval, ExecutionOutput, Explanation,
