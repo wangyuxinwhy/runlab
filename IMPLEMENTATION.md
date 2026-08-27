@@ -53,7 +53,7 @@ macOS 上所有 State 命令都在固定 Guest State `/var/lib/runlab` 执行，
 
 ## State 与生命周期
 
-State 目录包含 `oci/blobs/sha256`、`runlab.sqlite3` 和 Linux 执行时使用的 `engine` workspace。OCI 内容按 Descriptor 的 size 与 digest 校验，并通过同目录临时文件原子发布。Image 名称只在完整 Manifest、Config、Layers 和 DiffIDs 验证后写入 Catalog。
+State 目录包含 `oci/blobs/sha256`、`runlab.sqlite3` 和 Linux 执行时使用的 `engine` 目录。`engine` 内的 `invocations` 只保存调用期间的私有 workspace，正常返回后为空；`snapshots-v3` 保存由有序 DiffID chain 标识的只读 OverlayFS snapshot 与初始 filesystem Inventory。每次 Run 仍重新验证完整 OCI 输入；命中缓存只省去重复展开 Layer 和扫描初始 Inventory，每次调用使用独立 upperdir/workdir。OCI 内容按 Descriptor 的 size 与 digest 校验，并通过同目录临时文件原子发布。Image 名称只在完整 Manifest、Config、Layers 和 DiffIDs 验证后写入 Catalog。
 
 Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调用 Engine 前写入 accepted record；同一 identity 与语义相同的输入返回已有记录，输入不同则拒绝。Engine 正常返回 `RunOutput` 或 `EngineError` 后写入 terminal completion。命令只返回有界摘要，包括 lifecycle、execution、各 Program 的 process、final environment 与 errors；完整输入和标准流仍通过显式 `run get` 读取。
 
@@ -65,6 +65,7 @@ Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调
 - `NativeEngine` 支持 `Network::Isolated` 与 outbound-only `Network::Egress`。Egress 依赖宿主启用 IPv4 forwarding，并提供 `ip`、`iptables`、`ip6tables` 与 `nsenter`；Engine 不修改宿主级 forwarding 设置。
 - Image import 只接受包含单个 Image Manifest 的标准 OCI Image Layout 目录或未压缩 tar archive。
 - 支持 OCI tar、gzip 和 zstd Layer；不实现 registry pull 或 Image build。
+- NativeEngine snapshot cache 当前没有公开命令、容量策略或淘汰机制；这些能力尚无使用场景，不在本次实现中。
 - Native Linux 的 `filesystem get` 支持文件、目录和 symlink；macOS Managed VM transport 当前只传回普通文件。
 - `filesystem get` 从 Run Program 的 Final Environment 或指定 Image 读取普通文件、目录或 symlink。目标路径必须尚不存在；单文件从最新 Layer 向前解析，目录只合并目标子树。
 - stdout/stderr 当前作为协议事实保存在完整 Run record 中；独立 stream 命令尚未因真实场景而引入。
@@ -92,6 +93,8 @@ Rust 1.95 MSRV all-target check 已通过。独立进程 CLI 测试覆盖最小�
 Secret 纵切已从 macOS CLI 经 Managed VM 和真实 `runc` 验证：Program 同时读取一个 Secret 环境变量和一个只读 Secret 文件并退出 0；`run get` 只返回 `retained: false`，Final Environment 可以取得普通结果文件但无法取得 Secret file。NativeEngine opt-in real-runc 全生命周期测试也覆盖同样的 env/file 交付、Final Environment 排除和 workspace 清理。
 
 Secret 环境变量还通过一次完整 macOS Agent User Story 验证：`pi + deepseek-v4-flash` 在 SWE-bench `psf/requests-5414` Image 中通过 `--secret-env DEEPSEEK_API_KEY` 完成任务，Program exit 0，无 execution/program error。`filesystem get --run` 取出的 571-byte `/artifacts/solution.patch` 与既有 golden patch 字节相同，SHA-256 均为 `adfa5771ae09b6ff1d91eb2a57943d20f0a899df777528a2233821e8f73fc20a`。
+
+NativeEngine snapshot cache 与 upperdir-guided Final Image capture 已在同一 Managed VM 以 release binary 和 11-Layer SWE-bench Image 做 cold/warm 单次对照。snapshot chain 只发布 `upper`、`directories.bin` 和 `chain.bin`，解码后的 Layer 与 staged file 只存在于 build scratch；实际 cache 为 639 MiB，其中 Inventory 为 4.4 MiB，成功发布后没有 `build-*` 或 scratch 残留。cold `/bin/true` Run 从 accepted 到执行开始为 29.601 秒，warm Run 为 2.820 秒；对应完整命令 wall time 为 33.88 秒和 7.05 秒。进程结束到 terminal record 分别为 2.420 秒和 2.373 秒，两个 Run 均无 execution 或 Program error，Final Image digest 都是 `sha256:35f222e7175d8cc7bac5614f1fa0666d92ac7856d34d92c24859c11dc59dcd81`。另一次 warm Run 写入 5-byte `/artifacts/solution.patch`，wall time 为 7.13 秒，Final Image `sha256:9116f754d82d79aef469ba2f5cb4ed60afa0fd870591f2f1831c833c4fbf5f76` 可由 `filesystem get` 取回相同字节。调用后 invocation workspace 均为空。这些是固定环境中的各一次观测，不表示统计分布。
 
 Runtime Configuration 生成能力已在同一 Linux VM 通过真实 CLI 纵切验证：`run config generate` 的精确 stdout 字节分别被省略 `--runtime-config` 的 `isolated` 和 `egress` Run 原样保存，两个 Run 都通过 `runc` 正常退出。生成的 JSON 包含新的 network namespace，但不包含 Run Protocol 的 `network` 字段。另一路径通过 `jq` 修改生成配置的 `process.args`，再以显式 `--runtime-config` 执行并取得预期 stdout。
 

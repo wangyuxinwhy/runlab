@@ -9,12 +9,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use oci_spec::image::Digest;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat, unlinkat};
 use rustix::io::Errno;
+use serde::{Deserialize, Serialize};
 
 use super::{RootfsError, RootfsErrorKind, RootfsLimits};
 
 type Xattrs = BTreeMap<Box<[u8]>, Box<[u8]>>;
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct FsPath(Box<[u8]>);
 
 impl FsPath {
@@ -93,13 +94,13 @@ impl FsPath {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Timestamp {
     seconds: i64,
     nanos: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Metadata {
     mode: u32,
     uid: u32,
@@ -108,7 +109,7 @@ struct Metadata {
     xattrs: Xattrs,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum EntryKind {
     Regular {
         digest: Digest,
@@ -128,13 +129,13 @@ enum EntryKind {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct FsEntry {
     metadata: Metadata,
     kind: EntryKind,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct Inventory {
     root: Option<Metadata>,
     entries: BTreeMap<FsPath, FsEntry>,
@@ -148,9 +149,10 @@ struct Inventory {
 pub(crate) struct Rootfs {
     workspace: PathBuf,
     root_path: PathBuf,
-    root: OwnedFd,
+    root: Option<OwnedFd>,
     initial: Inventory,
     limits: RootfsLimits,
+    overlay: Option<snapshot::OverlayMount>,
 }
 
 impl Rootfs {
@@ -160,7 +162,20 @@ impl Rootfs {
 
     /// Fails unless `/proc/self/mountinfo` proves no mount remains below rootfs.
     pub(crate) fn ensure_no_mounts(&self) -> Result<()> {
-        mountinfo::ensure_no_mounts(&self.root)
+        mountinfo::ensure_no_mounts(self.root()?, self.overlay.is_some())
+    }
+
+    /// Releases the Engine-owned root `OverlayFS` after final capture.
+    pub(crate) fn unmount_overlay(&mut self) -> Result<()> {
+        self.ensure_no_mounts()?;
+        if let Some(mut overlay) = self.overlay.take() {
+            drop(self.root.take());
+            if let Err(error) = overlay.unmount() {
+                self.overlay = Some(overlay);
+                return Err(error);
+            }
+        }
+        mountinfo::ensure_path_no_mounts(&self.root_path)
     }
 
     /// Removes one empty Engine-created mountpoint without resolving any
@@ -182,7 +197,7 @@ impl Rootfs {
             );
         }
 
-        let Some(parent) = apply::open_parent_existing(&self.root, &path).with_context(|| {
+        let Some(parent) = apply::open_parent_existing(self.root()?, &path).with_context(|| {
             format!(
                 "rootfs instability: could not traverse mount artifact {} without following symlinks",
                 path.display()
@@ -221,6 +236,34 @@ impl Rootfs {
             )
         })?;
         Ok(())
+    }
+
+    fn root(&self) -> Result<&OwnedFd> {
+        self.root
+            .as_ref()
+            .context("rootfs descriptor has already been released")
+    }
+
+    fn overlay_upper(&self) -> Option<&Path> {
+        self.overlay.as_ref().map(snapshot::OverlayMount::upper)
+    }
+
+    fn from_overlay(
+        workspace: PathBuf,
+        root_path: PathBuf,
+        root: OwnedFd,
+        initial: Inventory,
+        limits: RootfsLimits,
+        overlay: snapshot::OverlayMount,
+    ) -> Self {
+        Self {
+            workspace,
+            root_path,
+            root: Some(root),
+            initial,
+            limits,
+            overlay: Some(overlay),
+        }
     }
 }
 
@@ -426,6 +469,7 @@ mod layer;
 mod mountinfo;
 mod plan;
 mod preflight;
+mod snapshot;
 mod xattr;
 
 #[cfg(test)]

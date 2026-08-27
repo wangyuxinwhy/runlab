@@ -75,7 +75,9 @@ impl Preparation<'_> {
         } else {
             None
         };
-        let workspace_root = validate_private_directory(self.workspace_root, "workspace_root")?;
+        let engine_root = validate_private_directory(self.workspace_root, "workspace_root")?;
+        let workspace_root = ensure_private_directory(&engine_root.join("invocations"))?;
+        let snapshot_root = ensure_private_directory(&engine_root.join("snapshots-v3"))?;
         let runc = validate_runc(self.runc_executable, self.budget, self.supervisor)?;
         let images = self.inspect_images()?;
         let invocation = create_invocation_workspace(&workspace_root)?;
@@ -94,6 +96,7 @@ impl Preparation<'_> {
             &cgroup_base,
             &images,
             egress.as_ref(),
+            &snapshot_root,
         )?;
 
         Ok(PreparedInvocation {
@@ -126,6 +129,7 @@ impl Preparation<'_> {
         cgroup_base: &Path,
         images: &BTreeMap<ProgramId, VerifiedImage>,
         egress: Option<&EgressTools>,
+        snapshot_root: &Path,
     ) -> Result<BTreeMap<ProgramId, PreparedProgram>, EngineError> {
         let mut programs = BTreeMap::new();
         for (index, (program_id, program)) in self.input.programs().iter().enumerate() {
@@ -138,6 +142,7 @@ impl Preparation<'_> {
                 runtime_root,
                 cgroup_base,
                 egress,
+                snapshot_root,
             })?;
             programs.insert(program_id.clone(), prepared);
             self.check_budget()?;
@@ -156,7 +161,13 @@ impl Preparation<'_> {
         create_private_directory(&bundle).map_err(|error| {
             EngineError::internal(format!("failed to create OCI bundle: {error:#}"))
         })?;
-        let rootfs = materialize_program_rootfs(program.id, &bundle, program.image, self.store);
+        let rootfs = materialize_program_rootfs_cached(
+            program.id,
+            &bundle,
+            program.snapshot_root,
+            program.image,
+            self.store,
+        );
         self.check_budget()?;
         let rootfs = rootfs?;
         let (config_bytes, config, mut sensitive_artifacts) =
@@ -236,6 +247,7 @@ struct ProgramPreparation<'a> {
     runtime_root: &'a Path,
     cgroup_base: &'a Path,
     egress: Option<&'a EgressTools>,
+    snapshot_root: &'a Path,
 }
 
 fn validate_input_capabilities(input: &RunInput) -> Result<(), EngineError> {
@@ -341,6 +353,7 @@ pub(super) fn inspect_program_image(
     inspect_image(store, image).map_err(|error| map_oci_error(id, &error))
 }
 
+#[cfg(test)]
 pub(super) fn materialize_program_rootfs(
     id: &ProgramId,
     bundle: &Path,
@@ -358,6 +371,31 @@ pub(super) fn materialize_program_rootfs(
     Rootfs::materialize_in(bundle, &layers, RootfsLimits::default(), |descriptor| {
         store.open(descriptor).map_err(anyhow::Error::new)
     })
+    .map_err(|error| map_materialize_error(id, &error))
+}
+
+fn materialize_program_rootfs_cached(
+    id: &ProgramId,
+    bundle: &Path,
+    snapshot_root: &Path,
+    image: &VerifiedImage,
+    store: &dyn OciContentStore,
+) -> Result<Rootfs, EngineError> {
+    let layers = image
+        .layers()
+        .iter()
+        .map(|layer| VerifiedLayer {
+            descriptor: layer.descriptor(),
+            expected_diff_id: layer.diff_id(),
+        })
+        .collect::<Vec<_>>();
+    Rootfs::materialize_cached_in(
+        bundle,
+        snapshot_root,
+        &layers,
+        RootfsLimits::default(),
+        |descriptor| store.open(descriptor).map_err(anyhow::Error::new),
+    )
     .map_err(|error| map_materialize_error(id, &error))
 }
 
@@ -420,6 +458,27 @@ fn validate_private_directory(path: &Path, label: &str) -> Result<PathBuf, Engin
         )));
     }
     Ok(canonical)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<PathBuf, EngineError> {
+    match fs::create_dir(path) {
+        Ok(()) => {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                EngineError::internal(format!(
+                    "failed to protect NativeEngine directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(EngineError::internal(format!(
+                "failed to create NativeEngine directory {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    validate_private_directory(path, "NativeEngine directory")
 }
 
 fn validate_runc(

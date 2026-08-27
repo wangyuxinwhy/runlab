@@ -159,13 +159,23 @@ fn stopped_capture_is_deterministic_and_preserves_raw_hardlinks() {
     if !geteuid().is_root() {
         return;
     }
-    let layer = tar_layer(|builder| append_test_file(builder, b"base", b"base"));
+    let layer = tar_layer(|builder| {
+        append_test_file(builder, b"base", b"base")?;
+        append_test_directory(builder, b"lower")?;
+        append_test_file(builder, b"lower/old-a", b"old")?;
+        append_test_file(builder, b"lower/old-b", b"old")
+    });
+    let cache = tempfile::tempdir().expect("cache");
     let workspace = tempfile::tempdir().expect("workspace");
-    let rootfs = materialize(workspace.path(), &[&layer]).expect("materialize");
+    let rootfs = materialize_cached(workspace.path(), cache.path(), &[&layer])
+        .expect("materialize cached rootfs");
     let raw = rootfs.path().join(OsStr::from_bytes(b"raw-\xff"));
     std::fs::write(&raw, b"changed").unwrap();
     std::fs::hard_link(&raw, rootfs.path().join("hard")).unwrap();
     std::fs::remove_file(rootfs.path().join("base")).unwrap();
+    std::fs::remove_dir_all(rootfs.path().join("lower")).unwrap();
+    std::fs::create_dir(rootfs.path().join("lower")).unwrap();
+    std::fs::write(rootfs.path().join("lower/new"), b"new").unwrap();
 
     let first = rootfs.capture().expect("first capture");
     let second = rootfs.capture().expect("second capture");
@@ -181,19 +191,40 @@ fn stopped_capture_is_deterministic_and_preserves_raw_hardlinks() {
         .unwrap();
     assert_eq!(first_bytes, second_bytes);
 
-    let mut archive = Archive::new(Cursor::new(first_bytes));
-    let mut observed = Vec::new();
-    for entry in archive.entries().unwrap() {
-        let entry = entry.unwrap();
-        observed.push((
-            entry.path_bytes().into_owned(),
-            entry.header().entry_type(),
-            entry.link_name_bytes().map(std::borrow::Cow::into_owned),
-        ));
-    }
+    let observed = {
+        let mut archive = Archive::new(Cursor::new(first_bytes.as_slice()));
+        let mut observed = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            observed.push((
+                entry.path_bytes().into_owned(),
+                entry.header().entry_type(),
+                entry.link_name_bytes().map(std::borrow::Cow::into_owned),
+            ));
+        }
+        observed
+    };
     assert!(observed.iter().any(|entry| entry.0 == b".wh.base"));
+    assert!(
+        observed
+            .iter()
+            .any(|entry| entry.0 == b"lower/.wh..wh..opq")
+    );
+    assert!(observed.iter().any(|entry| entry.0 == b"lower/new"));
     assert!(observed.iter().any(|entry| entry.0 == b"raw-\xff"));
     assert!(observed.iter().any(|entry| entry.1 == EntryType::Link));
+
+    let delta = test_layer_from_bytes(first_bytes);
+    let final_workspace = tempfile::tempdir().expect("final workspace");
+    let final_rootfs = materialize(final_workspace.path(), &[&layer, &delta])
+        .expect("materialize captured result");
+    assert!(!final_rootfs.path().join("base").exists());
+    assert!(!final_rootfs.path().join("lower/old-a").exists());
+    assert!(!final_rootfs.path().join("lower/old-b").exists());
+    assert_eq!(
+        std::fs::read(final_rootfs.path().join("lower/new")).unwrap(),
+        b"new"
+    );
 }
 
 #[test]
@@ -471,12 +502,13 @@ fn mountinfo_descendant_is_a_positive_fail_closed_signal() {
     let mountinfo = b"36 29 0:32 / / rw,relatime - ext4 /dev/root rw\n\
                 40 36 0:45 / /state/rootfs/runtime\\040mount rw - tmpfs tmpfs rw\n";
     assert_eq!(
-        mount_below(b"/state/rootfs", mountinfo).expect("mountinfo"),
+        mount_below(b"/state/rootfs", mountinfo, false).expect("mountinfo"),
         Some(b"/state/rootfs/runtime mount".to_vec())
     );
-    assert!(ensure_mountinfo_clear(b"/state/rootfs", mountinfo).is_err());
+    assert!(ensure_mountinfo_clear(b"/state/rootfs", mountinfo, false).is_err());
+    assert!(ensure_mountinfo_clear(b"/state/rootfs", mountinfo, true).is_err());
     assert_eq!(
-        mount_below(b"/other/rootfs", mountinfo).expect("unrelated mountinfo"),
+        mount_below(b"/other/rootfs", mountinfo, false).expect("unrelated mountinfo"),
         None
     );
 }
@@ -736,6 +768,32 @@ fn nonzero_tail_after_tar_end_marker_is_rejected() {
 
 fn materialize(workspace: &Path, layers: &[&TestLayer]) -> Result<Rootfs> {
     materialize_with_limits(workspace, layers, RootfsLimits::default())
+}
+
+fn materialize_cached(workspace: &Path, cache: &Path, layers: &[&TestLayer]) -> Result<Rootfs> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(workspace, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(cache, std::fs::Permissions::from_mode(0o700))?;
+    let verified = layers
+        .iter()
+        .map(|layer| VerifiedLayer {
+            descriptor: &layer.descriptor,
+            expected_diff_id: &layer.diff_id,
+        })
+        .collect::<Vec<_>>();
+    Ok(Rootfs::materialize_cached_in(
+        workspace,
+        cache,
+        &verified,
+        RootfsLimits::default(),
+        |descriptor| {
+            let layer = layers
+                .iter()
+                .find(|layer| &layer.descriptor == descriptor)
+                .context("test Layer is absent")?;
+            Ok(Cursor::new(layer.bytes.clone()))
+        },
+    )?)
 }
 
 fn assert_materialization_kind(error: &anyhow::Error, expected: RootfsErrorKind) {

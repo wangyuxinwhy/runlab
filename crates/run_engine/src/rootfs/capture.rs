@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
 use std::fs::File;
 use std::os::fd::{AsFd, OwnedFd};
@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use oci_spec::image::MediaType;
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, Stat, fgetxattr, fstat, lgetxattr, major, minor, openat,
-    readlinkat, statat,
+    AtFlags, Dir, FileType, Mode, OFlags, Stat, fgetxattr, fstat, lgetxattr, major, minor, open,
+    openat, readlinkat, statat,
 };
 
 use super::super::CapturedLayer;
-use super::diff::compare;
+use super::diff::{compare, compare_overlay};
 use super::digest::copy_and_digest;
 use super::encode::encode_layer;
 use super::xattr::{list_fd_xattr_names, list_path_xattr_names, split_xattr_names};
@@ -25,9 +25,21 @@ impl Rootfs {
     /// Captures the complete stopped tree after proving all mounts are gone.
     pub(crate) fn capture(&self) -> Result<CapturedLayer> {
         self.ensure_no_mounts()?;
-        let after = capture_stable(&self.root, &self.workspace, self.limits, true)?;
+        let after = self.overlay_upper().map_or_else(
+            || capture_stable(self.root()?, &self.workspace, self.limits, true),
+            |upper| capture_overlay_stable(self.root()?, upper, &self.workspace, self.limits, true),
+        )?;
         self.ensure_no_mounts()?;
-        let changes = compare(&self.initial, &after.inventory)?;
+        let changes = if self.overlay_upper().is_some() {
+            compare_overlay(
+                &self.initial,
+                &after.inventory,
+                &after.removals,
+                &after.opaques,
+            )?
+        } else {
+            compare(&self.initial, &after.inventory)?
+        };
         let (path, size, diff_id) =
             encode_layer(&changes, &after.contents, &self.workspace, self.limits)?;
         Ok(CapturedLayer {
@@ -41,6 +53,8 @@ impl Rootfs {
 #[derive(Default)]
 pub(super) struct CapturedTree {
     pub(super) inventory: Inventory,
+    removals: BTreeSet<FsPath>,
+    opaques: BTreeSet<FsPath>,
     contents: BTreeMap<String, tempfile::TempPath>,
 }
 
@@ -133,6 +147,210 @@ pub(super) fn capture_stable(
         bail!("filesystem changed between complete capture passes");
     }
     Ok(second)
+}
+
+fn capture_overlay_stable(
+    root: &OwnedFd,
+    upper: &Path,
+    content_parent: &Path,
+    limits: RootfsLimits,
+    keep_contents: bool,
+) -> Result<CapturedTree> {
+    let upper = open(
+        upper,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let first = capture_overlay_pass(root, &upper, content_parent, limits, false)?;
+    let second = capture_overlay_pass(root, &upper, content_parent, limits, keep_contents)?;
+    if first.inventory != second.inventory
+        || first.removals != second.removals
+        || first.opaques != second.opaques
+    {
+        bail!("filesystem changed between OverlayFS capture passes");
+    }
+    Ok(second)
+}
+
+fn capture_overlay_pass(
+    root: &OwnedFd,
+    upper: &OwnedFd,
+    content_parent: &Path,
+    limits: RootfsLimits,
+    keep_contents: bool,
+) -> Result<CapturedTree> {
+    let mut state = CaptureState {
+        tree: CapturedTree::default(),
+        hardlinks: BTreeMap::new(),
+        budget: CaptureBudget::new(limits),
+        keep_contents,
+        content_parent: content_parent.to_path_buf(),
+    };
+    let directory = reopen_directory(root)?;
+    let initial = fstat(&directory)?;
+    let initial_xattrs = read_fd_xattrs(&directory, limits, Some(&mut state.budget))?;
+    let upper_directory = reopen_directory(upper)?;
+    let upper_initial = fstat(&upper_directory)?;
+    let upper_initial_xattrs = read_fd_xattrs(&upper_directory, limits, None)?;
+    if is_overlay_opaque(&upper_initial_xattrs)? {
+        state.tree.opaques.insert(FsPath(Box::default()));
+    }
+    walk_overlay_directory(&upper_directory, &directory, None, 0, limits, &mut state)?;
+    let final_stat = fstat(&directory)?;
+    let final_xattrs = read_fd_xattrs(&directory, limits, None)?;
+    ensure_stable(&initial, &final_stat, &initial_xattrs, &final_xattrs, "/")?;
+    let upper_final = fstat(&upper_directory)?;
+    let upper_final_xattrs = read_fd_xattrs(&upper_directory, limits, None)?;
+    ensure_stable(
+        &upper_initial,
+        &upper_final,
+        &upper_initial_xattrs,
+        &upper_final_xattrs,
+        "OverlayFS upper /",
+    )?;
+    state.tree.inventory.root = Some(metadata(&initial, initial_xattrs)?);
+    normalize_hardlinks(&mut state.tree.inventory, state.hardlinks)?;
+    Ok(state.tree)
+}
+
+fn walk_overlay_directory(
+    upper: &OwnedFd,
+    merged: &OwnedFd,
+    parent: Option<&FsPath>,
+    depth: u64,
+    limits: RootfsLimits,
+    state: &mut CaptureState,
+) -> Result<()> {
+    let children = capture_directory_entries(upper, parent, depth, limits, &mut state.budget)?;
+    for (name, path, child_depth) in children {
+        let c_name = c_name(&name)?;
+        let upper_initial = statat(upper, &c_name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let upper_type = FileType::from_raw_mode(upper_initial.st_mode);
+        if upper_type == FileType::CharacterDevice
+            && major(upper_initial.st_rdev) == 0
+            && minor(upper_initial.st_rdev) == 0
+        {
+            state.tree.removals.insert(path);
+            continue;
+        }
+        let merged_initial = statat(merged, &c_name, AtFlags::SYMLINK_NOFOLLOW)
+            .with_context(|| format!("OverlayFS upper entry is absent from {}", path.display()))?;
+        let merged_type = FileType::from_raw_mode(merged_initial.st_mode);
+        if upper_type != merged_type {
+            bail!(
+                "OverlayFS upper and merged entry types disagree at {}",
+                path.display()
+            );
+        }
+        let entry = if upper_type == FileType::Directory {
+            capture_overlay_directory(
+                upper,
+                merged,
+                &c_name,
+                &path,
+                child_depth,
+                &upper_initial,
+                &merged_initial,
+                limits,
+                state,
+            )?
+        } else {
+            capture_entry(
+                EntryObservation {
+                    directory: merged,
+                    name: &c_name,
+                    raw_name: &name,
+                    path: &path,
+                    depth: child_depth,
+                    initial: &merged_initial,
+                },
+                limits,
+                state,
+            )?
+        };
+        if state
+            .tree
+            .inventory
+            .entries
+            .insert(path.clone(), entry)
+            .is_some()
+        {
+            bail!("duplicate captured filesystem path: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the upper and merged observations are kept explicit at the OverlayFS boundary"
+)]
+fn capture_overlay_directory(
+    upper_parent: &OwnedFd,
+    merged_parent: &OwnedFd,
+    name: &CStr,
+    path: &FsPath,
+    depth: u64,
+    upper_initial: &Stat,
+    merged_initial: &Stat,
+    limits: RootfsLimits,
+    state: &mut CaptureState,
+) -> Result<FsEntry> {
+    let upper = openat(
+        upper_parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let merged = openat(
+        merged_parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let upper_opened = fstat(&upper)?;
+    ensure_same_object(upper_initial, &upper_opened, path)?;
+    let merged_opened = fstat(&merged)?;
+    ensure_same_object(merged_initial, &merged_opened, path)?;
+    let upper_initial_xattrs = read_fd_xattrs(&upper, limits, None)?;
+    let merged_initial_xattrs = read_fd_xattrs(&merged, limits, Some(&mut state.budget))?;
+    if is_overlay_opaque(&upper_initial_xattrs)? {
+        state.tree.opaques.insert(path.clone());
+    }
+    walk_overlay_directory(&upper, &merged, Some(path), depth, limits, state)?;
+    let upper_final = fstat(&upper)?;
+    let upper_final_xattrs = read_fd_xattrs(&upper, limits, None)?;
+    ensure_stable(
+        &upper_opened,
+        &upper_final,
+        &upper_initial_xattrs,
+        &upper_final_xattrs,
+        &format!("OverlayFS upper {}", path.display()),
+    )?;
+    let merged_final = fstat(&merged)?;
+    let merged_final_xattrs = read_fd_xattrs(&merged, limits, None)?;
+    ensure_stable(
+        &merged_opened,
+        &merged_final,
+        &merged_initial_xattrs,
+        &merged_final_xattrs,
+        &path.display(),
+    )?;
+    Ok(FsEntry {
+        metadata: metadata(&merged_opened, merged_initial_xattrs)?,
+        kind: EntryKind::Directory,
+    })
+}
+
+fn is_overlay_opaque(xattrs: &Xattrs) -> Result<bool> {
+    let Some(value) = xattrs.get(b"trusted.overlay.opaque" as &[u8]) else {
+        return Ok(false);
+    };
+    match value.as_ref() {
+        b"y" => Ok(true),
+        b"x" => Ok(false),
+        value => bail!("unsupported OverlayFS opaque marker: {value:?}"),
+    }
 }
 
 pub(super) fn capture_pass(

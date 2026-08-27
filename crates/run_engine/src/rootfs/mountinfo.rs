@@ -1,20 +1,30 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
 use super::display_bytes;
 
-pub(super) fn ensure_no_mounts(root: &OwnedFd) -> Result<()> {
+pub(super) fn ensure_no_mounts(root: &OwnedFd, allow_root: bool) -> Result<()> {
     let root_path = std::fs::read_link(proc_fd_path(root))?;
     let root_bytes = root_path.as_os_str().as_bytes();
     let mountinfo = std::fs::read("/proc/self/mountinfo")?;
-    ensure_mountinfo_clear(root_bytes, &mountinfo)
+    ensure_mountinfo_clear(root_bytes, &mountinfo, allow_root)
 }
 
-pub(super) fn ensure_mountinfo_clear(root_bytes: &[u8], mountinfo: &[u8]) -> Result<()> {
-    if let Some(mountpoint) = mount_below(root_bytes, mountinfo)? {
+pub(super) fn ensure_path_no_mounts(root: &Path) -> Result<()> {
+    let mountinfo = std::fs::read("/proc/self/mountinfo")?;
+    ensure_mountinfo_clear(root.as_os_str().as_bytes(), &mountinfo, false)
+}
+
+pub(super) fn ensure_mountinfo_clear(
+    root_bytes: &[u8],
+    mountinfo: &[u8],
+    allow_root: bool,
+) -> Result<()> {
+    if let Some(mountpoint) = mount_below(root_bytes, mountinfo, allow_root)? {
         bail!(
             "rootfs still contains a mount at {}; capture requires all runtime mounts to be removed",
             display_bytes(&mountpoint)
@@ -23,7 +33,11 @@ pub(super) fn ensure_mountinfo_clear(root_bytes: &[u8], mountinfo: &[u8]) -> Res
     Ok(())
 }
 
-pub(super) fn mount_below(root_bytes: &[u8], mountinfo: &[u8]) -> Result<Option<Vec<u8>>> {
+pub(super) fn mount_below(
+    root_bytes: &[u8],
+    mountinfo: &[u8],
+    allow_root: bool,
+) -> Result<Option<Vec<u8>>> {
     for line in mountinfo
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
@@ -33,7 +47,7 @@ pub(super) fn mount_below(root_bytes: &[u8], mountinfo: &[u8]) -> Result<Option<
             bail!("malformed /proc/self/mountinfo record");
         }
         let mountpoint = decode_mountinfo_path(fields[4])?;
-        if mountpoint == root_bytes
+        if (!allow_root && mountpoint == root_bytes)
             || (mountpoint.len() > root_bytes.len()
                 && mountpoint.starts_with(root_bytes)
                 && mountpoint[root_bytes.len()] == b'/')

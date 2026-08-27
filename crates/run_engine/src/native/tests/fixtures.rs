@@ -483,8 +483,24 @@ pub(super) fn assert_final_delta(store: &MemoryStore, image: &ImageDescriptor) {
     assert!(!rootfs.path().join("run/secrets/token").exists());
 }
 
-pub(super) fn assert_workspace_empty(path: &Path) {
-    assert_eq!(fs::read_dir(path).expect("workspace entries").count(), 0);
+pub(super) fn assert_engine_workspace_clean(path: &Path) {
+    let invocations = path.join("invocations");
+    assert!(invocations.is_dir(), "invocation workspace is absent");
+    assert_eq!(
+        fs::read_dir(&invocations)
+            .expect("invocation workspace entries")
+            .count(),
+        0,
+        "ephemeral invocation workspace leaked"
+    );
+    assert!(
+        path.join("snapshots-v3/chains").is_dir(),
+        "snapshot chain cache is absent"
+    );
+    assert!(
+        path.join("snapshots-v3/inventories").is_dir(),
+        "snapshot Inventory cache is absent"
+    );
 }
 
 pub(super) fn engine_cgroups() -> BTreeSet<PathBuf> {

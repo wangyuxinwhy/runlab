@@ -163,12 +163,7 @@ pub(super) fn cleanup_invocation(
             None,
         ));
     }
-    if !all_writers_stopped
-        || prepared
-            .programs
-            .values()
-            .any(|program| program.rootfs.ensure_no_mounts().is_err())
-    {
+    if !all_writers_stopped {
         let path = preserve_workspace(prepared);
         return path.map(|path| {
             CleanupIssue::new(
@@ -179,6 +174,26 @@ pub(super) fn cleanup_invocation(
                 None,
             )
         });
+    }
+    for program in prepared.programs.values_mut() {
+        if let Err(error) = program.rootfs.unmount_overlay() {
+            let path = preserve_workspace(prepared);
+            return Some(CleanupIssue::new(
+                path.map_or_else(
+                    || format!("failed to release NativeEngine rootfs: {error:#}"),
+                    |path| {
+                        format!(
+                            "failed to release NativeEngine rootfs; preserved {}: {error:#}",
+                            path.display()
+                        )
+                    },
+                ),
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    .map(i64::from),
+            ));
+        }
     }
     prepared.workspace.take().and_then(|workspace| {
         let result = std::fs::remove_dir_all(&workspace);

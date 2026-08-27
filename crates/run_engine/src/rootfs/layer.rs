@@ -6,24 +6,32 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
-use oci_spec::image::{Descriptor, DigestAlgorithm, MediaType};
-use rustix::fs::{Mode, OFlags, fstat, mkdirat, open, openat};
+#[cfg(test)]
+use oci_spec::image::Descriptor;
+use oci_spec::image::{DigestAlgorithm, MediaType};
+use rustix::fs::{Mode, OFlags, fstat, open};
+#[cfg(test)]
+use rustix::fs::{mkdirat, openat};
 use rustix::io::Errno;
 use rustix::process::geteuid;
 use tar::{Archive, EntryType};
 
 use super::super::VerifiedLayer;
+#[cfg(test)]
 use super::apply::{CleanupBudget, apply_directory_metadata, apply_plan};
+#[cfg(test)]
 use super::capture::capture_stable;
 use super::digest::copy_and_digest;
 use super::plan::{LayerEntry, LayerKind, LayerPlan};
 use super::preflight::{MaterializationBudget, preflight_decoded_tar};
 use super::xattr::{decode_base64, validate_pax_xattr_name};
 use super::{
-    FsPath, MaterializationFault, Metadata, Rootfs, RootfsError, RootfsErrorKind, RootfsLimits,
-    Timestamp, Xattrs, classify_io_error, classify_materialization_error, default_directory,
-    enforce, internal_error, take_materialization_fault, unsupported_input, usize_to_u64,
+    FsPath, MaterializationFault, Metadata, RootfsError, RootfsErrorKind, RootfsLimits, Timestamp,
+    Xattrs, classify_io_error, default_directory, enforce, internal_error,
+    take_materialization_fault, unsupported_input, usize_to_u64,
 };
+#[cfg(test)]
+use super::{Rootfs, classify_materialization_error};
 
 struct ClassifiedReader<R> {
     inner: R,
@@ -95,6 +103,7 @@ impl<W: std::io::Write> std::io::Write for ClassifiedWriter<W> {
     }
 }
 
+#[cfg(test)]
 impl Rootfs {
     pub(crate) fn materialize_in<F, R>(
         workspace: &Path,
@@ -178,9 +187,10 @@ impl Rootfs {
         Ok(Self {
             workspace: workspace.to_path_buf(),
             root_path,
-            root,
+            root: Some(root),
             initial,
             limits,
+            overlay: None,
         })
     }
 }

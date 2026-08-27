@@ -94,7 +94,7 @@ fn real_runc_exercises_native_engine_contract() {
         )
     });
     assert_final_delta(store.as_ref(), final_image);
-    assert_workspace_empty(workspace.path());
+    assert_engine_workspace_clean(workspace.path());
     assert_eq!(engine_cgroups(), cgroups_before, "owned cgroup leaked");
 
     let listener = TcpListener::bind(("0.0.0.0", 0)).expect("egress target");
@@ -142,7 +142,7 @@ fn real_runc_exercises_native_engine_contract() {
         b"egress-ok"
     );
     assert_eq!(egress.errors().count(), 0, "egress cleanup polluted output");
-    assert_workspace_empty(workspace.path());
+    assert_engine_workspace_clean(workspace.path());
 
     let file_mount_source = tempfile::NamedTempFile::new().expect("file mount source");
     fs::write(file_mount_source.path(), b"task").expect("file mount contents");
@@ -159,7 +159,7 @@ fn real_runc_exercises_native_engine_contract() {
             .is_some(),
         "file bind mount artifact prevented final environment capture"
     );
-    assert_workspace_empty(workspace.path());
+    assert_engine_workspace_clean(workspace.path());
 
     let secrets = engine
         .run(e2e_input_with_secrets(&initial), CancellationToken::new())
@@ -174,7 +174,7 @@ fn real_runc_exercises_native_engine_contract() {
         .value()
         .expect("final image after Secret delivery");
     assert_final_delta(store.as_ref(), secret_final);
-    assert_workspace_empty(workspace.path());
+    assert_engine_workspace_clean(workspace.path());
 
     let exit_zero = engine
         .run(
@@ -558,6 +558,6 @@ fn real_runc_exercises_native_engine_contract() {
         "create failure did not retain the target rlimit diagnostic: {:?}",
         create_failure.create().errors().collect::<Vec<_>>()
     );
-    assert_workspace_empty(workspace.path());
+    assert_engine_workspace_clean(workspace.path());
     assert_eq!(engine_cgroups(), cgroups_before, "owned cgroup leaked");
 }

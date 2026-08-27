@@ -43,6 +43,47 @@ pub(super) fn compare(before: &Inventory, after: &Inventory) -> Result<ChangeSet
     Ok(changes)
 }
 
+pub(super) fn compare_overlay(
+    before: &Inventory,
+    observed: &Inventory,
+    removals: &BTreeSet<FsPath>,
+    opaques: &BTreeSet<FsPath>,
+) -> Result<ChangeSet> {
+    let root = match (&before.root, &observed.root) {
+        (Some(left), Some(right)) if left != right => Some(right.clone()),
+        (Some(_), Some(_)) => None,
+        _ => bail!("filesystem inventories disagree about root metadata"),
+    };
+    let mut changes = ChangeSet {
+        root,
+        ..ChangeSet::default()
+    };
+    for (path, entry) in &observed.entries {
+        if before.entries.get(path) != Some(entry) {
+            changes.entries.insert(path.clone(), entry.clone());
+        }
+    }
+    for path in removals {
+        if before.entries.contains_key(path) {
+            insert_removal(&mut changes.removals, path.clone());
+        }
+    }
+    for directory in opaques {
+        if before
+            .entries
+            .keys()
+            .any(|path| path.is_descendant_of(directory))
+        {
+            changes.opaques.insert(directory.clone());
+            changes
+                .removals
+                .retain(|path| !path.is_descendant_of(directory));
+        }
+    }
+    promote_changed_hardlink_anchors(observed, &mut changes.entries)?;
+    Ok(changes)
+}
+
 pub(super) fn insert_removal(removals: &mut BTreeSet<FsPath>, path: FsPath) {
     if removals
         .iter()
