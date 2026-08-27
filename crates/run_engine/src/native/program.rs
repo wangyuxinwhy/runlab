@@ -9,6 +9,7 @@ use run_protocol::{
 };
 
 use super::linux_evidence::ProcExitMonitor;
+use super::network::EgressNetwork;
 use super::report::output_internal;
 use super::stdio::{InputTransfer, StreamDrain};
 use super::subprocess::{InvocationSupervisor, RunningHelper, SupervisorToken};
@@ -42,6 +43,7 @@ pub(super) struct RuntimeState {
     pub(super) poll_failed: bool,
     pub(super) writer_stopped: bool,
     pub(super) rootfs_stability: RootfsStability,
+    pub(super) egress: Option<EgressNetwork>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -96,6 +98,7 @@ impl ProgramRun {
                 poll_failed: false,
                 writer_stopped: true,
                 rootfs_stability: RootfsStability::Unproved,
+                egress: None,
             },
             io: ProgramIo {
                 stdin_transfer: None,

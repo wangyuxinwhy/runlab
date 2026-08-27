@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use super::budget::OperationBudget;
 use super::cgroup::current_cgroup_base;
 use super::container_path::{reject_symlink_ancestor, safe_container_path};
+use super::network::{EgressPlan, EgressTools};
 use super::profile::{validate_host_resources, validate_platform, validate_runtime};
 use super::runc::helper_message;
 use super::subprocess::{InvocationSupervisor, run_helper};
@@ -64,6 +65,14 @@ impl Preparation<'_> {
     fn prepare(self) -> Result<PreparedInvocation, EngineError> {
         self.check_budget()?;
         validate_input_capabilities(self.input)?;
+        let egress = if self.input.network() == Network::Egress {
+            Some(EgressTools::preflight(
+                self.supervisor,
+                self.budget.deadline(),
+            )?)
+        } else {
+            None
+        };
         let workspace_root = validate_private_directory(self.workspace_root, "workspace_root")?;
         let runc = validate_runc(self.runc_executable, self.budget, self.supervisor)?;
         let images = self.inspect_images()?;
@@ -77,7 +86,13 @@ impl Preparation<'_> {
                 "failed to establish the Engine-owned default cgroup base: {error:#}"
             ))
         })?;
-        let programs = self.prepare_programs(&invocation, &runtime_root, &cgroup_base, &images)?;
+        let programs = self.prepare_programs(
+            &invocation,
+            &runtime_root,
+            &cgroup_base,
+            &images,
+            egress.as_ref(),
+        )?;
 
         Ok(PreparedInvocation {
             workspace: Some(invocation.keep()),
@@ -108,6 +123,7 @@ impl Preparation<'_> {
         runtime_root: &Path,
         cgroup_base: &Path,
         images: &BTreeMap<ProgramId, VerifiedImage>,
+        egress: Option<&EgressTools>,
     ) -> Result<BTreeMap<ProgramId, PreparedProgram>, EngineError> {
         let mut programs = BTreeMap::new();
         for (index, (program_id, program)) in self.input.programs().iter().enumerate() {
@@ -119,6 +135,7 @@ impl Preparation<'_> {
                 invocation,
                 runtime_root,
                 cgroup_base,
+                egress,
             })?;
             programs.insert(program_id.clone(), prepared);
             self.check_budget()?;
@@ -185,6 +202,9 @@ impl Preparation<'_> {
             rootfs,
             parent: program.input.initial_environment().clone(),
             artifacts,
+            egress: program
+                .egress
+                .map(|tools| tools.plan(std::process::id(), suffix)),
         })
     }
 
@@ -204,6 +224,7 @@ struct ProgramPreparation<'a> {
     invocation: &'a TempDir,
     runtime_root: &'a Path,
     cgroup_base: &'a Path,
+    egress: Option<&'a EgressTools>,
 }
 
 fn validate_input_capabilities(input: &RunInput) -> Result<(), EngineError> {
@@ -227,14 +248,8 @@ fn validate_input_capabilities(input: &RunInput) -> Result<(), EngineError> {
             ));
         }
     }
-    if input.network() == Network::Egress {
-        return Err(EngineError::unsupported(
-            InputPath::field("network"),
-            "NativeEngine has not implemented the outbound-only egress boundary",
-        ));
-    }
     for (program_id, program) in input.programs() {
-        validate_runtime(program_id, program)?;
+        validate_runtime(program_id, program, input.network())?;
         validate_host_resources(program_id, program)?;
     }
     if geteuid().as_raw() != 0 {
@@ -292,6 +307,7 @@ pub(super) struct PreparedProgram {
     pub(super) rootfs: Rootfs,
     pub(super) parent: ImageDescriptor,
     pub(super) artifacts: Vec<PathBuf>,
+    pub(super) egress: Option<EgressPlan>,
 }
 
 fn preflight_pidfd_socket(path: &Path) -> AnyResult<()> {

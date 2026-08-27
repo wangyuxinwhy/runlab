@@ -14,6 +14,7 @@ use run_protocol::{
 
 use super::cgroup::observe_owned_cgroup;
 use super::linux_evidence::{PidfdReceiver, ProcExitMonitor, pidfd_process_id};
+use super::network::EgressNetwork;
 use super::prepare::{MAX_EXECUTION_TIMEOUT, PreparedProgram};
 use super::program::ProgramRun;
 use super::report::operation_error;
@@ -141,8 +142,34 @@ impl ProgramStarter<'_> {
             execution_start,
             execution_limit,
         } = control;
-        if !establish_created_process_evidence(prepared, &mut run) {
+        let Some(init_pid) = establish_created_process_evidence(prepared, &mut run) else {
             return run;
+        };
+
+        if let Some(plan) = prepared.egress.clone() {
+            let network_deadline = checked_deadline(
+                Instant::now(),
+                timeouts.start(),
+                "egress network setup deadline",
+            )
+            .expect("validated OperationTimeouts fit Instant");
+            let mut network = EgressNetwork::new(plan);
+            let setup = network.setup(
+                init_pid,
+                &run.supervision.owner,
+                network_deadline,
+                cancellation,
+            );
+            run.runtime.egress = Some(network);
+            if let Err(error) = setup {
+                run.supervision.unreaped |= !error.supervisor_reaped;
+                run.facts.errors.push(operation_error(
+                    OperationStage::Preparation,
+                    format!("failed to establish outbound-only egress: {error}"),
+                    None,
+                ));
+                return run;
+            }
         }
 
         let start_wall = wall_clock_now();
@@ -522,7 +549,10 @@ impl CreateHelper {
     }
 }
 
-fn establish_created_process_evidence(prepared: &PreparedProgram, run: &mut ProgramRun) -> bool {
+fn establish_created_process_evidence(
+    prepared: &PreparedProgram,
+    run: &mut ProgramRun,
+) -> Option<u32> {
     let init_pid = match run
         .runtime
         .pidfd
@@ -537,7 +567,7 @@ fn establish_created_process_evidence(prepared: &PreparedProgram, run: &mut Prog
                 format!("could not identify the created container process: {error:#}"),
                 None,
             ));
-            return false;
+            return None;
         }
     };
     match ProcExitMonitor::subscribe(init_pid) {
@@ -556,10 +586,10 @@ fn establish_created_process_evidence(prepared: &PreparedProgram, run: &mut Prog
                 format!("could not prove ownership of runc's default cgroup: {error:#}"),
                 None,
             ));
-            return false;
+            return None;
         }
     }
-    true
+    Some(init_pid)
 }
 
 fn start_deadline(

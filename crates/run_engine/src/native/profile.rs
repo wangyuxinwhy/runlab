@@ -1,12 +1,16 @@
 use std::fs;
 use std::path::Path;
 
-use run_protocol::{EngineError, InputPath, ProgramId, ProgramInput};
+use run_protocol::{EngineError, InputPath, Network, ProgramId, ProgramInput};
 
 use super::container_path::safe_container_path;
 use crate::oci::VerifiedImage;
 
-pub(super) fn validate_runtime(id: &ProgramId, program: &ProgramInput) -> Result<(), EngineError> {
+pub(super) fn validate_runtime(
+    id: &ProgramId,
+    program: &ProgramInput,
+    network: Network,
+) -> Result<(), EngineError> {
     let base = program_path(id).child("runtime_config");
     let value = program.runtime_config().as_json();
     if value.pointer("/linux/cgroupsPath").is_some() {
@@ -35,15 +39,15 @@ pub(super) fn validate_runtime(id: &ProgramId, program: &ProgramInput) -> Result
         .ok_or_else(|| {
             EngineError::unsupported(
                 base.clone().child("linux").child("namespaces"),
-                "Network::Isolated requires an explicit new network namespace",
+                format!("Network::{network:?} requires an explicit new network namespace"),
             )
         })?;
     require_new_namespace(
         &base,
         namespaces,
         "network",
-        "Network::Isolated requires a new network namespace",
-        "Network::Isolated cannot join an existing network namespace",
+        &format!("Network::{network:?} requires a new network namespace"),
+        &format!("Network::{network:?} cannot join an existing network namespace"),
     )?;
     require_new_namespace(
         &base,

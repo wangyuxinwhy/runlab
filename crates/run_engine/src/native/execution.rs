@@ -246,6 +246,7 @@ fn cleanup_program_runtimes(
             runtime_attempted: run.runtime.attempted,
             removal_timeout: context.timeouts.runtime_filesystem_removal(),
             supervisor_deadline: deadline,
+            egress: &mut run.runtime.egress,
         });
         apply_runtime_cleanup_report(run, report);
     }

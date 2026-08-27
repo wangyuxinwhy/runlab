@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write as _;
+use std::net::TcpListener;
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -13,6 +15,7 @@ use run_protocol::{
 use rustix::process::geteuid;
 
 use super::fixtures::*;
+use crate::native::network::HOST_ADDRESS;
 use crate::{CancellationToken, NativeEngine, OperationTimeouts, RunEngine, STOP_GRACE_PERIOD};
 
 #[test]
@@ -93,6 +96,53 @@ fn real_runc_exercises_native_engine_contract() {
     assert_final_delta(store.as_ref(), final_image);
     assert_workspace_empty(workspace.path());
     assert_eq!(engine_cgroups(), cgroups_before, "owned cgroup leaked");
+
+    let listener = TcpListener::bind(("0.0.0.0", 0)).expect("egress target");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking egress target");
+    let port = listener.local_addr().expect("egress target address").port();
+    let target = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match listener.accept() {
+                Ok((mut connection, _)) => {
+                    connection
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\negress-ok")
+                        .expect("egress response");
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "egress connection timed out");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("egress listener failed: {error}"),
+            }
+        }
+    });
+    let egress = engine
+        .run(
+            e2e_input_with_network(
+                &initial,
+                "egress",
+                &format!("/bin/busybox wget -qO- http://{HOST_ADDRESS}:{port}/"),
+                Network::Egress,
+            ),
+            CancellationToken::new(),
+        )
+        .expect("egress output");
+    target.join().expect("egress target thread");
+    let egress = &egress.programs()[&ProgramId::primary()];
+    assert!(matches!(
+        egress.process(),
+        ProcessResult::Exited { code: 0, .. }
+    ));
+    assert_eq!(
+        egress.stdout().facts().expect("egress stdout").bytes(),
+        b"egress-ok"
+    );
+    assert_eq!(egress.errors().count(), 0, "egress cleanup polluted output");
+    assert_workspace_empty(workspace.path());
 
     let file_mount_source = tempfile::NamedTempFile::new().expect("file mount source");
     fs::write(file_mount_source.path(), b"task").expect("file mount contents");

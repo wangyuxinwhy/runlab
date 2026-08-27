@@ -62,13 +62,13 @@ Do not let the inherited language, package layout, models, tests, or architectur
 - Maintain one Rust 2024 workspace with exactly three packages: the `run_protocol` library, the `run_engine` library, and the `runlab` binary. Keep one public `runlab` product surface. Do not add a Python compatibility package, async runtime, SDK wrapper service, ORM, or parallel protocol package.
 - Keep `rust-toolchain.toml` fixed for reproducible development and keep `package.rust-version` as the tested MSRV. `unsafe` is forbidden.
 - Prefer blocking standard-library process, filesystem, and thread primitives. OCI content identity is computed from exact bytes; typed JSON views never replace retained content-addressed bytes.
-- `NativeEngine` and `DockerEngine` implement `RunEngine` directly. Keep their runtime mechanics behind narrow subprocess boundaries, and add no additional generic backend trait unless both real implementations demonstrate a smaller stable private boundary.
-- Run `cargo fmt --check`, all-target tests, Clippy with warnings denied, the declared MSRV check, packaging, separate-process CLI contract tests, and the opt-in real Docker test before claiming completion.
+- `NativeEngine` implements `RunEngine` directly. Keep its runtime mechanics behind narrow subprocess boundaries. Do not add another backend trait, compatibility Engine, or execution extension point without a demonstrated real workflow.
+- Run `cargo fmt --check`, all-target tests, Clippy with warnings denied, the declared MSRV check, packaging, and separate-process CLI contract tests before claiming completion.
 - Comments must explain a non-obvious invariant, safety boundary, protocol decision, or justified lint exception. Delete comments that merely restate the adjacent name, type, or control flow. Clap doc comments are user-facing help text and must earn their place as interface documentation.
 - Preserve the package dependency direction `runlab -> run_engine -> run_protocol`, with `runlab` also allowed to depend directly on `run_protocol`. `run_protocol` owns no execution, product, or persistence concepts. `run_engine` owns no `run_id`, Run Record, Catalog, database, or recovery interface. Keep exact-byte content access narrow; do not let CLI own lifecycle semantics, Engine publish Run Records, or Storage interpret process outcomes.
 
 ## Verification
 
-Use verification appropriate to the implementation language and current vertical slice. Before reporting implementation complete, test the installed CLI as a separate process, verify stdout, stderr, exit status, invalid input, and interruption behavior, and run at least one deterministic end-to-end Run through the real Docker backend.
+Use verification appropriate to the implementation language and current vertical slice. Before reporting implementation complete, test the installed CLI as a separate process, verify stdout, stderr, exit status, invalid input, and interruption behavior, and run at least one deterministic end-to-end Run through `NativeEngine` on real Linux.
 
 Report implemented behavior, verification evidence, failures, and remaining risk separately. Do not turn current behavior into a test contract merely because the inherited implementation does it.

@@ -75,6 +75,7 @@ pub(super) fn empty_prepared_invocation(
         rootfs,
         parent: test_image(),
         artifacts: Vec::new(),
+        egress: None,
     };
     PreparedInvocation {
         workspace: Some(workspace.keep()),
@@ -222,6 +223,23 @@ pub(super) fn e2e_input(
     timeout: Option<NonZeroU64>,
 ) -> RunInput {
     e2e_input_with_cwd(image, name, script, stdin, timeout, "/")
+}
+
+pub(super) fn e2e_input_with_network(
+    image: &ImageDescriptor,
+    name: &str,
+    script: &str,
+    network: Network,
+) -> RunInput {
+    RunInput::new(
+        BTreeMap::from([(
+            ProgramId::primary(),
+            e2e_program(image, name, script, b"", false),
+        )]),
+        None,
+        network,
+    )
+    .expect("RunInput")
 }
 
 pub(super) fn delayed_runc_wrapper(

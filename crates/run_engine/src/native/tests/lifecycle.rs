@@ -103,6 +103,7 @@ fn runtime_cleanup_reports_nonempty_mount_artifact_as_rootfs_instability() {
     program.artifacts = vec![PathBuf::from("runtime-created"), artifact];
 
     let mut run = ProgramRun::unattempted();
+    let mut egress = None;
     let report = cleanup_runtime(RuntimeCleanup {
         runc: &prepared.runc,
         runtime_root: &prepared.runtime_root,
@@ -111,6 +112,7 @@ fn runtime_cleanup_reports_nonempty_mount_artifact_as_rootfs_instability() {
         runtime_attempted: false,
         removal_timeout: OperationTimeouts::default().runtime_filesystem_removal(),
         supervisor_deadline: Instant::now() + Duration::from_secs(2),
+        egress: &mut egress,
     });
     assert_eq!(report.rootfs_stability, RootfsStability::Unproved);
     apply_runtime_cleanup_report(&mut run, report);

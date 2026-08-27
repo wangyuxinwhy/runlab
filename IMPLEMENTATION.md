@@ -1,81 +1,79 @@
-# Run Protocol 与 NativeEngine 当前工程状态
+# 当前实现状态
 
-本文只记录开发 worktree 的实现事实。稳定产品、协议和架构由 [Agent Wiki](http://localhost:8787/app/pages/runlab-index--nw) 拥有。
+本文只记录当前 worktree 的工程事实和剩余门禁。稳定产品、协议与架构由 [RunLab Agent Wiki](http://localhost:8787/app/pages/runlab-index--nw) 拥有。
 
-## 当前开发边界
+## 已实现
 
-当前分支是 `rewrite/native-engine`。本阶段只交付两个 Rust library package：
+Rust workspace 只包含 `run_protocol`、`run_engine` 和 `runlab` 三个 package，依赖方向为：
 
 ```text
-run_engine -> run_protocol
+runlab -> run_engine -> run_protocol
+runlab ----------------> run_protocol
 ```
 
-根 package 中继承的 `runlab` binary 仍是 legacy 实现，不是这两个新 package 的目标行为，也没有接入新的 NativeEngine。DockerEngine 已推迟，不属于当前分支的实现或验证范围。
+`run_protocol` 和 `run_engine::NativeEngine` 保持原有稳定边界。根 `runlab` package 已从 legacy 实现重写，不保留 Docker、managed VM、recovery、reconcile、GC、schema、RunLab-specific runtime-config DSL、registry transport 或旧 Base/Overlay/Task 模型。
 
-## `run_protocol`
+`runlab` 当前由六个直接模块组成：
 
-`run_protocol` 只拥有一次执行的输入、输出、错误分类与结构不变量：
-
-- `RunInput`、`ProgramInput`、`RuntimeConfig` 与 OCI `ImageDescriptor`；
-- `RunOutput`、逐 Program lifecycle/stdio/process/final-environment 事实；
-- `EngineError`、`InputError` 与 `OutputError`；
-- exact Runtime Configuration bytes、唯一 primary、完整 Program 映射和 execution ordering 等不变量。
-
-它不拥有 `run_id`、Run Record、持久化、恢复、Catalog、CLI 或 Engine 实现。
-
-输出模型通过私有 facade 保持一个 crate-root API，同时按职责分为 operation、process、stdio、stop 和 aggregate validation；这些物理模块不是新的公共协议层级。
-
-## `run_engine`
-
-公共边界只有同步、阻塞且可并发复用的 `RunEngine::run`、调用级 `CancellationToken`、OCI content store 与有限 operation deadlines。
-
-当前唯一实现是 Linux rootful `NativeEngine`。主要内部边界如下：
-
-| 责任 | 模块 |
+| 模块 | 责任 |
 | --- | --- |
-| invocation orchestration | `native/execution.rs` |
-| preflight 与 bundle preparation | `native/prepare.rs`、`native/profile.rs` |
-| create/start、wait、stop | `native/start.rs`、`native/wait.rs`、`native/stop.rs` |
-| process evidence 与 helper ownership | `native/linux_evidence.rs`、`native/subprocess.rs` |
-| stdio 与 process evidence | `native/stdio.rs`、`native/linux_evidence.rs` |
-| runtime/invocation cleanup | `native/cleanup.rs` |
-| exact OCI content/Image/Layer | `oci/content.rs`、`oci.rs`、`oci/layer.rs`、`oci/json.rs` |
-| rootfs tar 物理预检与共享预算 | `rootfs/preflight.rs` |
-| rootfs layer 扫描、计划与安全落盘 | `rootfs/layer.rs`、`rootfs/plan.rs`、`rootfs/apply.rs` |
-| stopped capture 与 deterministic layer | `rootfs/capture.rs`、`rootfs/diff.rs`、`rootfs/encode.rs` |
-| filesystem safety leaves | `rootfs/digest.rs`、`rootfs/xattr.rs`、`rootfs/mountinfo.rs` |
+| `cli` | 参数解析、命令分发、stdout JSON 与 stderr 错误边界 |
+| `image` | OCI Image Layout 导入、Catalog 查询、Image 检查与单文件读取 |
+| `run` | Run identity、协议输入构造、NativeEngine 调用、结果投影与持久化 |
+| `runtime_config` | 从 OCI Image Config 与固定 Linux 执行骨架生成标准 OCI Runtime Configuration |
+| `state` | 本地 State 打开及组件装配 |
+| `storage` | exact-byte OCI content store 与 SQLite catalog/Run records |
 
-依赖方向保持为：
+公共 CLI 只有以下八个命令：
 
 ```text
-execution -> prepare/start/wait/stop/cleanup/capture
-prepare/capture -> OCI + rootfs
-rootfs layer/capture -> digest/xattr/mountinfo
-run_engine -> run_protocol
+image import
+image list
+image get
+image file get
+run config generate
+run start
+run get
+run list
 ```
 
-Native lifecycle 按 preparation、create/start、wait、stop、capture 和 cleanup 分解。辅助 runc 进程只使用普通 `Child` ownership、process-group kill 和 reap；无法观察的过程事实进入协议已有的 Unknown/Unavailable，不建立额外的证明状态机。rootfs 子模块使用显式依赖，Layer 扫描和 apply 共同依赖独立 plan，不互相反向拥有类型。
+`run config generate` 把完整 OCI Runtime Configuration JSON 写到 stdout，供 `jq` 等普通 JSON 工具继续处理。`run start` 省略 `--runtime-config` 时复用同一个生成器。生成器固定创建新的 network namespace，`isolated` 或 `egress` 仍只由 `run start --network` 选择，不写入 `config.json`。
 
-没有公共 Backend trait、异步 runtime、恢复接口或 Docker compatibility vocabulary。
+## State 与生命周期
 
-## 当前能力限制
+State 目录包含 `oci/blobs/sha256`、`runlab.sqlite3` 和 Linux 执行时使用的 `engine` workspace。OCI 内容按 Descriptor 的 size 与 digest 校验，并通过同目录临时文件原子发布。Image 名称只在完整 Manifest、Config、Layers 和 DiffIDs 验证后写入 Catalog。
 
-- Linux-only、rootful reference profile；rootless 尚未实现。
-- `Network::Isolated` 已实现；egress profile 尚未实现。
-- 每次最多 8 个 Program，execution timeout 最长 7 天。
-- stdout/stderr 各保留固定 100 MiB 原始字节前缀，之后继续排空并记录 omission/EOF。
-- capture 依靠 stopped tree 的 two-pass agreement，不是原子 filesystem snapshot。
-- OCI Runtime Configuration 的受支持标准字段和 option 原样交给 runc。NativeEngine 只预检自己拥有的交叉边界，以及显式宿主资源在执行前是否可用：isolated network namespace、new mount namespace with non-shared rootfs propagation、Engine-owned cgroup、mount destination、bind/namespace path 和执行平台。非空 host hooks 在具备可验证的进程 containment 模型前不受支持。
-- runtime 与 cgroup 清理由 `runc delete --force` 实施；失败作为操作事实返回，不在 Engine 内复制一套 cgroup 解释和回收机制。
-- 不考虑跨调用恢复、journal 或 reconcile。
+Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调用 Engine 前写入 accepted record；同一 identity 与语义相同的输入返回已有记录，输入不同则拒绝。Engine 正常返回 `RunOutput` 或 `EngineError` 后写入 terminal completion。
 
-## 当前验证事实
+当前不实现跨进程恢复。进程在 accepted 之后、terminal 写入之前崩溃时，记录会诚实地保持 accepted 状态；没有 reconcile 或隐式重试。
 
-- macOS：`run_protocol` 21 个测试、`run_engine` 8 个非 Linux 测试通过。
-- Linux：`run_protocol` 21 个测试；`run_engine` 76 个测试通过，1 个真实 runc 测试默认显式忽略。
-- macOS 与 Linux Clippy 均以 `-D warnings` 通过；`cargo fmt --check` 与 `git diff --check` 通过。
-- macOS 和 Linux 的 Rust 1.95.0 all-target check 通过。
-- `run_protocol` package 成功；`run_engine` 在临时 crates.io patch 指向同工作树 `run_protocol` 的条件下成功生成 package archive。真实发布仍必须先发布 `run_protocol 0.1.0`。
-- 真实 Lima Linux VM 上以 runc 1.5.1 跑过完整 NativeEngine ignored E2E：1 个测试通过，覆盖非零/零退出、信号、超时、取消、并发、多 Program、stdio、最终 Image、workspace 和 cgroup 清理。
+## 已知边界
 
-以上事实均针对当前未提交工作树。独立 review 结论只对审阅时列明的完整 source hash 有效，本状态文件不替代冻结 manifest 与审阅报告。
+- `NativeEngine` 只在 Linux 可执行；macOS 可管理和检查 Image/Run State，但不能直接开始 Run。
+- `NativeEngine` 支持 `Network::Isolated` 与 outbound-only `Network::Egress`。Egress 依赖宿主启用 IPv4 forwarding，并提供 `ip`、`iptables`、`ip6tables` 与 `nsenter`；Engine 不修改宿主级 forwarding 设置。
+- Image import 只接受包含单个 Image Manifest 的标准 OCI Image Layout 目录或未压缩 tar archive。
+- 支持 OCI tar、gzip 和 zstd Layer；不实现 registry pull 或 Image build。
+- `image file get` 只提取一个 regular file，并以 create-new 方式写目标路径。
+- stdout/stderr 当前作为协议事实保存在完整 Run record 中；独立 stream 命令尚未因真实场景而引入。
+- 不实现恢复、验证、评分、golden comparison 或实验编排。
+
+## 当前验证
+
+macOS 与 Linux rootful VM 已通过：
+
+```text
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Rust 1.95 MSRV all-target check 已通过。独立进程 CLI 测试覆盖最小命令面、OCI Layout 导入、名称和 digest 查询、包含常见根目录条目的 Layer 单文件提取、拒绝覆盖目标，以及错误请求不输出成功 JSON。
+
+真实 Linux CLI 纵切已通过 `runc 1.5.1`：导入 arm64 OCI Image，执行返回 exit 7 的 Run，保存独立 stdout/stderr 与 Final Image，通过 Final Image digest 提取 `/result/value` 的精确字节，并验证同 identity 重试返回 `created: false`。单独的长运行进程收到 SIGINT 后得到 terminal、`cancelled: true` 的 RunOutput，Engine workspace 无残留。
+
+真实 `NativeEngine` E2E 还覆盖了 `Network::Egress`：Program 从独立 OCI network namespace 主动连接 VM 上的 TCP 服务并取得响应；调用返回后临时 veth 与对应 IPv4/IPv6 firewall rules 均无残留。
+
+Runtime Configuration 生成能力已在同一 Linux VM 通过真实 CLI 纵切验证：`run config generate` 的精确 stdout 字节分别被省略 `--runtime-config` 的 `isolated` 和 `egress` Run 原样保存，两个 Run 都通过 `runc` 正常退出。生成的 JSON 包含新的 network namespace，但不包含 Run Protocol 的 `network` 字段。另一路径通过 `jq` 修改生成配置的 `process.args`，再以显式 `--runtime-config` 执行并取得预期 stdout。
+
+`cargo package -p run_protocol --no-verify --locked --allow-dirty` 成功。完整 workspace packaging 当前不能成立：`run_engine` 打包时会从 crates.io 解析 `run_protocol 0.1.0`，而该版本尚未发布。没有为绕过这一发布顺序去修改 manifest 或评价路径。

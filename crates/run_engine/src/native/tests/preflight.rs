@@ -46,13 +46,14 @@ fn capability_limits_fail_before_host_or_content_probe() {
 #[test]
 fn isolated_profile_requires_one_new_network_namespace() {
     let id = ProgramId::primary();
-    validate_runtime(&id, &test_program()).expect("new private network namespace");
+    validate_runtime(&id, &test_program(), Network::Isolated)
+        .expect("new private network namespace");
     let runtime = RuntimeConfig::parse(
             br#"{"ociVersion":"1.3.0","root":{"path":"rootfs"},"process":{"terminal":false,"args":["/bin/true"],"cwd":"/","user":{"uid":0,"gid":0},"noNewPrivileges":true,"capabilities":{"bounding":[],"effective":[],"inheritable":[],"permitted":[],"ambient":[]}},"linux":{"namespaces":[{"type":"pid"},{"type":"network","path":"/proc/1/ns/net"},{"type":"ipc"},{"type":"uts"},{"type":"mount"},{"type":"cgroup"}]}}"#.to_vec(),
         )
         .expect("runtime");
     let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
-    let error = validate_runtime(&id, &program).expect_err("existing namespace");
+    let error = validate_runtime(&id, &program, Network::Isolated).expect_err("existing namespace");
     assert!(
         error
             .path()
@@ -75,7 +76,8 @@ fn native_profile_requires_one_new_mount_namespace() {
             namespace.get("type").and_then(serde_json::Value::as_str) != Some("mount")
         });
     let program = program_with_runtime(&missing);
-    let error = validate_runtime(&id, &program).expect_err("missing mount namespace");
+    let error =
+        validate_runtime(&id, &program, Network::Isolated).expect_err("missing mount namespace");
     assert!(
         error
             .path()
@@ -92,7 +94,8 @@ fn native_profile_requires_one_new_mount_namespace() {
         .expect("mount namespace")
         .insert("path".to_owned(), json!("/proc/1/ns/mnt"));
     let program = program_with_runtime(&existing);
-    let error = validate_runtime(&id, &program).expect_err("existing mount namespace");
+    let error =
+        validate_runtime(&id, &program, Network::Isolated).expect_err("existing mount namespace");
     assert!(
         error
             .path()
@@ -109,7 +112,8 @@ fn native_profile_requires_one_new_mount_namespace() {
         .expect("namespaces")
         .push(json!({"type": "mount"}));
     let program = program_with_runtime(&duplicate);
-    let error = validate_runtime(&id, &program).expect_err("duplicate mount namespace");
+    let error =
+        validate_runtime(&id, &program, Network::Isolated).expect_err("duplicate mount namespace");
     assert!(
         error
             .path()
@@ -131,7 +135,8 @@ fn native_profile_rejects_shared_rootfs_propagation() {
             .expect("linux")
             .insert("rootfsPropagation".to_owned(), json!(propagation));
         let program = program_with_runtime(&value);
-        let error = validate_runtime(&id, &program).expect_err("outgoing mount propagation");
+        let error = validate_runtime(&id, &program, Network::Isolated)
+            .expect_err("outgoing mount propagation");
         assert!(
             error
                 .path()
@@ -149,7 +154,7 @@ fn native_profile_rejects_shared_rootfs_propagation() {
             .and_then(serde_json::Value::as_object_mut)
             .expect("linux")
             .insert("rootfsPropagation".to_owned(), json!(propagation));
-        validate_runtime(&id, &program_with_runtime(&value))
+        validate_runtime(&id, &program_with_runtime(&value), Network::Isolated)
             .expect("non-shared rootfs propagation");
     }
 }
@@ -166,7 +171,7 @@ fn native_profile_delegates_oci_runtime_semantics_to_runc() {
         .expect("structurally valid runtime config");
     let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
 
-    validate_runtime(&ProgramId::primary(), &program)
+    validate_runtime(&ProgramId::primary(), &program, Network::Isolated)
         .expect("runc, not NativeEngine, owns these OCI field semantics");
 }
 
@@ -181,7 +186,8 @@ fn host_hooks_are_rejected_without_a_containment_model() {
         .expect("structurally valid runtime config");
     let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
 
-    let error = validate_runtime(&ProgramId::primary(), &program).expect_err("host hooks");
+    let error = validate_runtime(&ProgramId::primary(), &program, Network::Isolated)
+        .expect_err("host hooks");
     assert!(
         error
             .path()
@@ -234,7 +240,8 @@ fn caller_selected_cgroup_is_rejected_at_the_owned_boundary() {
         .expect("structurally valid runtime config");
     let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
 
-    let error = validate_runtime(&ProgramId::primary(), &program).expect_err("owned cgroup");
+    let error = validate_runtime(&ProgramId::primary(), &program, Network::Isolated)
+        .expect_err("owned cgroup");
     assert!(
         error
             .path()

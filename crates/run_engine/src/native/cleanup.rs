@@ -7,7 +7,6 @@ use super::program::RootfsStability;
 use super::runc::{helper_message, runc_command};
 use super::subprocess::{InvocationSupervisor, run_helper_until};
 
-#[derive(Clone, Copy)]
 pub(super) struct RuntimeCleanup<'a> {
     pub(super) runc: &'a Path,
     pub(super) runtime_root: &'a Path,
@@ -16,6 +15,7 @@ pub(super) struct RuntimeCleanup<'a> {
     pub(super) runtime_attempted: bool,
     pub(super) removal_timeout: Duration,
     pub(super) supervisor_deadline: Instant,
+    pub(super) egress: &'a mut Option<super::network::EgressNetwork>,
 }
 
 #[derive(Default)]
@@ -58,6 +58,12 @@ impl RuntimeCleanup<'_> {
             .checked_add(self.removal_timeout)
             .expect("validated OperationTimeouts fit Instant")
             .min(self.supervisor_deadline);
+        if let Some(network) = self.egress {
+            for issue in network.cleanup(self.supervisor, deadline) {
+                report.supervisor_unreaped |= !issue.supervisor_reaped;
+                report.issues.push(CleanupIssue::new(issue.message, None));
+            }
+        }
         if self.runtime_attempted {
             self.delete_runtime(&mut report, deadline);
         }
