@@ -94,6 +94,23 @@ fn real_runc_exercises_native_engine_contract() {
     assert_workspace_empty(workspace.path());
     assert_eq!(engine_cgroups(), cgroups_before, "owned cgroup leaked");
 
+    let file_mount_source = tempfile::NamedTempFile::new().expect("file mount source");
+    fs::write(file_mount_source.path(), b"task").expect("file mount contents");
+    let file_bind = engine
+        .run(
+            e2e_input_with_file_bind(&initial, file_mount_source.path()),
+            CancellationToken::new(),
+        )
+        .expect("file bind mount output");
+    assert!(
+        file_bind.programs()[&ProgramId::primary()]
+            .final_environment()
+            .value()
+            .is_some(),
+        "file bind mount artifact prevented final environment capture"
+    );
+    assert_workspace_empty(workspace.path());
+
     let exit_zero = engine
         .run(
             e2e_input(&initial, "exit-zero", "sleep .2; exit 0", b"", None),
@@ -391,6 +408,28 @@ fn real_runc_exercises_native_engine_contract() {
             .create()
             .errors()
             .any(|error| error.message().contains("create deadline exceeded"))
+    );
+
+    let (_noisy_wrapper_workspace, noisy_wrapper) = noisy_runc_wrapper(&engine.runc_executable);
+    let noisy_engine = NativeEngine::new(
+        store.clone(),
+        workspace.path(),
+        noisy_wrapper,
+        OperationTimeouts::default(),
+    );
+    let noisy_create = noisy_engine
+        .run(
+            e2e_input(&initial, "noisy-create", "exit 0", b"", None),
+            CancellationToken::new(),
+        )
+        .expect("bounded create diagnostics remain structured output");
+    let noisy_program = &noisy_create.programs()[&ProgramId::primary()];
+    assert_eq!(noisy_program.create().status(), OperationStatus::Unknown);
+    assert!(
+        noisy_program
+            .create()
+            .errors()
+            .any(|error| error.message().contains("diagnostics exceeded"))
     );
 
     let (_start_wrapper_workspace, start_wrapper) =

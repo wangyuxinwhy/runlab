@@ -80,7 +80,7 @@ impl Preparation<'_> {
         let programs = self.prepare_programs(&invocation, &runtime_root, &cgroup_base, &images)?;
 
         Ok(PreparedInvocation {
-            workspace: Some(invocation),
+            workspace: Some(invocation.keep()),
             runtime_root,
             runc,
             programs,
@@ -276,7 +276,7 @@ fn ensure_cgroup_absent(path: &Path) -> Result<(), EngineError> {
 }
 
 pub(super) struct PreparedInvocation {
-    pub(super) workspace: Option<TempDir>,
+    pub(super) workspace: Option<PathBuf>,
     pub(super) runtime_root: PathBuf,
     pub(super) runc: PathBuf,
     pub(super) programs: BTreeMap<ProgramId, PreparedProgram>,

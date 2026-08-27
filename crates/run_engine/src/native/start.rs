@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result as AnyResult, bail};
 use run_protocol::{
-    CreateFacts, OperationReport, OperationStage, OperationStatus, ProgramId, ProgramInput,
-    StartFacts,
+    CreateFacts, OperationError, OperationReport, OperationStage, OperationStatus, ProgramId,
+    ProgramInput, StartFacts,
 };
 
 use super::cgroup::observe_owned_cgroup;
@@ -21,7 +21,7 @@ use super::runc::{create_failure_message, helper_message, runc_command};
 use super::stdio::{InputTransfer, StreamDrain};
 use super::subprocess::{
     HELPER_OUTPUT_LIMIT, HelperOutput, InvocationSupervisor, RunningHelper, SUPERVISOR_REAP_LIMIT,
-    SupervisorSpawnError, terminate_child,
+    terminate_child,
 };
 use super::time::{POLL_INTERVAL, checked_deadline, execution_expired, wall_clock_now};
 use crate::{CancellationToken, OperationTimeouts};
@@ -204,8 +204,8 @@ impl CreateSession<'_> {
         self.supervise(&mut helper);
         helper.stdout.pump();
         helper.stderr.pump();
-        self.finish_supervisor(&mut helper);
-        helper.run.facts.create = self.create_report(&helper);
+        let termination_error = self.finish_supervisor(&mut helper);
+        helper.run.facts.create = self.create_report(&helper, termination_error);
         if helper.run.facts.create.status() != OperationStatus::Succeeded
             || self.cancellation.is_cancelled()
             || execution_expired(self.execution_start, self.execution_limit)
@@ -214,7 +214,7 @@ impl CreateSession<'_> {
         }
         if !helper.pipes_are_empty() {
             helper.run.facts.errors.push(operation_error(
-                OperationStage::Create,
+                OperationStage::ProcessSupervision,
                 format!(
                     "runc create succeeded but pre-start Program pipes were not provably empty; stdout: {}; stderr: {}",
                     String::from_utf8_lossy(helper.stdout.bytes()),
@@ -269,33 +269,14 @@ impl CreateSession<'_> {
             .process_group(0);
         let child = match self.supervisor.spawn(&mut command) {
             Ok(child) => child,
-            Err(SupervisorSpawnError::NotSpawned(error)) => {
+            Err(error) => {
                 let operation = operation_error(
                     OperationStage::Create,
-                    format!("failed to spawn runc create: {error}"),
+                    format!("failed to spawn runc create: {error:#}"),
                     None,
                 );
                 let mut run = ProgramRun::unattempted_with(self.supervisor.clone());
                 run.facts.create = OperationReport::failed(operation, []);
-                return CreateLaunch::Finished(run);
-            }
-            Err(SupervisorSpawnError::SpawnedRegistered { token, error }) => {
-                let operation = operation_error(
-                    OperationStage::Create,
-                    format!(
-                        "runc create was spawned, but its supervisor attachment failed after registration: {error:#}"
-                    ),
-                    None,
-                );
-                let mut run = ProgramRun::unattempted_with(self.supervisor.clone());
-                run.supervision.create_child = Some(token);
-                run.runtime.attempted = true;
-                run.runtime.writer_stopped = false;
-                run.facts.create = OperationReport::unknown(
-                    "runc create outcome is unknown because supervisor attachment failed after the process was registered",
-                    [operation],
-                )
-                .expect("literal reason");
                 return CreateLaunch::Finished(run);
             }
         };
@@ -343,11 +324,14 @@ impl CreateSession<'_> {
                 || fs::metadata(&self.prepared.runc_log_path)
                     .is_ok_and(|metadata| metadata.len() > HELPER_OUTPUT_LIMIT as u64)
             {
-                helper.run.facts.errors.push(operation_error(
-                    OperationStage::Create,
-                    "runc create diagnostics exceeded the bounded 1 MiB limit",
-                    None,
-                ));
+                helper.record_unknown(
+                    "runc create diagnostics exceeded the bounded limit",
+                    operation_error(
+                        OperationStage::Create,
+                        "runc create diagnostics exceeded the bounded 1 MiB limit",
+                        None,
+                    ),
+                );
                 break;
             }
             if helper.run.runtime.pidfd.is_none() {
@@ -356,15 +340,14 @@ impl CreateSession<'_> {
                         helper.run.runtime.pidfd = pidfd;
                     }
                     Err(error) => {
-                        helper.run.facts.create = OperationReport::unknown(
+                        helper.record_unknown(
                             "runc pidfd receipt failed after runc create was spawned",
-                            [operation_error(
+                            operation_error(
                                 OperationStage::Create,
                                 format!("failed to receive container pidfd from runc: {error}"),
                                 error.raw_os_error().map(i64::from),
-                            )],
-                        )
-                        .expect("literal reason");
+                            ),
+                        );
                         break;
                     }
                 }
@@ -395,32 +378,37 @@ impl CreateSession<'_> {
                 Ok(None) => thread::sleep(POLL_INTERVAL),
                 Err(error) => {
                     helper.run.runtime.poll_failed = true;
-                    helper.run.facts.errors.push(operation_error(
-                        OperationStage::Create,
-                        format!("failed to poll runc create: {error}"),
-                        error.raw_os_error().map(i64::from),
-                    ));
+                    helper.record_unknown(
+                        "runc create outcome is unknown because its supervisor could not be polled",
+                        operation_error(
+                            OperationStage::Create,
+                            format!("failed to poll runc create: {error}"),
+                            error.raw_os_error().map(i64::from),
+                        ),
+                    );
                     break;
                 }
             }
         }
     }
 
-    fn finish_supervisor(&self, helper: &mut CreateHelper) {
+    fn finish_supervisor(&self, helper: &mut CreateHelper) -> Option<OperationError> {
         if helper.status.is_none() {
-            terminate_child(
+            match terminate_child(
                 self.supervisor,
                 &mut helper.run.supervision.create_child,
                 SUPERVISOR_REAP_LIMIT,
-            )
-            .unwrap_or_else(|error| {
-                helper.run.supervision.unreaped = true;
-                helper.run.facts.errors.push(operation_error(
-                    OperationStage::Create,
-                    format!("failed to terminate runc create supervisor: {error:#}"),
-                    None,
-                ));
-            });
+            ) {
+                Ok(()) => None,
+                Err(error) => {
+                    helper.run.supervision.unreaped = true;
+                    Some(operation_error(
+                        OperationStage::Create,
+                        format!("failed to terminate runc create supervisor: {error:#}"),
+                        None,
+                    ))
+                }
+            }
         } else {
             self.supervisor
                 .release_reaped(
@@ -432,10 +420,33 @@ impl CreateSession<'_> {
                 )
                 .expect("completed create supervisor is reaped");
             helper.run.supervision.create_child = None;
+            None
         }
     }
 
-    fn create_report(&self, helper: &CreateHelper) -> OperationReport<CreateFacts> {
+    fn create_report(
+        &self,
+        helper: &CreateHelper,
+        termination_error: Option<OperationError>,
+    ) -> OperationReport<CreateFacts> {
+        if helper.status.is_none() && helper.run.facts.create.status() == OperationStatus::Unknown {
+            let reason = helper
+                .run
+                .facts
+                .create
+                .reason()
+                .expect("Unknown create report has a reason")
+                .to_owned();
+            let mut errors = helper
+                .run
+                .facts
+                .create
+                .errors()
+                .cloned()
+                .collect::<Vec<_>>();
+            errors.extend(termination_error);
+            return OperationReport::unknown(reason, errors).expect("existing reason is valid");
+        }
         match helper.status {
             Some(status) if status.success() && helper.run.runtime.pidfd.is_some() => {
                 OperationReport::succeeded(CreateFacts::new(wall_clock_now()))
@@ -458,9 +469,8 @@ impl CreateSession<'_> {
                 ),
                 [],
             ),
-            None => OperationReport::unknown(
-                "runc create did not complete before cancellation or its deadline",
-                [operation_error(
+            None => {
+                let mut errors = vec![operation_error(
                     OperationStage::Create,
                     if self.cancellation.is_cancelled() {
                         "runc create interrupted by cancellation"
@@ -470,9 +480,14 @@ impl CreateSession<'_> {
                         "runc create deadline exceeded"
                     },
                     None,
-                )],
-            )
-            .expect("literal reason"),
+                )];
+                errors.extend(termination_error);
+                OperationReport::unknown(
+                    "runc create did not complete before cancellation or its deadline",
+                    errors,
+                )
+                .expect("literal reason")
+            }
         }
     }
 }
@@ -493,6 +508,10 @@ struct CreateHelper {
 }
 
 impl CreateHelper {
+    fn record_unknown(&mut self, reason: &'static str, error: OperationError) {
+        self.run.facts.create = OperationReport::unknown(reason, [error]).expect("literal reason");
+    }
+
     fn pipes_are_empty(&self) -> bool {
         self.stdout.bytes().is_empty()
             && self.stderr.bytes().is_empty()
@@ -514,7 +533,7 @@ fn establish_created_process_evidence(prepared: &PreparedProgram, run: &mut Prog
         Ok(pid) => pid,
         Err(error) => {
             run.facts.errors.push(operation_error(
-                OperationStage::Create,
+                OperationStage::ProcessSupervision,
                 format!("could not identify the created container process: {error:#}"),
                 None,
             ));
@@ -533,7 +552,7 @@ fn establish_created_process_evidence(prepared: &PreparedProgram, run: &mut Prog
         Ok(path) => run.runtime.cgroup_path = Some(path),
         Err(error) => {
             run.facts.errors.push(operation_error(
-                OperationStage::Create,
+                OperationStage::ProcessSupervision,
                 format!("could not prove ownership of runc's default cgroup: {error:#}"),
                 None,
             ));

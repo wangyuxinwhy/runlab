@@ -163,7 +163,7 @@ impl Rootfs {
         mountinfo::ensure_no_mounts(&self.root)
     }
 
-    /// Removes one Engine-created mountpoint directory without resolving any
+    /// Removes one empty Engine-created mountpoint without resolving any
     /// component outside the retained rootfs descriptor.
     pub(crate) fn remove_mount_artifact(&self, relative: &Path) -> Result<()> {
         let raw = relative.as_os_str().as_bytes();
@@ -204,13 +204,17 @@ impl Rootfs {
                 });
             }
         };
-        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
-            bail!(
-                "rootfs instability: runtime-created mount artifact {} changed from an expected directory",
-                path.display()
-            );
-        }
-        unlinkat(&parent, name, AtFlags::REMOVEDIR).with_context(|| {
+        let flags = match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => AtFlags::REMOVEDIR,
+            FileType::RegularFile if stat.st_size == 0 => AtFlags::empty(),
+            _ => {
+                bail!(
+                    "rootfs instability: runtime-created mount artifact {} is not an empty file or directory",
+                    path.display()
+                );
+            }
+        };
+        unlinkat(&parent, name, flags).with_context(|| {
             format!(
                 "rootfs instability: runtime-created mount artifact {} was not proved empty and removed",
                 path.display()

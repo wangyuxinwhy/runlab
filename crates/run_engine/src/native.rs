@@ -94,9 +94,6 @@ impl NativeEngine {
                 }
             },
         };
-        budget
-            .check()
-            .map_err(|error| EngineError::internal(format!("{error:#}")))?;
         execute(
             &self.execution_context(),
             input,

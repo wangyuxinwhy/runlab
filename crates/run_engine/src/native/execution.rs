@@ -3,27 +3,23 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result as AnyResult, bail};
-use run_protocol::{
-    Availability, EngineError, ExecutionInterval, ExecutionOutput, ImageDescriptor, OperationStage,
-    OperationStatus, ProcessResult, ProgramId, RunInput, RunOutput,
-};
-use tempfile::TempDir;
-
 use super::budget::OperationBudget;
 use super::capture::capture;
-use super::cleanup::{
-    CgroupProcessProof, RuntimeCleanup, RuntimeCleanupReport, cleanup_invocation, cleanup_runtime,
-};
+use super::cleanup::{RuntimeCleanup, RuntimeCleanupReport, cleanup_invocation, cleanup_runtime};
 use super::prepare::{PreparedInvocation, PreparedProgram};
 use super::program::{ProgramRun, RootfsStability};
 use super::report::{operation_error, output_internal};
 use super::start::{ProgramStarter, StartControl};
 use super::stop::stop_all;
-use super::subprocess::{InvocationSupervisor, SUPERVISOR_REAP_LIMIT, SupervisorLifecycle};
-use super::time::{POLL_INTERVAL, checked_deadline, execution_expired, wall_clock_now};
+use super::subprocess::{InvocationSupervisor, SupervisorLifecycle};
+use super::time::{POLL_INTERVAL, execution_expired, wall_clock_now};
 use super::wait::{finalize_children, poll_children};
 use crate::{CancellationToken, OciContentStore, OperationTimeouts};
+use anyhow::{Result as AnyResult, bail};
+use run_protocol::{
+    Availability, EngineError, ExecutionInterval, ExecutionOutput, ImageDescriptor, OperationStage,
+    OperationStatus, ProcessResult, ProgramId, RunInput, RunOutput,
+};
 
 pub(super) struct ExecutionContext {
     store: Arc<dyn OciContentStore>,
@@ -226,7 +222,7 @@ fn establish_capture_safety(
         mark_writers_unstopped(runs);
         if let Some(workspace) = prepared.workspace.take() {
             return Err(preserve_workspace_after_supervisor_failure(
-                workspace, &error,
+                &workspace, &error,
             ));
         }
         return Err(EngineError::internal(format!("{error:#}")));
@@ -248,7 +244,6 @@ fn cleanup_program_runtimes(
             program,
             supervisor: &run.supervision.owner,
             runtime_attempted: run.runtime.attempted,
-            observed_cgroup: run.runtime.cgroup_path.as_deref(),
             removal_timeout: context.timeouts.runtime_filesystem_removal(),
             supervisor_deadline: deadline,
         });
@@ -265,7 +260,7 @@ fn finalize_supervisor_for_capture(
         mark_writers_unstopped(runs);
         if let Some(workspace) = prepared.workspace.take() {
             return Err(preserve_workspace_after_supervisor_failure(
-                workspace, &error,
+                &workspace, &error,
             ));
         }
         return Err(EngineError::internal(format!(
@@ -313,9 +308,6 @@ fn apply_runtime_cleanup_report(run: &mut ProgramRun, report: RuntimeCleanupRepo
             );
         }
     }
-    if report.cgroup_processes == CgroupProcessProof::Unproved {
-        run.runtime.writer_stopped = false;
-    }
     run.runtime.rootfs_stability = report.rootfs_stability;
     run.supervision.unreaped |= report.supervisor_unreaped;
     run.facts
@@ -330,30 +322,9 @@ fn establish_runtime_cleanup_safety(
     supervisor: &InvocationSupervisor,
     deadline: Instant,
 ) -> AnyResult<()> {
-    let initial_deadline = checked_deadline(
-        Instant::now(),
-        SUPERVISOR_REAP_LIMIT,
-        "initial supervisor cleanup pass",
-    )?
-    .min(deadline);
-    let _ = supervisor.finalize(initial_deadline);
-    if matches!(
-        supervisor.lifecycle(),
-        SupervisorLifecycle::TerminationUnproven { .. }
-    ) {
-        let closure = supervisor.finalize(deadline);
-        if matches!(
-            supervisor.lifecycle(),
-            SupervisorLifecycle::TerminationUnproven { .. }
-        ) {
-            return Err(closure.expect_err("unproved lifecycle must not report Reaped"));
-        }
-    }
-    if !matches!(
-        supervisor.lifecycle(),
-        SupervisorLifecycle::Reaped | SupervisorLifecycle::KillDelivered { .. }
-    ) {
-        bail!("invocation supervisor did not establish a safe runtime-cleanup lifecycle");
+    supervisor.finalize(deadline)?;
+    if supervisor.lifecycle() != SupervisorLifecycle::Reaped {
+        bail!("invocation supervisor still owns an active helper");
     }
     if Instant::now() >= deadline {
         bail!(
@@ -364,13 +335,12 @@ fn establish_runtime_cleanup_safety(
 }
 
 fn preserve_workspace_after_supervisor_failure(
-    workspace: TempDir,
+    workspace: &std::path::Path,
     error: &anyhow::Error,
 ) -> EngineError {
-    let preserved = workspace.keep();
     EngineError::internal(format!(
         "invocation supervisor could not prove every child reaped before capture; preserved workspace {}: {error:#}",
-        preserved.display()
+        workspace.display()
     ))
 }
 

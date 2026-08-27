@@ -98,6 +98,7 @@ const NETLINK_HEADER_LEN: usize = 16;
 const CONNECTOR_HEADER_LEN: usize = 20;
 const PROC_EVENT_EXIT_LEN: usize = 40;
 const PROC_EVENT_BUFFER: usize = 64 * 1024;
+const PROC_EVENT_POLL_LIMIT: usize = 64;
 
 #[derive(Clone, Copy)]
 pub(super) enum RawProcessResult {
@@ -164,8 +165,8 @@ impl ProcExitMonitor {
     }
 
     pub(super) fn try_result(&mut self) -> AnyResult<Option<RawProcessResult>> {
-        loop {
-            let mut buffer = vec![0_u8; PROC_EVENT_BUFFER].into_boxed_slice();
+        let mut buffer = vec![0_u8; PROC_EVENT_BUFFER].into_boxed_slice();
+        for _ in 0..PROC_EVENT_POLL_LIMIT {
             let (received, full_length, address) =
                 match recvfrom(&self.socket, &mut buffer[..], RecvFlags::DONTWAIT) {
                     Ok(value) => value,
@@ -186,6 +187,9 @@ impl ProcExitMonitor {
                 return Ok(Some(RawProcessResult::from_wait_status(status)));
             }
         }
+        // The proc connector is host-wide. Yield to the lifecycle loop so an
+        // unrelated event flood cannot postpone cancellation or deadlines.
+        Ok(None)
     }
 
     fn drain_stale(&mut self) -> AnyResult<()> {

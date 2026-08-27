@@ -104,6 +104,25 @@ fn mount_artifact_cleanup_is_dirfd_relative_and_fails_closed() {
         .expect("remove parent artifact");
     assert!(!rootfs.path().join("removed").exists());
 
+    File::create(rootfs.path().join("empty-file")).expect("empty file artifact");
+    rootfs
+        .remove_mount_artifact(Path::new("empty-file"))
+        .expect("remove empty file artifact");
+    assert!(!rootfs.path().join("empty-file").exists());
+
+    std::fs::write(rootfs.path().join("changed-file"), b"preserve").expect("changed file artifact");
+    let error = rootfs
+        .remove_mount_artifact(Path::new("changed-file"))
+        .expect_err("changed file artifact must make the rootfs unstable");
+    assert!(
+        error.to_string().contains("rootfs instability"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read(rootfs.path().join("changed-file")).expect("preserved file change"),
+        b"preserve"
+    );
+
     let outside = tempfile::tempdir().expect("outside");
     std::fs::create_dir(outside.path().join("victim")).expect("outside victim");
     std::os::unix::fs::symlink(outside.path(), rootfs.path().join("escape"))

@@ -36,7 +36,7 @@ run_engine -> run_protocol
 | invocation orchestration | `native/execution.rs` |
 | preflight 与 bundle preparation | `native/prepare.rs`、`native/profile.rs` |
 | create/start、wait、stop | `native/start.rs`、`native/wait.rs`、`native/stop.rs` |
-| process ownership 与 bounded helpers | `native/subprocess/supervisor.rs`、`native/subprocess/helper.rs` |
+| process evidence 与 helper ownership | `native/linux_evidence.rs`、`native/subprocess.rs` |
 | stdio 与 process evidence | `native/stdio.rs`、`native/linux_evidence.rs` |
 | runtime/invocation cleanup | `native/cleanup.rs` |
 | exact OCI content/Image/Layer | `oci/content.rs`、`oci.rs`、`oci/layer.rs`、`oci/json.rs` |
@@ -54,7 +54,7 @@ rootfs layer/capture -> digest/xattr/mountinfo
 run_engine -> run_protocol
 ```
 
-Native lifecycle 函数按 preparation、execution、create/start、wait、signal phase 和 cleanup 分解；生产路径没有 `too_many_lines` 或 `too_many_arguments` lint 例外。rootfs 子模块使用显式依赖，Layer 扫描和 apply 共同依赖独立 plan，不互相反向拥有类型。
+Native lifecycle 按 preparation、create/start、wait、stop、capture 和 cleanup 分解。辅助 runc 进程只使用普通 `Child` ownership、process-group kill 和 reap；无法观察的过程事实进入协议已有的 Unknown/Unavailable，不建立额外的证明状态机。rootfs 子模块使用显式依赖，Layer 扫描和 apply 共同依赖独立 plan，不互相反向拥有类型。
 
 没有公共 Backend trait、异步 runtime、恢复接口或 Docker compatibility vocabulary。
 
@@ -65,17 +65,17 @@ Native lifecycle 函数按 preparation、execution、create/start、wait、signa
 - 每次最多 8 个 Program，execution timeout 最长 7 天。
 - stdout/stderr 各保留固定 100 MiB 原始字节前缀，之后继续排空并记录 omission/EOF。
 - capture 依靠 stopped tree 的 two-pass agreement，不是原子 filesystem snapshot。
-- OCI Runtime field、mount、device、namespace、capability 与 resource 只接受已证明可忠实执行的子集。
+- OCI Runtime Configuration 的受支持标准字段和 option 原样交给 runc。NativeEngine 只预检自己拥有的交叉边界，以及显式宿主资源在执行前是否可用：isolated network namespace、new mount namespace with non-shared rootfs propagation、Engine-owned cgroup、mount destination、bind/namespace path 和执行平台。非空 host hooks 在具备可验证的进程 containment 模型前不受支持。
+- runtime 与 cgroup 清理由 `runc delete --force` 实施；失败作为操作事实返回，不在 Engine 内复制一套 cgroup 解释和回收机制。
 - 不考虑跨调用恢复、journal 或 reconcile。
 
 ## 当前验证事实
 
-- macOS：`run_protocol` 20 个测试、`run_engine` 8 个非 Linux 测试通过。
-- Linux：`run_protocol` 20 个测试；`run_engine` 83 个测试通过，1 个真实 runc 测试默认显式忽略。
-- Linux 完整测试套件曾连续运行 20 轮，用于复核已修正的 executable fixture 竞态。
+- macOS：`run_protocol` 21 个测试、`run_engine` 8 个非 Linux 测试通过。
+- Linux：`run_protocol` 21 个测试；`run_engine` 76 个测试通过，1 个真实 runc 测试默认显式忽略。
 - macOS 与 Linux Clippy 均以 `-D warnings` 通过；`cargo fmt --check` 与 `git diff --check` 通过。
 - macOS 和 Linux 的 Rust 1.95.0 all-target check 通过。
 - `run_protocol` package 成功；`run_engine` 在临时 crates.io patch 指向同工作树 `run_protocol` 的条件下成功生成 package archive。真实发布仍必须先发布 `run_protocol 0.1.0`。
-- 真实 Lima Linux VM 上以 runc 1.5.1 跑过完整 NativeEngine ignored E2E：1 个测试通过。rootfs-stability 修正后的第一次复跑暴露旧 fixture 把持久输出写入 Engine-owned mount artifact，因而按新安全规则正确拒绝 Final；fixture 分离两类目录后，完整 E2E 重新通过。
+- 真实 Lima Linux VM 上以 runc 1.5.1 跑过完整 NativeEngine ignored E2E：1 个测试通过，覆盖非零/零退出、信号、超时、取消、并发、多 Program、stdio、最终 Image、workspace 和 cgroup 清理。
 
 以上事实均针对当前未提交工作树。独立 review 结论只对审阅时列明的完整 source hash 有效，本状态文件不替代冻结 manifest 与审阅报告。

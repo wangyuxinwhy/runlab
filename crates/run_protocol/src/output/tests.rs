@@ -397,3 +397,24 @@ fn execution_scope_rejects_program_operation_errors() {
 
     assert_eq!(error.path(), "execution.errors");
 }
+
+#[test]
+fn process_supervision_error_belongs_to_the_program() {
+    let base = simple_program();
+    ProgramOutput::new(
+        base.create().clone(),
+        base.start().clone(),
+        base.process().clone(),
+        base.stdin().clone(),
+        base.stdout().clone(),
+        base.stderr().clone(),
+        [],
+        base.final_environment().clone(),
+        [error(
+            1,
+            OperationStage::ProcessSupervision,
+            "created process identity unavailable",
+        )],
+    )
+    .expect("process supervision is an additional Program-scoped operation");
+}

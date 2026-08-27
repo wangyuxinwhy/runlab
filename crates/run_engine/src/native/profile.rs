@@ -1,6 +1,4 @@
-use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use run_protocol::{EngineError, InputPath, ProgramId, ProgramInput};
@@ -11,100 +9,10 @@ use crate::oci::VerifiedImage;
 pub(super) fn validate_runtime(id: &ProgramId, program: &ProgramInput) -> Result<(), EngineError> {
     let base = program_path(id).child("runtime_config");
     let value = program.runtime_config().as_json();
-    if value
-        .pointer("/root/path")
-        .and_then(serde_json::Value::as_str)
-        != Some("rootfs")
-    {
-        return Err(EngineError::unsupported(
-            base.clone().child("root").child("path"),
-            "NativeEngine materializes each private rootfs at the exact bundle path rootfs",
-        ));
-    }
-    if value
-        .pointer("/process/terminal")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(EngineError::unsupported(
-            base.clone().child("process").child("terminal"),
-            "NativeEngine implements independent byte streams and does not allocate a terminal",
-        ));
-    }
     if value.pointer("/linux/cgroupsPath").is_some() {
         return Err(EngineError::unsupported(
             base.clone().child("linux").child("cgroupsPath"),
             "NativeEngine requires its unique runtime id to select an Engine-owned cgroup; caller-selected cgroupsPath has external or concurrent ownership",
-        ));
-    }
-    validate_isolated_host_boundaries(&base, value)?;
-    let namespaces = value
-        .pointer("/linux/namespaces")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            EngineError::unsupported(
-                base.clone().child("linux").child("namespaces"),
-                "isolated execution requires an explicit new network namespace",
-            )
-        })?;
-    let required_namespaces = ["cgroup", "ipc", "mount", "network", "pid", "uts"];
-    let mut observed_namespaces = BTreeSet::new();
-    for (index, namespace) in namespaces.iter().enumerate() {
-        if namespace.get("path").is_some_and(|path| !path.is_null()) {
-            return Err(EngineError::unsupported(
-                base.clone()
-                    .child("linux")
-                    .child("namespaces")
-                    .index(index)
-                    .child("path"),
-                "isolated NativeEngine execution requires newly created namespaces, not existing host namespaces",
-            ));
-        }
-        let namespace_type = namespace
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if !required_namespaces.contains(&namespace_type) {
-            return Err(EngineError::unsupported(
-                base.clone()
-                    .child("linux")
-                    .child("namespaces")
-                    .index(index)
-                    .child("type"),
-                "isolated NativeEngine execution supports only new pid, network, ipc, uts, mount, and cgroup namespaces",
-            ));
-        }
-        if !observed_namespaces.insert(namespace_type) {
-            return Err(EngineError::invalid(
-                base.clone()
-                    .child("linux")
-                    .child("namespaces")
-                    .index(index)
-                    .child("type"),
-                "namespace type is duplicated",
-            ));
-        }
-    }
-    if !required_namespaces
-        .iter()
-        .all(|namespace| observed_namespaces.contains(namespace))
-    {
-        return Err(EngineError::unsupported(
-            base.child("linux").child("namespaces"),
-            "isolated execution requires new pid, network, ipc, uts, mount, and cgroup namespaces",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_isolated_host_boundaries(
-    base: &InputPath,
-    value: &serde_json::Value,
-) -> Result<(), EngineError> {
-    if value.pointer("/process/noNewPrivileges") != Some(&serde_json::Value::Bool(true)) {
-        return Err(EngineError::unsupported(
-            base.clone().child("process").child("noNewPrivileges"),
-            "isolated rootful execution requires noNewPrivileges=true",
         ));
     }
     if value
@@ -113,128 +21,92 @@ fn validate_isolated_host_boundaries(
         .is_some_and(|hooks| {
             hooks
                 .values()
-                .any(|hooks| hooks.as_array().is_none_or(|hooks| !hooks.is_empty()))
+                .any(|value| value.as_array().is_none_or(|hooks| !hooks.is_empty()))
         })
     {
         return Err(EngineError::unsupported(
             base.clone().child("hooks"),
-            "isolated NativeEngine execution does not permit caller-controlled host hooks",
+            "NativeEngine does not execute host hooks without a containment model for processes they may leave behind",
         ));
     }
-    validate_isolated_mounts(base, value)?;
-    let capabilities = value
-        .pointer("/process/capabilities")
-        .and_then(serde_json::Value::as_object)
+    let namespaces = value
+        .pointer("/linux/namespaces")
+        .and_then(serde_json::Value::as_array)
         .ok_or_else(|| {
             EngineError::unsupported(
-                base.clone().child("process").child("capabilities"),
-                "isolated rootful execution requires all five capability sets to be explicitly empty",
+                base.clone().child("linux").child("namespaces"),
+                "Network::Isolated requires an explicit new network namespace",
             )
         })?;
-    for set in [
-        "bounding",
-        "effective",
-        "inheritable",
-        "permitted",
-        "ambient",
-    ] {
-        if capabilities
-            .get(set)
-            .and_then(serde_json::Value::as_array)
-            .is_none_or(|entries| !entries.is_empty())
-        {
-            return Err(EngineError::unsupported(
-                base.clone()
-                    .child("process")
-                    .child("capabilities")
-                    .child(set),
-                "isolated rootful execution requires this capability set to be explicitly empty",
-            ));
-        }
-    }
-    if value
-        .pointer("/linux/devices")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|devices| !devices.is_empty())
+    require_new_namespace(
+        &base,
+        namespaces,
+        "network",
+        "Network::Isolated requires a new network namespace",
+        "Network::Isolated cannot join an existing network namespace",
+    )?;
+    require_new_namespace(
+        &base,
+        namespaces,
+        "mount",
+        "NativeEngine requires a new mount namespace for its private rootfs",
+        "NativeEngine cannot place its private rootfs in an existing mount namespace",
+    )?;
+    if let Some(propagation) = value.pointer("/linux/rootfsPropagation")
+        && !matches!(
+            propagation.as_str(),
+            Some("private" | "rprivate" | "slave" | "rslave")
+        )
     {
         return Err(EngineError::unsupported(
-            base.clone().child("linux").child("devices"),
-            "isolated NativeEngine execution does not permit explicit host devices",
+            base.child("linux").child("rootfsPropagation"),
+            "NativeEngine requires rootfs propagation that cannot propagate mounts back to the host",
         ));
-    }
-    if value.pointer("/linux/seccomp/listenerPath").is_some() {
-        return Err(EngineError::unsupported(
-            base.clone()
-                .child("linux")
-                .child("seccomp")
-                .child("listenerPath"),
-            "isolated NativeEngine execution does not permit a host seccomp listener path",
-        ));
-    }
-    if value.pointer("/linux/rootfsPropagation").is_some() {
-        return Err(EngineError::unsupported(
-            base.clone().child("linux").child("rootfsPropagation"),
-            "isolated NativeEngine execution does not permit caller-selected rootfs propagation",
-        ));
-    }
-    for field in ["uidMappings", "gidMappings", "sysctl", "intelRdt"] {
-        if value.pointer(&format!("/linux/{field}")).is_some() {
-            return Err(EngineError::unsupported(
-                base.clone().child("linux").child(field),
-                "isolated NativeEngine does not implement this additional host-kernel boundary",
-            ));
-        }
     }
     Ok(())
 }
 
-fn validate_isolated_mounts(
+fn require_new_namespace(
     base: &InputPath,
-    value: &serde_json::Value,
+    namespaces: &[serde_json::Value],
+    kind: &str,
+    missing: &str,
+    existing: &str,
 ) -> Result<(), EngineError> {
-    for (index, mount) in value
-        .get("mounts")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
+    let mut found = None;
+    for (index, namespace) in namespaces.iter().enumerate() {
+        if namespace.get("type").and_then(serde_json::Value::as_str) != Some(kind) {
+            continue;
+        }
+        if found.replace(index).is_some() {
+            return Err(EngineError::invalid(
+                base.clone()
+                    .child("linux")
+                    .child("namespaces")
+                    .index(index)
+                    .child("type"),
+                format!("{kind} namespace is duplicated"),
+            ));
+        }
+    }
+    let Some(index) = found else {
+        return Err(EngineError::unsupported(
+            base.clone().child("linux").child("namespaces"),
+            missing,
+        ));
+    };
+    if namespaces[index]
+        .get("path")
+        .is_some_and(|path| !path.is_null())
     {
-        let mount_type = mount
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let bind = mount_type == "bind"
-            || mount
-                .get("options")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|options| {
-                    options
-                        .iter()
-                        .any(|option| matches!(option.as_str(), Some("bind" | "rbind")))
-                });
-        if bind {
-            return Err(EngineError::unsupported(
-                base.clone().child("mounts").index(index),
-                "isolated NativeEngine execution does not permit bind mounts across the host boundary",
-            ));
-        }
-        if !matches!(mount_type, "proc" | "tmpfs" | "sysfs") {
-            return Err(EngineError::unsupported(
-                base.clone().child("mounts").index(index).child("type"),
-                "isolated NativeEngine execution supports only proc, tmpfs, and sysfs mounts",
-            ));
-        }
-        if mount_type == "sysfs"
-            && !mount
-                .get("options")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|options| options.iter().any(|option| option.as_str() == Some("ro")))
-        {
-            return Err(EngineError::unsupported(
-                base.clone().child("mounts").index(index).child("options"),
-                "isolated NativeEngine sysfs mounts must be read-only",
-            ));
-        }
+        return Err(EngineError::unsupported(
+            base.clone()
+                .child("linux")
+                .child("namespaces")
+                .index(index)
+                .child("path"),
+            existing,
+        ));
     }
     Ok(())
 }
@@ -290,6 +162,9 @@ pub(super) fn validate_host_resources(
         .and_then(serde_json::Value::as_array)
     {
         for (index, namespace) in namespaces.iter().enumerate() {
+            if namespace.get("type").and_then(serde_json::Value::as_str) == Some("network") {
+                continue;
+            }
             if let Some(path) = namespace.get("path").and_then(serde_json::Value::as_str) {
                 validate_host_path(
                     path,
@@ -302,64 +177,19 @@ pub(super) fn validate_host_resources(
             }
         }
     }
-    for phase in [
-        "prestart",
-        "createRuntime",
-        "createContainer",
-        "startContainer",
-        "poststart",
-        "poststop",
-    ] {
-        if let Some(hooks) = value
-            .pointer(&format!("/hooks/{phase}"))
-            .and_then(serde_json::Value::as_array)
-        {
-            for (index, hook) in hooks.iter().enumerate() {
-                let path = base
-                    .clone()
-                    .child("hooks")
-                    .child(phase)
-                    .index(index)
-                    .child("path");
-                let executable = hook
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| EngineError::invalid(path.clone(), "hook path is required"))?;
-                validate_hook_path(executable, path)?;
-            }
-        }
-    }
     Ok(())
 }
 
 fn validate_host_path(raw: &str, path: InputPath) -> Result<(), EngineError> {
-    let value = Path::new(raw);
-    if !value.is_absolute() {
+    if !Path::new(raw).is_absolute() {
         return Err(EngineError::invalid(
             path,
             "explicit host resource path must be absolute",
         ));
     }
-    fs::symlink_metadata(value).map_err(|error| {
-        EngineError::input_unavailable(path, format!("cannot inspect host resource {raw}: {error}"))
+    fs::metadata(raw).map_err(|error| {
+        EngineError::input_unavailable(path.clone(), format!("cannot inspect {raw}: {error}"))
     })?;
-    Ok(())
-}
-
-fn validate_hook_path(raw: &str, path: InputPath) -> Result<(), EngineError> {
-    validate_host_path(raw, path.clone())?;
-    let metadata = fs::metadata(raw).map_err(|error| {
-        EngineError::input_unavailable(
-            path.clone(),
-            format!("cannot inspect hook executable {raw}: {error}"),
-        )
-    })?;
-    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
-        return Err(EngineError::input_unavailable(
-            path,
-            format!("hook path {raw} is not an executable regular file"),
-        ));
-    }
     Ok(())
 }
 

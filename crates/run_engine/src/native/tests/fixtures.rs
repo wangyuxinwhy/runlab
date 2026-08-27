@@ -6,9 +6,7 @@ use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::Result as AnyResult;
 use oci_spec::image::{Descriptor, Digest, ImageIndex, ImageManifest, MediaType};
@@ -18,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 use crate::native::prepare::{PreparedInvocation, PreparedProgram, create_private_directory};
-use crate::native::subprocess::InvocationSupervisor;
+use crate::native::subprocess::{HELPER_OUTPUT_LIMIT, InvocationSupervisor};
 use crate::oci::inspect_image;
 use crate::rootfs::{Rootfs, RootfsLimits, VerifiedLayer};
 use crate::{
@@ -45,54 +43,6 @@ impl OciContentStore for UnavailableStore {
             "test store is read-only",
         ))
     }
-}
-
-#[derive(Default)]
-pub(super) struct PublishCountingStore {
-    pub(super) publishes: std::sync::atomic::AtomicUsize,
-}
-
-impl OciContentStore for PublishCountingStore {
-    fn open(&self, _descriptor: &Descriptor) -> Result<Box<dyn OciContent>, ContentError> {
-        Err(ContentError::new(
-            ContentErrorKind::Unavailable,
-            "test content is absent",
-        ))
-    }
-
-    fn publish(
-        &self,
-        _descriptor: &Descriptor,
-        _content: &mut dyn Read,
-    ) -> Result<(), ContentError> {
-        self.publishes.fetch_add(1, Ordering::Relaxed);
-        Err(ContentError::new(
-            ContentErrorKind::Rejected,
-            "test publish must not be reached",
-        ))
-    }
-}
-
-pub(super) fn fake_runc_with_create_markers(
-    create_delay: Duration,
-) -> (TempDir, PathBuf, PathBuf, PathBuf) {
-    let workspace = tempfile::tempdir().expect("fake runc workspace");
-    let created = workspace.path().join("created");
-    let deleted = workspace.path().join("deleted");
-    let runc = workspace.path().join("runc");
-    fs::write(
-            &runc,
-            format!(
-                "#!/bin/sh\noperation=\nfor argument in \"$@\"; do\n  case \"$argument\" in create|delete) operation=\"$argument\";; esac\ndone\ncase \"$operation\" in\n  create) sleep {}; printf created > '{}'; sleep 30;;\n  delete) printf deleted > '{}'; rm -f '{}';;\nesac\n",
-                create_delay.as_secs_f64(),
-                created.display(),
-                deleted.display(),
-                created.display(),
-            ),
-        )
-        .expect("write fake runc");
-    fs::set_permissions(&runc, fs::Permissions::from_mode(0o700)).expect("executable fake runc");
-    (workspace, runc, created, deleted)
 }
 
 pub(super) fn empty_prepared_invocation(
@@ -127,7 +77,7 @@ pub(super) fn empty_prepared_invocation(
         artifacts: Vec::new(),
     };
     PreparedInvocation {
-        workspace: Some(workspace),
+        workspace: Some(workspace.keep()),
         runtime_root,
         runc,
         programs: BTreeMap::from([(ProgramId::primary(), program)]),
@@ -295,6 +245,25 @@ pub(super) fn delayed_runc_wrapper(
     (workspace, wrapper)
 }
 
+pub(super) fn noisy_runc_wrapper(real_runc: &Path) -> (TempDir, PathBuf) {
+    let workspace = tempfile::tempdir().expect("wrapper workspace");
+    fs::set_permissions(workspace.path(), fs::Permissions::from_mode(0o700))
+        .expect("private wrapper workspace");
+    let wrapper = workspace.path().join("runc");
+    let quoted_runc = format!("'{}'", real_runc.to_string_lossy().replace('\'', "'\\''"));
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\noperation=\nhelp=0\nfor argument in \"$@\"; do\n  case \"$argument\" in create) operation=create;; --help) help=1;; esac\ndone\nif [ \"$operation\" = create ] && [ \"$help\" -eq 0 ]; then\n  head -c {} /dev/zero >&2\n  sleep 30\nfi\nexec {quoted_runc} \"$@\"\n",
+            HELPER_OUTPUT_LIMIT + 1
+        ),
+    )
+    .expect("write runc wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
+        .expect("executable runc wrapper");
+    (workspace, wrapper)
+}
+
 pub(super) fn e2e_input_uncgrouped(
     image: &ImageDescriptor,
     name: &str,
@@ -317,6 +286,37 @@ pub(super) fn e2e_input_with_cwd(
     RunInput::new(
         BTreeMap::from([(ProgramId::primary(), program)]),
         timeout,
+        Network::Isolated,
+    )
+    .expect("RunInput")
+}
+
+pub(super) fn e2e_input_with_file_bind(image: &ImageDescriptor, source: &Path) -> RunInput {
+    let base = e2e_program_with_options(
+        image,
+        "file-bind",
+        "test \"$(cat /task/input.json)\" = task",
+        b"",
+        "/",
+        false,
+    );
+    let mut value = base.runtime_config().as_json().clone();
+    value
+        .pointer_mut("/mounts")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("mounts")
+        .push(json!({
+            "destination": "/task/input.json",
+            "source": source,
+            "type": "bind",
+            "options": ["bind", "ro"]
+        }));
+    let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime JSON"))
+        .expect("runtime config");
+    let program = ProgramInput::new(image.clone(), runtime, Vec::new()).expect("program");
+    RunInput::new(
+        BTreeMap::from([(ProgramId::primary(), program)]),
+        None,
         Network::Isolated,
     )
     .expect("RunInput")

@@ -150,7 +150,7 @@ impl RunningHelper {
             .stderr(Stdio::from(stderr.try_clone()?))
             .process_group(0);
         Ok(Self {
-            token: supervisor.spawn(command).map_err(anyhow::Error::from)?,
+            token: supervisor.spawn(command)?,
             supervisor: supervisor.clone(),
             stdout,
             stderr,
@@ -229,6 +229,9 @@ impl RunningHelper {
     }
 
     fn terminate_until(&mut self, deadline: Instant) -> AnyResult<()> {
+        if self.reaped {
+            return Ok(());
+        }
         loop {
             if Instant::now() >= deadline {
                 bail!("helper reap deadline exceeded");
@@ -238,7 +241,7 @@ impl RunningHelper {
                 self.supervisor.release_reaped(self.token)?;
                 return Ok(());
             }
-            self.supervisor.progress_kill(self.token)?;
+            self.supervisor.kill(self.token)?;
             if Instant::now() >= deadline {
                 bail!(
                     "helper process group was killed but its leader was not reaped before the confirmation deadline"
@@ -254,7 +257,7 @@ impl RunningHelper {
             self.supervisor.release_reaped(self.token)?;
             return Ok(());
         }
-        self.supervisor.progress_kill(self.token).map(|_| ())
+        self.supervisor.kill(self.token)
     }
 
     pub(in crate::native) fn poll_reaped(&mut self) -> AnyResult<()> {
@@ -262,7 +265,7 @@ impl RunningHelper {
             self.reaped = true;
             self.supervisor.release_reaped(self.token)?;
         } else if !self.reaped {
-            self.supervisor.progress_kill(self.token)?;
+            self.supervisor.kill(self.token)?;
         }
         Ok(())
     }
@@ -300,7 +303,7 @@ pub(in crate::native) fn terminate_child(
             *child = None;
             return Ok(());
         }
-        supervisor.progress_kill(token)?;
+        supervisor.kill(token)?;
         if Instant::now() >= deadline {
             bail!(
                 "child process group was killed but its leader was not reaped before the confirmation deadline"

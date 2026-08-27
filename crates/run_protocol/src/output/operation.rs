@@ -83,6 +83,8 @@ pub enum OperationStage {
     Create,
     /// OCI runtime `start`.
     Start,
+    /// Establishing the identity and containment needed to control a created process.
+    ProcessSupervision,
     /// Writing bytes to the Program's standard input.
     StdinWrite,
     /// Closing the standard-input write end.

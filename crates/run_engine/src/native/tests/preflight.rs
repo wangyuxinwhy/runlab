@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::fixtures::*;
 use crate::native::prepare::{MAX_EXECUTION_TIMEOUT, MAX_PROGRAMS};
-use crate::native::profile::{validate_platform, validate_runtime};
+use crate::native::profile::{validate_host_resources, validate_platform, validate_runtime};
 use crate::oci::inspect_image;
 use crate::{CancellationToken, RunEngine};
 
@@ -44,40 +44,6 @@ fn capability_limits_fail_before_host_or_content_probe() {
 }
 
 #[test]
-fn later_invalid_program_fails_before_any_host_or_content_probe() {
-    let mut invalid_value = test_program().runtime_config().as_json().clone();
-    invalid_value
-        .as_object_mut()
-        .expect("runtime object")
-        .insert(
-            "hooks".to_owned(),
-            json!({"prestart": [{"path": "/bin/true"}]}),
-        );
-    let invalid_runtime =
-        RuntimeConfig::parse(serde_json::to_vec(&invalid_value).expect("runtime config bytes"))
-            .expect("structurally valid runtime config");
-    let invalid = ProgramInput::new(test_image(), invalid_runtime, Vec::new()).expect("program");
-    let input = RunInput::new(
-        BTreeMap::from([
-            (ProgramId::new("dependency-a"), test_program()),
-            (ProgramId::new("dependency-z"), invalid),
-            (ProgramId::primary(), test_program()),
-        ]),
-        None,
-        Network::Isolated,
-    )
-    .expect("input");
-
-    let error = test_engine()
-        .run(input, CancellationToken::new())
-        .expect_err("later unsupported Program");
-    assert_eq!(
-        error.path().map(ToString::to_string).as_deref(),
-        Some("programs[\"dependency-z\"].runtime_config.hooks")
-    );
-}
-
-#[test]
 fn isolated_profile_requires_one_new_network_namespace() {
     let id = ProgramId::primary();
     validate_runtime(&id, &test_program()).expect("new private network namespace");
@@ -98,107 +64,185 @@ fn isolated_profile_requires_one_new_network_namespace() {
 }
 
 #[test]
-fn isolated_profile_rejects_cross_boundary_runtime_features_at_exact_paths() {
-    let cases = [
-        (
-            "hooks",
-            json!({"hooks": {"prestart": [{"path": "/bin/true"}]}}),
-            "hooks",
-        ),
-        (
-            "bind",
-            json!({"mounts": [{"destination": "/host", "type": "bind", "source": "/"}]}),
-            "mounts[0]",
-        ),
-        (
-            "namespace",
-            json!({"linux": {"namespaces": [{"type": "network"}, {"type": "pid", "path": "/proc/1/ns/pid"}]}}),
-            "linux.namespaces[1].path",
-        ),
-        (
-            "capability",
-            json!({"process": {"capabilities": {
-                "bounding": [], "effective": ["CAP_NET_ADMIN"], "inheritable": [],
-                "permitted": [], "ambient": []
-            }}}),
-            "process.capabilities.effective",
-        ),
-        (
-            "privilege gain",
-            json!({"process": {"noNewPrivileges": false}}),
-            "process.noNewPrivileges",
-        ),
-        (
-            "device",
-            json!({"linux": {"devices": [{"path": "/dev/kmsg", "type": "c", "major": 1, "minor": 11}], "namespaces": [{"type": "network"}]}}),
-            "linux.devices",
-        ),
-        (
-            "seccomp listener",
-            json!({"linux": {"seccomp": {"defaultAction": "SCMP_ACT_ALLOW", "listenerPath": "/run/notify.sock"}, "namespaces": [{"type": "network"}]}}),
-            "linux.seccomp.listenerPath",
-        ),
-        (
-            "rootfs propagation",
-            json!({"linux": {"rootfsPropagation": "shared", "namespaces": [{"type": "network"}]}}),
-            "linux.rootfsPropagation",
-        ),
-        (
-            "caller cgroup",
-            json!({"linux": {"cgroupsPath": "/shared", "namespaces": [{"type": "network"}]}}),
-            "linux.cgroupsPath",
-        ),
-    ];
-    for (label, addition, suffix) in cases {
-        let mut value = json!({
-            "ociVersion": "1.3.0",
-            "root": {"path": "rootfs"},
-            "process": {
-                "terminal": false,
-                "args": ["/bin/true"],
-                "cwd": "/",
-                "user": {"uid": 0, "gid": 0},
-                "noNewPrivileges": true,
-                "capabilities": {
-                    "bounding": [], "effective": [], "inheritable": [],
-                    "permitted": [], "ambient": []
-                }
-            },
-            "linux": {"namespaces": [
-                {"type": "pid"}, {"type": "network"}, {"type": "ipc"},
-                {"type": "uts"}, {"type": "mount"}, {"type": "cgroup"}
-            ]}
+fn native_profile_requires_one_new_mount_namespace() {
+    let id = ProgramId::primary();
+    let mut missing = test_program().runtime_config().as_json().clone();
+    missing
+        .pointer_mut("/linux/namespaces")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("namespaces")
+        .retain(|namespace| {
+            namespace.get("type").and_then(serde_json::Value::as_str) != Some("mount")
         });
-        merge_json(&mut value, &addition);
-        let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime JSON"))
-            .expect("runtime config");
-        let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
-        let error = validate_runtime(&ProgramId::primary(), &program)
-            .expect_err("cross-boundary feature unexpectedly accepted");
+    let program = program_with_runtime(&missing);
+    let error = validate_runtime(&id, &program).expect_err("missing mount namespace");
+    assert!(
+        error
+            .path()
+            .expect("path")
+            .to_string()
+            .ends_with("linux.namespaces"),
+        "{error}"
+    );
+
+    let mut existing = test_program().runtime_config().as_json().clone();
+    existing
+        .pointer_mut("/linux/namespaces/4")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("mount namespace")
+        .insert("path".to_owned(), json!("/proc/1/ns/mnt"));
+    let program = program_with_runtime(&existing);
+    let error = validate_runtime(&id, &program).expect_err("existing mount namespace");
+    assert!(
+        error
+            .path()
+            .expect("path")
+            .to_string()
+            .ends_with("linux.namespaces[4].path"),
+        "{error}"
+    );
+
+    let mut duplicate = test_program().runtime_config().as_json().clone();
+    duplicate
+        .pointer_mut("/linux/namespaces")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("namespaces")
+        .push(json!({"type": "mount"}));
+    let program = program_with_runtime(&duplicate);
+    let error = validate_runtime(&id, &program).expect_err("duplicate mount namespace");
+    assert!(
+        error
+            .path()
+            .expect("path")
+            .to_string()
+            .ends_with("linux.namespaces[6].type"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_profile_rejects_shared_rootfs_propagation() {
+    let id = ProgramId::primary();
+    for propagation in ["shared", "rshared", "unbindable", "runbindable"] {
+        let mut value = test_program().runtime_config().as_json().clone();
+        value
+            .pointer_mut("/linux")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("linux")
+            .insert("rootfsPropagation".to_owned(), json!(propagation));
+        let program = program_with_runtime(&value);
+        let error = validate_runtime(&id, &program).expect_err("outgoing mount propagation");
         assert!(
             error
                 .path()
-                .expect("unsupported path")
+                .expect("path")
                 .to_string()
-                .ends_with(suffix),
-            "{label}: {error}"
+                .ends_with("linux.rootfsPropagation"),
+            "{propagation}: {error}"
         );
+    }
+
+    for propagation in ["private", "rprivate", "slave", "rslave"] {
+        let mut value = test_program().runtime_config().as_json().clone();
+        value
+            .pointer_mut("/linux")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("linux")
+            .insert("rootfsPropagation".to_owned(), json!(propagation));
+        validate_runtime(&id, &program_with_runtime(&value))
+            .expect("non-shared rootfs propagation");
     }
 }
 
-fn merge_json(target: &mut serde_json::Value, addition: &serde_json::Value) {
-    let target = target.as_object_mut().expect("target object");
-    for (key, value) in addition.as_object().expect("addition object") {
-        if let (Some(existing), Some(fields)) = (target.get_mut(key), value.as_object())
-            && let Some(existing) = existing.as_object_mut()
-        {
-            for (field, value) in fields {
-                existing.insert(field.clone(), value.clone());
-            }
-            continue;
-        }
-        target.insert(key.clone(), value.clone());
-    }
+#[test]
+fn native_profile_delegates_oci_runtime_semantics_to_runc() {
+    let mut value = test_program().runtime_config().as_json().clone();
+    value
+        .pointer_mut("/process")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("process")
+        .insert("noNewPrivileges".to_owned(), json!(false));
+    let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
+        .expect("structurally valid runtime config");
+    let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
+
+    validate_runtime(&ProgramId::primary(), &program)
+        .expect("runc, not NativeEngine, owns these OCI field semantics");
+}
+
+#[test]
+fn host_hooks_are_rejected_without_a_containment_model() {
+    let mut value = test_program().runtime_config().as_json().clone();
+    value.as_object_mut().expect("runtime object").insert(
+        "hooks".to_owned(),
+        json!({"prestart": [{"path": "/bin/true"}]}),
+    );
+    let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
+        .expect("structurally valid runtime config");
+    let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
+
+    let error = validate_runtime(&ProgramId::primary(), &program).expect_err("host hooks");
+    assert!(
+        error
+            .path()
+            .expect("unsupported path")
+            .to_string()
+            .ends_with("runtime_config.hooks"),
+        "{error}"
+    );
+}
+
+#[test]
+fn missing_bind_source_is_rejected_before_execution() {
+    let workspace = tempfile::tempdir().expect("host resource fixture");
+    let source = workspace.path().join("missing");
+    let mut value = test_program().runtime_config().as_json().clone();
+    value.as_object_mut().expect("runtime object").insert(
+        "mounts".to_owned(),
+        json!([{
+            "destination": "/input",
+            "source": source,
+            "type": "bind",
+            "options": ["bind"]
+        }]),
+    );
+    let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
+        .expect("structurally valid runtime config");
+    let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
+
+    let error =
+        validate_host_resources(&ProgramId::primary(), &program).expect_err("missing bind source");
+    assert!(
+        error
+            .path()
+            .expect("input path")
+            .to_string()
+            .ends_with("mounts[0].source"),
+        "{error}"
+    );
+}
+
+#[test]
+fn caller_selected_cgroup_is_rejected_at_the_owned_boundary() {
+    let mut value = test_program().runtime_config().as_json().clone();
+    value
+        .pointer_mut("/linux")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("linux")
+        .insert("cgroupsPath".to_owned(), json!("/shared"));
+    let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
+        .expect("structurally valid runtime config");
+    let program = ProgramInput::new(test_image(), runtime, Vec::new()).expect("program");
+
+    let error = validate_runtime(&ProgramId::primary(), &program).expect_err("owned cgroup");
+    assert!(
+        error
+            .path()
+            .expect("unsupported path")
+            .to_string()
+            .ends_with("linux.cgroupsPath"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -234,4 +278,10 @@ fn image_platform_requirements_are_rejected_at_exact_paths() {
         validate_platform(&ProgramId::primary(), &image)
             .expect("aarch64 execution proves the OCI arm64/v8 baseline");
     }
+}
+
+fn program_with_runtime(value: &serde_json::Value) -> ProgramInput {
+    let runtime = RuntimeConfig::parse(serde_json::to_vec(&value).expect("runtime config bytes"))
+        .expect("structurally valid runtime config");
+    ProgramInput::new(test_image(), runtime, Vec::new()).expect("program")
 }

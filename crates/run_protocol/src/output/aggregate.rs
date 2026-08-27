@@ -414,6 +414,7 @@ fn validate_program_shape(output: &ProgramOutput, path: &str) -> Result<(), Outp
 
     let allowed_additional = [
         OperationStage::Preparation,
+        OperationStage::ProcessSupervision,
         OperationStage::Wait,
         OperationStage::RuntimeFilesystemRemoval,
         OperationStage::FinalEnvironmentCapture,
