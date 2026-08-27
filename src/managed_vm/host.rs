@@ -15,13 +15,13 @@ use uuid::Uuid;
 
 use super::{GuestHandshake, TRANSPORT_VERSION};
 
-const INSTANCE: &str = "runlab";
+pub(super) const INSTANCE: &str = "runlab";
 const LIMA_VERSION: &str = "2.2.0";
 const START_TIMEOUT: &str = "5m";
-const GUEST_BINARY_ROOT: &str = "/usr/local/libexec/runlab";
+pub(super) const GUEST_BINARY_ROOT: &str = "/usr/local/libexec/runlab";
 const RUNC_PATH: &str = "/usr/local/bin/runc";
 const RUNC_VERSION: &str = "1.5.1";
-const STATE_PATH: &str = "/var/lib/runlab";
+pub(super) const STATE_PATH: &str = "/var/lib/runlab";
 const SYSCTL_PATH: &str = "/etc/sysctl.d/90-runlab.conf";
 const SYSCTL_CONTENTS: &[u8] = b"net.ipv4.ip_forward = 1\n";
 
@@ -33,7 +33,7 @@ const AMD64_IMAGE_DIGEST: &str =
     "sha256:ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6";
 
 pub(crate) struct ManagedVm {
-    limactl: PathBuf,
+    pub(super) limactl: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,9 +108,9 @@ impl RuntimeProfile {
 }
 
 #[derive(Debug)]
-struct FileIdentity {
-    digest: String,
-    size: u64,
+pub(super) struct FileIdentity {
+    pub(super) digest: String,
+    pub(super) size: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -188,7 +188,7 @@ impl ManagedVm {
         let lima_version = self.lima_version()?;
         if let Some(instance) = self.instance()? {
             ensure_compatible(&instance, &lima_version)?;
-            return Ok(status_from(Some(&instance), lima_version));
+            return self.status();
         }
 
         let architecture = host_architecture()?;
@@ -387,6 +387,16 @@ impl ManagedVm {
         Ok(())
     }
 
+    pub(super) fn ensure_ready(&self) -> Result<()> {
+        let status = self.status()?;
+        ensure!(
+            status.ready,
+            "managed VM is not ready: {}; run `runlab vm start` and `runlab vm install`",
+            status.readiness_problems.join("; ")
+        );
+        Ok(())
+    }
+
     fn installed_guest(&self) -> Result<(GuestHandshake, RuntimeProfile)> {
         let binary = guest_binary_path();
         Ok((
@@ -417,7 +427,7 @@ impl ManagedVm {
             "guest architecture does not match the macOS host"
         );
         ensure!(
-            handshake.capabilities == ["native-engine"],
+            handshake.capabilities == ["native-engine", "state-cli"],
             "guest RunLab capabilities do not match the macOS CLI"
         );
         Ok(handshake)
@@ -470,7 +480,7 @@ impl ManagedVm {
         false
     }
 
-    fn guest_test<const N: usize>(&self, arguments: [&str; N]) -> bool {
+    pub(super) fn guest_test<const N: usize>(&self, arguments: [&str; N]) -> bool {
         let mut command = vec!["/usr/bin/test"];
         command.extend(arguments);
         self.guest_command_success(command)
@@ -487,7 +497,7 @@ impl ManagedVm {
         command.output().is_ok_and(|output| output.status.success())
     }
 
-    fn copy_checked(
+    pub(super) fn copy_checked(
         &self,
         source: &Path,
         identity: &FileIdentity,
@@ -504,7 +514,7 @@ impl ManagedVm {
         ensure_remote_identity(&self.remote_file_identity(destination)?, identity)
     }
 
-    fn remote_file_identity(&self, path: &str) -> Result<FileIdentity> {
+    pub(super) fn remote_file_identity(&self, path: &str) -> Result<FileIdentity> {
         let digest = self.guest_output(["/usr/bin/sha256sum", "--", path])?;
         let digest = std::str::from_utf8(&digest.stdout)
             .context("guest sha256sum output is not UTF-8")?
@@ -527,11 +537,11 @@ impl ManagedVm {
         })
     }
 
-    fn guest_success<const N: usize>(&self, arguments: [&str; N]) -> Result<()> {
+    pub(super) fn guest_success<const N: usize>(&self, arguments: [&str; N]) -> Result<()> {
         self.guest_output(arguments).map(|_| ())
     }
 
-    fn guest_output<I, S>(&self, arguments: I) -> Result<Output>
+    pub(super) fn guest_output<I, S>(&self, arguments: I) -> Result<Output>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -707,7 +717,7 @@ fn template(architecture: &str) -> Result<String> {
     .context("failed to encode the managed VM template")
 }
 
-fn guest_binary_path() -> String {
+pub(super) fn guest_binary_path() -> String {
     format!("{GUEST_BINARY_ROOT}/{}/runlab", env!("CARGO_PKG_VERSION"))
 }
 
@@ -729,7 +739,7 @@ fn bundled_artifact(variable: &str, name: &str, architecture: &str) -> Result<Pa
     Ok(path)
 }
 
-fn file_identity(path: &Path) -> Result<FileIdentity> {
+pub(super) fn file_identity(path: &Path) -> Result<FileIdentity> {
     let mut file = File::open(path)
         .with_context(|| format!("cannot open managed VM artifact {}", path.display()))?;
     ensure!(
@@ -763,7 +773,7 @@ fn file_identity(path: &Path) -> Result<FileIdentity> {
     })
 }
 
-fn ensure_remote_identity(remote: &FileIdentity, local: &FileIdentity) -> Result<()> {
+pub(super) fn ensure_remote_identity(remote: &FileIdentity, local: &FileIdentity) -> Result<()> {
     ensure!(
         remote.digest == local.digest && remote.size == local.size,
         "managed VM transfer failed digest or size verification"
@@ -771,7 +781,7 @@ fn ensure_remote_identity(remote: &FileIdentity, local: &FileIdentity) -> Result
     Ok(())
 }
 
-fn ensure_success(output: &Output, operation: &str) -> Result<()> {
+pub(super) fn ensure_success(output: &Output, operation: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }

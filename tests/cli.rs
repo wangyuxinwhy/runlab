@@ -1,3 +1,5 @@
+#![cfg(not(target_os = "macos"))]
+
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Cursor;
@@ -126,7 +128,7 @@ fn managed_vm_surface_is_narrow() {
         assert_eq!(value["runlab_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["os"], "linux");
         assert_eq!(value["architecture"], std::env::consts::ARCH);
-        assert_eq!(value["capabilities"], json!(["native-engine"]));
+        assert_eq!(value["capabilities"], json!(["native-engine", "state-cli"]));
     }
 }
 

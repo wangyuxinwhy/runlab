@@ -43,6 +43,10 @@ macOS 另外提供 `vm create/start/install/stop/status`。它们只管理固定
 
 `vm install` 从 macOS 可执行文件旁读取 `runlab-linux-<arch>` 与 `runc-linux-<arch>`，传输后复验 size 和 SHA-256，再以原子 rename 安装。开发构建可用 `RUNLAB_GUEST_BINARY` 与 `RUNLAB_GUEST_RUNC` 覆盖 bundle 路径。Guest 握手必须与 Host 的 RunLab version、transport version、Linux OS 和 architecture 完全一致。reference profile 当前固定 runc 1.5.1、`ip`、`iptables`、`ip6tables`、`nsenter`、cgroup v2、OverlayFS 与 IPv4 forwarding。
 
+macOS 上所有 State 命令都在固定 Guest State `/var/lib/runlab` 执行，显式 `--state` 或 `RUNLAB_STATE` 会被拒绝。Host 只按已解析的命令类型构造 Guest 调用，没有公开或内部的任意 argv 转发入口。OCI archive、Runtime Configuration 和 stdin 先进入唯一 staging path，并在使用前复验 size 与 SHA-256。`run start` 由 transient systemd service 持有；Host 控制连接中断不会向 Run 发送取消，调用方可以用同一 `run_id` 查询已经持久化的状态。systemd 在 Run 结束后清理输入 staging。
+
+`filesystem get` 当前只跨 VM 传回普通文件。Guest 与 Host 文件 identity 一致后才以 no-clobber 方式发布到请求的 macOS 路径，返回 JSON 中只出现该路径，不泄露 Guest staging path。
+
 `run config generate` 把完整 OCI Runtime Configuration JSON 写到 stdout，供 `jq` 等普通 JSON 工具继续处理。`run start` 省略 `--runtime-config` 时复用同一个生成器。生成器固定创建新的 network namespace，`isolated` 或 `egress` 仍只由 `run start --network` 选择，不写入 `config.json`。
 
 ## State 与生命周期
@@ -55,10 +59,11 @@ Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调
 
 ## 已知边界
 
-- `NativeEngine` 只在 Linux 可执行；macOS 已能显式管理本地 Linux VM 生命周期和安装 Guest appliance，但普通 State 命令尚未转发到 VM，不能直接开始 Run。
+- `NativeEngine` 只在 Linux 可执行；macOS 通过 Managed VM 使用同一个 Linux binary 与 Engine，不存在 macOS Engine 实现。
 - `NativeEngine` 支持 `Network::Isolated` 与 outbound-only `Network::Egress`。Egress 依赖宿主启用 IPv4 forwarding，并提供 `ip`、`iptables`、`ip6tables` 与 `nsenter`；Engine 不修改宿主级 forwarding 设置。
 - Image import 只接受包含单个 Image Manifest 的标准 OCI Image Layout 目录或未压缩 tar archive。
 - 支持 OCI tar、gzip 和 zstd Layer；不实现 registry pull 或 Image build。
+- Native Linux 的 `filesystem get` 支持文件、目录和 symlink；macOS Managed VM transport 当前只传回普通文件。
 - `filesystem get` 从 Run Program 的 Final Environment 或指定 Image 读取普通文件、目录或 symlink。目标路径必须尚不存在；单文件从最新 Layer 向前解析，目录只合并目标子树。
 - stdout/stderr 当前作为协议事实保存在完整 Run record 中；独立 stream 命令尚未因真实场景而引入。
 - 不实现恢复、验证、评分、golden comparison 或实验编排。

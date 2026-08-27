@@ -1,12 +1,20 @@
 #![forbid(unsafe_code)]
 
 mod cli;
+// macOS reuses these modules' validated CLI value types while their State
+// implementation runs only in the managed Linux guest.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod filesystem;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod image;
 mod managed_vm;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod run;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod runtime_config;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod state;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod storage;
 
 fn main() {

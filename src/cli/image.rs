@@ -44,3 +44,14 @@ pub(super) fn execute(state_path: &Path, command: ImageCommand) -> Result<u8> {
     }
     Ok(0)
 }
+
+#[cfg(target_os = "macos")]
+pub(super) fn execute_managed(command: ImageCommand) -> Result<u8> {
+    let vm = crate::managed_vm::ManagedVm::new();
+    let output = match command {
+        ImageCommand::Import { source, name } => vm.forward_image_import(&source, &name)?,
+        ImageCommand::List { limit, after } => vm.forward_image_list(limit, after.as_deref())?,
+        ImageCommand::Get { image } => vm.forward_image_get(&image.to_string())?,
+    };
+    super::emit_forwarded(&output)
+}

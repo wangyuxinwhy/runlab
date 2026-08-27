@@ -20,6 +20,6 @@ pub(crate) fn guest_handshake() -> GuestHandshake {
         runlab_version: env!("CARGO_PKG_VERSION").to_owned(),
         os: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
-        capabilities: vec!["native-engine".to_owned()],
+        capabilities: vec!["native-engine".to_owned(), "state-cli".to_owned()],
     }
 }

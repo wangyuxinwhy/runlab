@@ -57,3 +57,22 @@ pub(super) fn execute(state_path: &Path, command: FilesystemCommand) -> Result<u
     }
     Ok(0)
 }
+
+#[cfg(target_os = "macos")]
+pub(super) fn execute_managed(command: FilesystemCommand) -> Result<u8> {
+    let vm = crate::managed_vm::ManagedVm::new();
+    match command {
+        FilesystemCommand::Get(arguments) => {
+            let run = arguments.run.map(|value| value.to_string());
+            let image = arguments.image.map(|value| value.to_string());
+            let output = vm.forward_filesystem_get(
+                run.as_deref(),
+                image.as_deref(),
+                arguments.program.as_deref(),
+                &arguments.path,
+                &arguments.output,
+            )?;
+            super::emit_forwarded(&output)
+        }
+    }
+}

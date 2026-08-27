@@ -43,7 +43,9 @@ runlab vm status
 
 `vm status` is read-only. The other lifecycle commands are idempotent and never expose a general VM shell or command executor. `vm install` verifies and atomically installs the bundled, architecture-matched Linux `runlab` and `runc`, then checks the minimal NativeEngine reference profile. Release bundles place these files beside the macOS executable as `runlab-linux-<arch>` and `runc-linux-<arch>`; development builds can select them with `RUNLAB_GUEST_BINARY` and `RUNLAB_GUEST_RUNC`.
 
-Ordinary State commands are not forwarded to the VM yet.
+On macOS, the ordinary `image`, `run`, and `filesystem` commands execute the same-version Linux `runlab` inside the ready VM. State remains fixed at `/var/lib/runlab`; macOS rejects `--state` and `RUNLAB_STATE` rather than treating a host path as a guest path.
+
+Input files cross the VM boundary as explicit bytes and are checked by size and SHA-256 before use. `run start` is owned by a transient systemd service, so closing the macOS control connection does not cancel the Run; reconnect with `run get RUN_ID`. Successful `filesystem get` verifies the guest and host bytes before publishing a new macOS file. Managed-VM output transfer currently supports regular files, while native Linux `filesystem get` also supports directories and symlinks.
 
 Image building and registry transport belong to external OCI tools. `image import` accepts a standard OCI Image Layout directory or an uncompressed tar archive containing one Image Manifest.
 

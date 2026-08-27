@@ -108,3 +108,30 @@ pub(super) fn execute(state_path: &Path, command: RunCommand) -> Result<u8> {
     }
     Ok(0)
 }
+
+#[cfg(target_os = "macos")]
+pub(super) fn execute_managed(command: RunCommand) -> Result<u8> {
+    let vm = crate::managed_vm::ManagedVm::new();
+    let output = match command {
+        RunCommand::Config {
+            command: RunConfigCommand::Generate { image },
+        } => vm.forward_run_config(&image.to_string())?,
+        RunCommand::Start(arguments) => vm.forward_run_start(
+            &arguments.id.to_string(),
+            &arguments.image.to_string(),
+            arguments.runtime_config.as_deref(),
+            arguments.stdin.as_deref(),
+            arguments.execution_timeout_ms,
+            match arguments.network {
+                NetworkArg::Isolated => "isolated",
+                NetworkArg::Egress => "egress",
+            },
+        )?,
+        RunCommand::Get { run_id } => vm.forward_run_get(&run_id.to_string())?,
+        RunCommand::List { limit, after } => {
+            let after = after.map(|value| value.to_string());
+            vm.forward_run_list(limit, after.as_deref())?
+        }
+    };
+    super::emit_forwarded(&output)
+}

@@ -6,8 +6,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod filesystem;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod image;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod run;
 #[cfg(target_os = "macos")]
 mod vm;
@@ -20,6 +23,7 @@ mod vm;
 )]
 struct Cli {
     /// State Directory for filesystem, Image, and Run commands; defaults to `RUNLAB_STATE`, `$XDG_DATA_HOME/runlab`, or `$HOME/.local/share/runlab`.
+    #[cfg(not(target_os = "macos"))]
     #[arg(long, value_name = "DIRECTORY")]
     state: Option<PathBuf>,
 
@@ -57,25 +61,69 @@ enum Command {
 
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
+    #[cfg(not(target_os = "macos"))]
+    let state = cli.state.as_ref();
+    #[cfg(target_os = "macos")]
+    let state = None;
     match cli.command {
         #[cfg(target_os = "linux")]
         Command::ManagedVmHandshake => {
             emit(&crate::managed_vm::guest_handshake())?;
             Ok(0)
         }
-        Command::Filesystem { command } => filesystem::execute(&resolve_state(cli.state)?, command),
-        Command::Image { command } => image::execute(&resolve_state(cli.state)?, command),
-        Command::Run { command } => run::execute(&resolve_state(cli.state)?, command),
+        Command::Filesystem { command } => execute_filesystem(state, command),
+        Command::Image { command } => execute_image(state, command),
+        Command::Run { command } => execute_run(state, command),
         #[cfg(target_os = "macos")]
-        Command::Vm { command } => {
-            if cli.state.is_some() {
-                anyhow::bail!("--state does not apply to managed VM lifecycle commands");
-            }
-            vm::execute(command)
-        }
+        Command::Vm { command } => vm::execute(command),
     }
 }
 
+fn execute_filesystem(
+    state: Option<&PathBuf>,
+    command: filesystem::FilesystemCommand,
+) -> Result<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        reject_managed_state(state)?;
+        filesystem::execute_managed(command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    filesystem::execute(&resolve_state(state.cloned())?, command)
+}
+
+fn execute_image(state: Option<&PathBuf>, command: image::ImageCommand) -> Result<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        reject_managed_state(state)?;
+        image::execute_managed(command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    image::execute(&resolve_state(state.cloned())?, command)
+}
+
+fn execute_run(state: Option<&PathBuf>, command: run::RunCommand) -> Result<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        reject_managed_state(state)?;
+        run::execute_managed(command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    run::execute(&resolve_state(state.cloned())?, command)
+}
+
+#[cfg(target_os = "macos")]
+fn reject_managed_state(state: Option<&PathBuf>) -> Result<()> {
+    debug_assert!(state.is_none());
+    if env::var_os("RUNLAB_STATE").is_some() {
+        anyhow::bail!(
+            "custom State does not apply on macOS; RunLab State is managed in the Linux VM"
+        );
+    }
+    Ok(())
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn resolve_state(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
@@ -97,10 +145,22 @@ pub(super) fn emit(value: &impl Serialize) -> Result<()> {
     writeln!(stdout).context("failed to write JSON output")
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(super) fn emit_json_bytes(bytes: &[u8]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     stdout
         .write_all(bytes)
         .context("failed to write JSON output")
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn emit_forwarded(output: &crate::managed_vm::ForwardedOutput) -> Result<u8> {
+    std::io::stderr()
+        .write_all(&output.stderr)
+        .context("failed to write guest stderr")?;
+    std::io::stdout()
+        .write_all(&output.stdout)
+        .context("failed to write guest stdout")?;
+    Ok(0)
 }
