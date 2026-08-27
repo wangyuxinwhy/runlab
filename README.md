@@ -18,7 +18,7 @@ Settled design is maintained in the [RunLab Agent Wiki](http://localhost:8787/ap
 
 ## Commands
 
-RunLab intentionally starts with eight commands:
+RunLab intentionally starts with eight State commands:
 
 ```text
 runlab image import
@@ -30,6 +30,17 @@ runlab run start
 runlab run get
 runlab run list
 ```
+
+On macOS, RunLab also exposes explicit lifecycle commands for the fixed local Linux VM:
+
+```text
+runlab vm create
+runlab vm start
+runlab vm stop
+runlab vm status
+```
+
+`vm status` is read-only. The other lifecycle commands are idempotent and never expose a general VM shell or command executor. Guest installation and ordinary command forwarding are not implemented yet.
 
 Image building and registry transport belong to external OCI tools. `image import` accepts a standard OCI Image Layout directory or an uncompressed tar archive containing one Image Manifest.
 

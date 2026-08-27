@@ -9,6 +9,8 @@ use serde::Serialize;
 mod filesystem;
 mod image;
 mod run;
+#[cfg(target_os = "macos")]
+mod vm;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -17,8 +19,8 @@ mod run;
     about = "Run OCI environments and preserve immutable Run records."
 )]
 struct Cli {
-    /// State Directory; defaults to `RUNLAB_STATE`, `$XDG_DATA_HOME/runlab`, or `$HOME/.local/share/runlab`.
-    #[arg(long, global = true, value_name = "DIRECTORY")]
+    /// State Directory for filesystem, Image, and Run commands; defaults to `RUNLAB_STATE`, `$XDG_DATA_HOME/runlab`, or `$HOME/.local/share/runlab`.
+    #[arg(long, value_name = "DIRECTORY")]
     state: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -42,15 +44,27 @@ enum Command {
         #[command(subcommand)]
         command: run::RunCommand,
     },
+    /// Manage the local Linux execution VM.
+    #[cfg(target_os = "macos")]
+    Vm {
+        #[command(subcommand)]
+        command: vm::VmCommand,
+    },
 }
 
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
-    let state = resolve_state(cli.state)?;
     match cli.command {
-        Command::Filesystem { command } => filesystem::execute(&state, command),
-        Command::Image { command } => image::execute(&state, command),
-        Command::Run { command } => run::execute(&state, command),
+        Command::Filesystem { command } => filesystem::execute(&resolve_state(cli.state)?, command),
+        Command::Image { command } => image::execute(&resolve_state(cli.state)?, command),
+        Command::Run { command } => run::execute(&resolve_state(cli.state)?, command),
+        #[cfg(target_os = "macos")]
+        Command::Vm { command } => {
+            if cli.state.is_some() {
+                anyhow::bail!("--state does not apply to managed VM lifecycle commands");
+            }
+            vm::execute(command)
+        }
     }
 }
 

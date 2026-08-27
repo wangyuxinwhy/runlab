@@ -13,19 +13,20 @@ runlab ----------------> run_protocol
 
 `run_protocol` 和 `run_engine::NativeEngine` 保持原有稳定边界。根 `runlab` package 已从 legacy 实现重写，不保留 Docker、managed VM、recovery、reconcile、GC、schema、RunLab-specific runtime-config DSL、registry transport 或旧 Base/Overlay/Task 模型。
 
-`runlab` 当前由七个直接模块组成：
+`runlab` 当前由八个直接模块组成：
 
 | 模块 | 责任 |
 | --- | --- |
 | `cli` | 参数解析、命令分发、stdout JSON 与 stderr 错误边界 |
 | `filesystem` | 从 Run Final Environment 或 Image 读取文件系统路径 |
 | `image` | OCI Image Layout 导入、Catalog 查询与 Image 检查 |
+| `managed_vm` | macOS 上固定 Lima/VZ Linux VM 的显式生命周期与兼容性检查 |
 | `run` | Run identity、协议输入构造、NativeEngine 调用、结果投影与持久化 |
 | `runtime_config` | 从 OCI Image Config 与固定 Linux 执行骨架生成标准 OCI Runtime Configuration |
 | `state` | 本地 State 打开及组件装配 |
 | `storage` | exact-byte OCI content store 与 SQLite catalog/Run records |
 
-公共 CLI 只有以下八个命令：
+State CLI 只有以下八个命令：
 
 ```text
 image import
@@ -37,6 +38,8 @@ run start
 run get
 run list
 ```
+
+macOS 另外提供 `vm create/start/stop/status`。它们只管理固定名为 `runlab` 的 Lima 2.2.0/VZ 实例，要求宿主架构匹配、plain mode、零 host mounts 和 digest-pinned Ubuntu Image。`vm status` 不改变 VM；create/start/stop 均可安全重试。当前还没有 Guest 安装、握手、命令转发或文件传输。
 
 `run config generate` 把完整 OCI Runtime Configuration JSON 写到 stdout，供 `jq` 等普通 JSON 工具继续处理。`run start` 省略 `--runtime-config` 时复用同一个生成器。生成器固定创建新的 network namespace，`isolated` 或 `egress` 仍只由 `run start --network` 选择，不写入 `config.json`。
 
@@ -50,7 +53,7 @@ Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调
 
 ## 已知边界
 
-- `NativeEngine` 只在 Linux 可执行；macOS 可管理和检查 Image/Run State，但不能直接开始 Run。
+- `NativeEngine` 只在 Linux 可执行；macOS 已能显式管理本地 Linux VM 生命周期，但普通 State 命令尚未转发到 VM，不能直接开始 Run。
 - `NativeEngine` 支持 `Network::Isolated` 与 outbound-only `Network::Egress`。Egress 依赖宿主启用 IPv4 forwarding，并提供 `ip`、`iptables`、`ip6tables` 与 `nsenter`；Engine 不修改宿主级 forwarding 设置。
 - Image import 只接受包含单个 Image Manifest 的标准 OCI Image Layout 目录或未压缩 tar archive。
 - 支持 OCI tar、gzip 和 zstd Layer；不实现 registry pull 或 Image build。

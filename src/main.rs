@@ -3,6 +3,8 @@
 mod cli;
 mod filesystem;
 mod image;
+#[cfg(target_os = "macos")]
+mod managed_vm;
 mod run;
 mod runtime_config;
 mod state;

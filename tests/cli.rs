@@ -18,18 +18,16 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("image"));
     assert!(stdout.contains("run"));
     assert!(stdout.contains("filesystem"));
-    for removed in [
-        "docker",
-        "managed-service",
-        "runtime-config",
-        "schema",
-        "vm",
-    ] {
+    for removed in ["docker", "managed-service", "runtime-config", "schema"] {
         assert!(
             !stdout.contains(removed),
             "legacy command leaked: {removed}"
         );
     }
+    #[cfg(target_os = "macos")]
+    assert!(stdout.contains("vm"));
+    #[cfg(not(target_os = "macos"))]
+    assert!(!stdout.contains("vm"));
 
     let image = run(&["image", "--help"]);
     assert_success(&image);
@@ -85,6 +83,32 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("compact JSON summary"));
     assert!(stdout.contains("Use run get for the complete persisted Run record"));
     assert!(stdout.contains("Examples:"));
+
+    #[cfg(target_os = "macos")]
+    {
+        let vm_help = run(&["vm", "--help"]);
+        assert_success(&vm_help);
+        let stdout = text(&vm_help.stdout);
+        assert!(!stdout.contains("--state"));
+        for command in ["create", "start", "stop", "status"] {
+            assert!(
+                stdout.contains(&format!("\n  {command} ")),
+                "missing VM command: {command}"
+            );
+        }
+        for deferred in ["install", "delete", "exec", "shell"] {
+            assert!(
+                !stdout.contains(&format!("\n  {deferred} ")),
+                "deferred VM command leaked: {deferred}"
+            );
+        }
+
+        let state = tempfile::tempdir().expect("temporary state");
+        let invalid = run_with_state(state.path(), &["vm", "status"]);
+        assert!(!invalid.status.success());
+        assert!(invalid.stdout.is_empty());
+        assert!(text(&invalid.stderr).contains("--state does not apply"));
+    }
 }
 
 #[test]
