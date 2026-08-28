@@ -41,6 +41,12 @@ fn help_exposes_the_managed_vm_product_surface() {
     assert!(stdout.contains("stderr emits an NDJSON observation stream"));
     assert!(!stdout.contains("--secret-env-file"));
 
+    let cancel = run(&["run", "cancel", "--help"]);
+    assert_success(&cancel);
+    let stdout = text(&cancel.stdout);
+    assert!(stdout.contains("request was stored"));
+    assert!(stdout.contains("run get"));
+
     let exec = run(&["exec", "--help"]);
     assert_success(&exec);
     let stdout = text(&exec.stdout);
@@ -131,8 +137,22 @@ fn state_query_is_forwarded_to_the_fixed_guest_state() {
         serde_json::from_slice::<Value>(&schema.stdout).expect("schema JSON")["objects"][0]["name"],
         "runs"
     );
-    let log = fs::read_to_string(log_path).expect("fake limactl log");
+    let log = fs::read_to_string(&log_path).expect("fake limactl log");
     assert!(log.contains("schema get runs --compact"));
+
+    let cancelled = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log_path)
+        .args(["run", "cancel", "550e8400-e29b-41d4-a716-446655440000"])
+        .output()
+        .expect("runlab process");
+    assert_success(&cancelled);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cancelled.stdout).expect("cancel result")["cancellation_requested"],
+        true
+    );
+    let log = fs::read_to_string(log_path).expect("fake limactl log");
+    assert!(log.contains("run cancel 550e8400-e29b-41d4-a716-446655440000"));
 }
 
 #[test]
@@ -221,6 +241,51 @@ fn exec_forwards_an_unidentified_observation_stream_without_persistent_arguments
     assert!(!calls.contains("--id"));
 }
 
+#[test]
+fn foreground_signal_cancels_the_exact_managed_vm_execution() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (limactl, log) = fake_limactl(temporary.path());
+    let marker = temporary.path().join("cancelled");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .env("RUNLAB_FAKE_CANCEL", &marker)
+        .args(["exec", "--image", "agent-base"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runlab process");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let mut header = String::new();
+    stderr.read_line(&mut header).expect("observation header");
+    assert_eq!(
+        serde_json::from_str::<Value>(&header).expect("header")["kind"],
+        "run.stream"
+    );
+
+    let signal = Command::new("/bin/kill")
+        .args(["-INT", &child.id().to_string()])
+        .output()
+        .expect("send SIGINT");
+    assert_success(&signal);
+    let mut remaining = String::new();
+    stderr
+        .read_to_string(&mut remaining)
+        .expect("remaining observations");
+    let output = child.wait_with_output().expect("runlab completion");
+    assert_success(&output);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).expect("exec result")["result"]["output"]["execution"]
+            ["cancelled"],
+        true
+    );
+    let calls = fs::read_to_string(log).expect("fake limactl log");
+    assert!(
+        calls
+            .contains("/usr/bin/systemctl kill --signal=SIGINT --kill-whom=main runlab-execution-")
+    );
+}
+
 fn fake_limactl(root: &Path) -> (PathBuf, PathBuf) {
     let architecture = std::env::consts::ARCH;
     let (location, digest) = match architecture {
@@ -254,9 +319,18 @@ case "$*" in
     ;;
   *"exec --image agent-base --network isolated"*)
     printf '%s\n' '{{"kind":"run.stream","schema_version":1,"run_id":null}}' >&2
-    printf '%s\n' '{{"kind":"program.stdout","observed_at":"2026-08-28T00:00:00Z","program_id":"primary","byte_offset":0,"text":"ready\n"}}' >&2
-    printf '%s\n' '{{"schema_version":1,"result":{{"kind":"output","output":{{"execution":{{"interval":{{"kind":"entered"}},"timed_out":false,"cancelled":false,"errors":[]}},"programs":{{"primary":{{"final_environment":{{"availability":"not_requested"}}}}}}}}}}}}'
+    if test -n "$RUNLAB_FAKE_CANCEL"; then
+      while test ! -e "$RUNLAB_FAKE_CANCEL"; do sleep 0.02; done
+      printf '%s\n' '{{"schema_version":1,"result":{{"kind":"output","output":{{"execution":{{"interval":{{"kind":"entered"}},"timed_out":false,"cancelled":true,"errors":[]}},"programs":{{"primary":{{"final_environment":{{"availability":"not_requested"}}}}}}}}}}}}'
+    else
+      printf '%s\n' '{{"kind":"program.stdout","observed_at":"2026-08-28T00:00:00Z","program_id":"primary","byte_offset":0,"text":"ready\n"}}' >&2
+      printf '%s\n' '{{"schema_version":1,"result":{{"kind":"output","output":{{"execution":{{"interval":{{"kind":"entered"}},"timed_out":false,"cancelled":false,"errors":[]}},"programs":{{"primary":{{"final_environment":{{"availability":"not_requested"}}}}}}}}}}}}'
+    fi
     ;;
+  *"/usr/bin/systemctl kill --signal=SIGINT --kill-whom=main runlab-execution-"*)
+    : > "$RUNLAB_FAKE_CANCEL"
+    ;;
+  *"run cancel 550e8400-e29b-41d4-a716-446655440000"*) printf '%s\n' '{{"schema_version":1,"run_id":"550e8400-e29b-41d4-a716-446655440000","lifecycle":"accepted","cancellation_requested":true,"cancellation_requested_at":"2026-08-28T00:00:00Z","terminal_at":null}}' ;;
   *"image list --limit 7 --after alpha"*) printf '%s\n' '{{"schema_version":1,"images":[],"next_after":null}}' ;;
   *"schema get runs --compact"*) printf '%s\n' '{{"schema_version":1,"objects":[{{"name":"runs","columns":[]}}]}}' ;;
   *) printf '%s\n' "unexpected fake limactl call: $*" >&2; exit 2 ;;

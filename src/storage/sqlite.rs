@@ -19,8 +19,20 @@ pub(crate) struct StoredRun {
     pub(crate) metadata: Metadata,
     pub(crate) input: Value,
     pub(crate) input_identity: Value,
+    pub(crate) cancellation_requested_at: Option<String>,
     pub(crate) terminal_at: Option<String>,
     pub(crate) completion: Option<Value>,
+}
+
+#[derive(Debug)]
+pub(crate) enum RunCancellation {
+    Requested {
+        requested_at: String,
+    },
+    Terminal {
+        requested_at: Option<String>,
+        terminal_at: String,
+    },
 }
 
 type RunRow = (
@@ -30,6 +42,7 @@ type RunRow = (
     String,
     String,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
 );
@@ -54,6 +67,7 @@ impl Database {
                  metadata_json TEXT NOT NULL DEFAULT '{"description":null,"labels":{}}',
                  input_json TEXT NOT NULL,
                  input_identity_json TEXT NOT NULL,
+                 cancellation_requested_at TEXT,
                  terminal_at TEXT,
                  completion_json TEXT
              ) STRICT;
@@ -67,6 +81,12 @@ impl Database {
             "runs",
             "initial_image_name",
             "ALTER TABLE runs ADD COLUMN initial_image_name TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "runs",
+            "cancellation_requested_at",
+            "ALTER TABLE runs ADD COLUMN cancellation_requested_at TEXT",
         )?;
         crate::public_schema::install(&connection)?;
         Ok(Self {
@@ -192,12 +212,56 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) fn run_cancel(
+        &self,
+        run_id: &str,
+        requested_at: &str,
+    ) -> Result<Option<RunCancellation>> {
+        let connection = self.lock()?;
+        let requested_at = connection
+            .query_row(
+                "UPDATE main.runs
+                 SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?2)
+                 WHERE run_id = ?1 AND terminal_at IS NULL
+                 RETURNING cancellation_requested_at",
+                params![run_id, requested_at],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(requested_at) = requested_at {
+            return Ok(Some(RunCancellation::Requested { requested_at }));
+        }
+        connection
+            .query_row(
+                "SELECT cancellation_requested_at, terminal_at
+                 FROM main.runs WHERE run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok(RunCancellation::Terminal {
+                        requested_at: row.get(0)?,
+                        terminal_at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn run_cancellation_requested(&self, run_id: &str) -> Result<bool> {
+        Ok(self.lock()?.query_row(
+            "SELECT cancellation_requested_at IS NOT NULL
+                 FROM main.runs WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn run_get(&self, run_id: &str) -> Result<Option<StoredRun>> {
         let row = self
             .lock()?
             .query_row(
                 "SELECT run_id, accepted_at, initial_image_name, metadata_json, input_json,
-                        input_identity_json,
+                        input_identity_json, cancellation_requested_at,
                         terminal_at, completion_json
                  FROM main.runs WHERE run_id = ?1",
                 [run_id],
@@ -228,7 +292,7 @@ impl Database {
             after_position.map_or((None, None), |(at, id)| (Some(at), Some(id)));
         let mut statement = connection.prepare(
             "SELECT run_id, accepted_at, initial_image_name, metadata_json, input_json,
-                    input_identity_json,
+                    input_identity_json, cancellation_requested_at,
                     terminal_at, completion_json
              FROM main.runs
              WHERE (?1 IS NULL OR accepted_at < ?1 OR (accepted_at = ?1 AND run_id < ?2))
@@ -264,6 +328,7 @@ fn read_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
     ))
 }
 
@@ -276,9 +341,10 @@ fn decode_run(row: RunRow) -> Result<StoredRun> {
         input: serde_json::from_str(&row.4).context("stored RunInput is invalid")?,
         input_identity: serde_json::from_str(&row.5)
             .context("stored RunInput identity is invalid")?,
-        terminal_at: row.6,
+        cancellation_requested_at: row.6,
+        terminal_at: row.7,
         completion: row
-            .7
+            .8
             .map(|value| serde_json::from_str(&value).context("stored completion is invalid"))
             .transpose()?,
     })

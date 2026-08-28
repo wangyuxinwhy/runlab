@@ -7,6 +7,12 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::thread;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -29,7 +35,7 @@ use crate::image::{ImageSelector, Images};
 use crate::metadata::Metadata;
 use crate::observation::RunObservation;
 use crate::state::State;
-use crate::storage::{Database, StoredRun};
+use crate::storage::{Database, RunCancellation, StoredRun};
 
 const MAX_PAGE_SIZE: usize = 100;
 
@@ -97,7 +103,18 @@ pub(crate) struct RunStartResult {
     initial_image_name: Option<String>,
     metadata: Metadata,
     lifecycle: &'static str,
+    cancellation_requested_at: Option<String>,
     completion: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RunCancelResult {
+    schema_version: u32,
+    run_id: String,
+    lifecycle: &'static str,
+    cancellation_requested: bool,
+    cancellation_requested_at: Option<String>,
+    terminal_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,11 +188,13 @@ impl<'a> Runs<'a> {
         let cancellation = CancellationToken::new();
         let signal = SignalCancellation::install(&cancellation)?;
         let input = prepared.input;
-        let result = run_observed(
+        let (result, cancellation_monitor) = run_persistent_observed(
             &engine,
             &input,
             &cancellation,
             observation.engine_observer(),
+            self.database,
+            &run_id,
         );
         signal.close()?;
         observation.report_dropped_observation();
@@ -189,6 +208,7 @@ impl<'a> Runs<'a> {
             .run_complete(&run_id, &terminal_at, &completion)?;
         observation.stage("terminal");
         observation.finish();
+        cancellation_monitor?;
         let record = self
             .database
             .run_get(&run_id)?
@@ -294,6 +314,35 @@ impl<'a> Runs<'a> {
         Ok(record_json(&record))
     }
 
+    pub(crate) fn cancel(&self, run_id: RunId) -> Result<RunCancelResult> {
+        let run_id = run_id.to_string();
+        let cancellation = self
+            .database
+            .run_cancel(&run_id, &Utc::now().to_rfc3339())?
+            .with_context(|| format!("Run does not exist: {run_id}"))?;
+        Ok(match cancellation {
+            RunCancellation::Requested { requested_at } => RunCancelResult {
+                schema_version: 1,
+                run_id,
+                lifecycle: "accepted",
+                cancellation_requested: true,
+                cancellation_requested_at: Some(requested_at),
+                terminal_at: None,
+            },
+            RunCancellation::Terminal {
+                requested_at,
+                terminal_at,
+            } => RunCancelResult {
+                schema_version: 1,
+                run_id,
+                lifecycle: "terminal",
+                cancellation_requested: requested_at.is_some(),
+                cancellation_requested_at: requested_at,
+                terminal_at: Some(terminal_at),
+            },
+        })
+    }
+
     pub(crate) fn list(&self, limit: usize, after: Option<RunId>) -> Result<RunListResult> {
         if !(1..=MAX_PAGE_SIZE).contains(&limit) {
             bail!("--limit must be between 1 and {MAX_PAGE_SIZE}");
@@ -313,6 +362,50 @@ impl<'a> Runs<'a> {
             next_after,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_persistent_observed(
+    engine: &run_engine::NativeEngine,
+    input: &RunInput,
+    cancellation: &CancellationToken,
+    observer: Arc<dyn run_engine::EngineObserver>,
+    database: &Database,
+    run_id: &str,
+) -> (Result<RunOutput, EngineError>, Result<()>) {
+    let finished = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let watcher = scope.spawn(|| -> Result<()> {
+            while !finished.load(Ordering::Acquire) {
+                if database.run_cancellation_requested(run_id)? {
+                    cancellation.cancel();
+                    return Ok(());
+                }
+                thread::park_timeout(Duration::from_millis(50));
+            }
+            Ok(())
+        });
+        let result = run_observed(engine, input, cancellation, observer);
+        finished.store(true, Ordering::Release);
+        watcher.thread().unpark();
+        let watcher = watcher
+            .join()
+            .map_err(|_| anyhow::anyhow!("Run cancellation monitor panicked"))
+            .and_then(|result| result);
+        (result, watcher)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_persistent_observed(
+    _engine: &UnavailableEngine,
+    _input: &RunInput,
+    _cancellation: &CancellationToken,
+    _observer: Arc<dyn run_engine::EngineObserver>,
+    _database: &Database,
+    _run_id: &str,
+) -> (Result<RunOutput, EngineError>, Result<()>) {
+    unreachable!("unavailable engine is never constructed")
 }
 
 fn matches_request(
@@ -499,6 +592,7 @@ fn record_json(record: &StoredRun) -> Value {
         "metadata": record.metadata,
         "accepted_at": record.accepted_at,
         "lifecycle": if record.completion.is_some() { "terminal" } else { "accepted" },
+        "cancellation_requested_at": record.cancellation_requested_at,
         "input": record.input,
         "terminal_at": record.terminal_at,
         "completion": record.completion,
@@ -517,6 +611,7 @@ fn start_result(record: &StoredRun, created: bool) -> Result<RunStartResult> {
         } else {
             "accepted"
         },
+        cancellation_requested_at: record.cancellation_requested_at.clone(),
         completion: record
             .completion
             .as_ref()
@@ -990,6 +1085,7 @@ mod tests {
                     "labels": {},
                 },
                 "lifecycle": "terminal",
+                "cancellation_requested_at": null,
                 "completion": {
                     "kind": "output",
                     "execution": {
@@ -1089,6 +1185,7 @@ mod tests {
             metadata: Metadata::default(),
             input: json!({"stdin": "input-payload"}),
             input_identity: json!({}),
+            cancellation_requested_at: None,
             terminal_at: completion
                 .as_ref()
                 .map(|_| "2026-08-27T00:00:01Z".to_owned()),

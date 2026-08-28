@@ -28,6 +28,7 @@ runlab filesystem get
 runlab exec
 runlab run config generate
 runlab run start
+runlab run cancel
 runlab run get
 runlab run list
 runlab schema list|get
@@ -58,7 +59,7 @@ runlab vm status
 
 On macOS, the ordinary `exec`, `image`, `run`, `filesystem`, `schema`, and `query` commands execute the same-version Linux `runlab` inside the ready VM. State remains fixed at `/var/lib/runlab`; macOS rejects `--state` and `RUNLAB_STATE` rather than treating a host path as a guest path.
 
-Input files cross the VM boundary as explicit bytes and are checked by size and SHA-256 before use. `run start` is owned by a transient systemd service, so closing the macOS control connection does not cancel the Run; reconnect with `run get RUN_ID`. Successful `filesystem get` verifies the guest and host bytes before publishing a new macOS file. Managed-VM output transfer currently supports regular files, while native Linux `filesystem get` also supports directories and symlinks.
+Input files cross the VM boundary as explicit bytes and are checked by size and SHA-256 before use. `run start` is owned by a transient systemd service, so an unexpected macOS control-connection loss does not cancel the Run; reconnect with `run get RUN_ID` or explicitly request cancellation with `run cancel RUN_ID`. A foreground `SIGINT` or `SIGTERM` is forwarded to the exact Guest invocation and RunLab waits for its bounded termination result. Successful `filesystem get` verifies the guest and host bytes before publishing a new macOS file. Managed-VM output transfer currently supports regular files, while native Linux `filesystem get` also supports directories and symlinks.
 
 Image building and registry transport belong to external OCI tools. `image import` accepts a standard OCI Image Layout directory or an uncompressed tar archive containing one Image Manifest.
 
@@ -128,6 +129,7 @@ $runlab --state "$state" run start \
 
 $runlab --state "$state" run list
 $runlab --state "$state" run get <run-id>
+$runlab --state "$state" run cancel <run-id>
 $runlab --state "$state" schema get runs --compact
 $runlab --state "$state" query run \
   "SELECT run_id, initial_image_name, lifecycle FROM runs ORDER BY accepted_at DESC LIMIT 10"
@@ -137,11 +139,13 @@ $runlab --state "$state" query run \
 
 The same Run identity, semantically identical input, and identical accepted caller facts make `run start` idempotent. Reusing the identity with a different input, Initial Image name, or metadata fails.
 
+`run cancel RUN_ID` idempotently persists a cancellation request for a non-terminal Run. Its success confirms that the request is stored, not that the Program has already stopped. `run get RUN_ID` exposes `cancellation_requested_at`; the final `RunOutput` remains the source of truth for `cancelled`, stop actions, and the process result. A terminal Run is returned unchanged.
+
 `--secret-env NAME` reads one variable from the caller environment. `--secret-file HOST_FILE=CONTAINER_PATH` reads one host file and exposes its exact bytes as a read-only regular file during execution. Secret values are part of the in-memory Run Protocol input, but RunLab does not serialize them from the Secret fields into the public Run record or Final Environment. A Program can still disclose a Secret by writing it to stdout, stderr, or its writable filesystem.
 
 While `run start` is active, stderr emits an NDJSON observation stream beginning with `run.stream`, followed by `run.stage`, `program.stdout`, and `program.stderr` records as those observations occur. Its stdout remains reserved for one compact final JSON result containing the Run identity, lifecycle, execution facts, process results, final environments, and errors. It does not repeat the exact input or captured stdout/stderr. Use `run get RUN_ID` when the complete persisted Run record is required.
 
-`--state` can be replaced by `RUNLAB_STATE`. Otherwise RunLab uses `$XDG_DATA_HOME/runlab` or `$HOME/.local/share/runlab`.
+For a foreground `exec`, `SIGINT` and `SIGTERM` cancel the current synchronous Engine invocation; no temporary public identity or follow-up command is created. `--state` can be replaced by `RUNLAB_STATE`. Otherwise RunLab uses `$XDG_DATA_HOME/runlab` or `$HOME/.local/share/runlab`.
 
 ## Development checks
 

@@ -41,6 +41,15 @@ pub(super) enum RunCommand {
         after_long_help = "Examples:\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --description 'SWE-bench django__django-11099 with pi' --label suite=swe-bench --label agent=pi\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --runtime-config config.json --network egress\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --secret-env API_KEY --secret-file ./auth.json=/run/secrets/auth.json"
     )]
     Start(RunStartArgs),
+    /// Request cancellation of one active persistent Run.
+    #[command(
+        long_about = "Persist an idempotent cancellation request for one Run. If the Run is active, its Coordinator delivers the request to the current Engine invocation. Success confirms the request was stored, not that execution has already stopped; use run get for the final RunOutput cancellation and stop facts. A terminal Run is returned unchanged.",
+        after_long_help = "Example:\n  runlab run cancel 550e8400-e29b-41d4-a716-446655440000"
+    )]
+    Cancel {
+        /// Canonical lowercase UUID v4 of the Run to cancel.
+        run_id: RunId,
+    },
     /// Read one complete Run record, including caller-provided metadata, by identity.
     Get {
         /// Canonical lowercase UUID v4 assigned when the Run was started.
@@ -189,6 +198,7 @@ pub(super) fn execute(state_path: &Path, command: RunCommand) -> Result<u8> {
             };
             emit(&runs.start(&state, &request)?)?;
         }
+        RunCommand::Cancel { run_id } => emit(&runs.cancel(run_id)?)?,
         RunCommand::Get { run_id } => emit(&runs.get(run_id)?)?,
         RunCommand::List { limit, after } => emit(&runs.list(limit, after)?)?,
     }
@@ -220,6 +230,7 @@ pub(super) fn execute_managed(command: RunCommand) -> Result<u8> {
                 },
             })?
         }
+        RunCommand::Cancel { run_id } => vm.forward_run_cancel(&run_id.to_string())?,
         RunCommand::Get { run_id } => vm.forward_run_get(&run_id.to_string())?,
         RunCommand::List { limit, after } => {
             let after = after.map(|value| value.to_string());

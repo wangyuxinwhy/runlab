@@ -62,7 +62,7 @@ enum Command {
         #[command(subcommand)]
         command: image::ImageCommand,
     },
-    /// Start and read persistent Runs.
+    /// Start, cancel, and read persistent Runs.
     Run {
         #[command(subcommand)]
         command: run::RunCommand,

@@ -2,9 +2,13 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
 use std::num::NonZeroU64;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -233,6 +237,10 @@ impl ManagedVm {
         self.state_command(["run", "get", id]).map(Into::into)
     }
 
+    pub(crate) fn forward_run_cancel(&self, id: &str) -> Result<ForwardedOutput> {
+        self.state_command(["run", "cancel", id]).map(Into::into)
+    }
+
     pub(crate) fn forward_run_list(
         &self,
         limit: usize,
@@ -372,13 +380,21 @@ impl ManagedVm {
         cleanup: &[&String],
     ) -> Result<ForwardedOutput> {
         self.ensure_ready()?;
+        let unit = format!("runlab-execution-{}", Uuid::new_v4());
+        let forwarding = GuestSignalForwarding::install(&self.limactl, &unit)?;
         let mut command = Command::new(&self.limactl);
         command.args(["shell", "--tty=false", INSTANCE, "--"]);
-        command.args(Self::systemd_state_arguments(arguments, cleanup));
+        command.args(Self::systemd_state_arguments(arguments, cleanup, &unit));
+        command.process_group(0);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to run {} shell", self.limactl.display()))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                forwarding.close()?;
+                return Err(error)
+                    .with_context(|| format!("failed to run {} shell", self.limactl.display()));
+            }
+        };
         let mut stderr = child
             .stderr
             .take()
@@ -398,11 +414,15 @@ impl ManagedVm {
         });
         let output = child
             .wait_with_output()
-            .context("failed to wait for managed VM command")?;
-        forward
+            .context("failed to wait for managed VM command");
+        let signal_result = forwarding.close();
+        let stream_result = forward
             .join()
             .map_err(|_| anyhow::anyhow!("managed VM stderr forwarding thread panicked"))?
-            .context("failed to forward managed VM stderr")?;
+            .context("failed to forward managed VM stderr");
+        let output = output?;
+        signal_result?;
+        stream_result?;
         ensure_success(&output, "managed VM command")?;
         Ok(ForwardedOutput {
             stdout: output.stdout,
@@ -410,7 +430,11 @@ impl ManagedVm {
         })
     }
 
-    fn systemd_state_arguments(arguments: Vec<OsString>, cleanup: &[&String]) -> Vec<OsString> {
+    fn systemd_state_arguments(
+        arguments: Vec<OsString>,
+        cleanup: &[&String],
+        unit: &str,
+    ) -> Vec<OsString> {
         let mut command = vec![
             OsString::from("/usr/bin/sudo"),
             OsString::from("/usr/bin/systemd-run"),
@@ -420,7 +444,7 @@ impl ManagedVm {
             OsString::from("--collect"),
             OsString::from("--service-type=exec"),
             OsString::from("--unit"),
-            OsString::from(format!("runlab-run-{}", Uuid::new_v4())),
+            OsString::from(unit),
         ];
         if !cleanup.is_empty() {
             command.extend([
@@ -506,6 +530,85 @@ impl ManagedVm {
             )
         })?;
         Ok(())
+    }
+}
+
+struct GuestSignalForwarding {
+    finished: Arc<AtomicBool>,
+    signal_handle: signal_hook::iterator::Handle,
+    thread: thread::JoinHandle<Result<()>>,
+}
+
+impl GuestSignalForwarding {
+    fn install(limactl: &Path, unit: &str) -> Result<Self> {
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+        ])?;
+        let signal_handle = signals.handle();
+        let finished = Arc::new(AtomicBool::new(false));
+        let thread_finished = Arc::clone(&finished);
+        let limactl = limactl.to_owned();
+        let unit = unit.to_owned();
+        let thread = thread::spawn(move || -> Result<()> {
+            let Some(signal) = signals.forever().next() else {
+                return Ok(());
+            };
+            let signal = match signal {
+                signal_hook::consts::SIGINT => "SIGINT",
+                signal_hook::consts::SIGTERM => "SIGTERM",
+                _ => unreachable!("only installed signals can be observed"),
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut last_error = None;
+            while !thread_finished.load(Ordering::Acquire) {
+                let output = Command::new(&limactl)
+                    .args([
+                        "shell",
+                        "--tty=false",
+                        INSTANCE,
+                        "--",
+                        "/usr/bin/sudo",
+                        "/usr/bin/systemctl",
+                        "kill",
+                        &format!("--signal={signal}"),
+                        "--kill-whom=main",
+                        &unit,
+                    ])
+                    .process_group(0)
+                    .output()
+                    .with_context(|| format!("failed to run {} shell", limactl.display()))?;
+                if output.status.success() {
+                    return Ok(());
+                }
+                last_error = Some(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::park_timeout(Duration::from_millis(50));
+            }
+            if thread_finished.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            bail!(
+                "failed to deliver {signal} to managed VM execution {unit}: {}",
+                last_error.unwrap_or_else(|| "managed VM control command failed".to_owned())
+            )
+        });
+        Ok(Self {
+            finished,
+            signal_handle,
+            thread,
+        })
+    }
+
+    fn close(self) -> Result<()> {
+        self.finished.store(true, Ordering::Release);
+        self.signal_handle.close();
+        self.thread.thread().unpark();
+        self.thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("managed VM signal forwarding thread panicked"))?
     }
 }
 

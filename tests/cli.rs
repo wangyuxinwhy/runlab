@@ -74,7 +74,7 @@ fn help_exposes_only_the_minimal_product_surface() {
     let run_help = run(&["run", "--help"]);
     assert_success(&run_help);
     let stdout = text(&run_help.stdout);
-    for command in ["config", "start", "get", "list"] {
+    for command in ["config", "start", "cancel", "get", "list"] {
         assert!(stdout.contains(command), "missing run command: {command}");
     }
     for removed in ["stdout", "stderr", "verify", "reconcile", "diff"] {
@@ -107,6 +107,63 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("are not execution facts"));
     assert!(stdout.contains("Keys are not interpreted"));
     assert!(stdout.contains("Examples:"));
+}
+
+#[test]
+fn run_cancel_is_persisted_idempotently_and_preserves_terminal_runs() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    assert_success(&run_with_state(&state, &["image", "list"]));
+    let run_id = "550e8400-e29b-41d4-a716-446655440000";
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    connection
+        .execute(
+            "INSERT INTO runs(
+                run_id, accepted_at, initial_image_name, metadata_json, input_json,
+                input_identity_json
+             ) VALUES (?1, '2026-08-28T00:00:00Z', NULL,
+                       '{\"description\":null,\"labels\":{}}', '{}', '{}')",
+            [run_id],
+        )
+        .expect("insert accepted Run");
+
+    let first = run_with_state(&state, &["run", "cancel", run_id]);
+    assert_success(&first);
+    let first = json_output(&first);
+    assert_eq!(first["run_id"], run_id);
+    assert_eq!(first["lifecycle"], "accepted");
+    assert_eq!(first["cancellation_requested"], true);
+    let requested_at = first["cancellation_requested_at"]
+        .as_str()
+        .expect("request time")
+        .to_owned();
+
+    let repeated = run_with_state(&state, &["run", "cancel", run_id]);
+    assert_success(&repeated);
+    assert_eq!(
+        json_output(&repeated)["cancellation_requested_at"],
+        requested_at
+    );
+    let record = run_with_state(&state, &["run", "get", run_id]);
+    assert_success(&record);
+    assert_eq!(
+        json_output(&record)["cancellation_requested_at"],
+        requested_at
+    );
+
+    connection
+        .execute(
+            "UPDATE runs SET terminal_at = '2026-08-28T00:00:01Z', completion_json = '{}'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("complete Run");
+    let terminal = run_with_state(&state, &["run", "cancel", run_id]);
+    assert_success(&terminal);
+    let terminal = json_output(&terminal);
+    assert_eq!(terminal["lifecycle"], "terminal");
+    assert_eq!(terminal["cancellation_requested_at"], requested_at);
+    assert_eq!(terminal["terminal_at"], "2026-08-28T00:00:01Z");
 }
 
 #[test]
@@ -630,6 +687,12 @@ fn existing_state_is_migrated_with_empty_metadata() {
         json_output(&runs)["runs"][0]["metadata"],
         json!({"description": null, "labels": {}})
     );
+    let cancelled = run_with_state(
+        &state,
+        &["run", "cancel", "550e8400-e29b-41d4-a716-446655440000"],
+    );
+    assert_success(&cancelled);
+    assert_eq!(json_output(&cancelled)["cancellation_requested"], true);
 }
 
 #[test]
