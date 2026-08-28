@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset};
 use run_protocol::{
-    Availability, CreateFacts, EngineError, ImageDescriptor, OperationError, OperationReport,
-    ProcessResult, ProgramOutput, StartFacts, StdinOutput, StopAction, StreamFacts,
+    Availability, CreateFacts, EngineError, OperationError, OperationReport, ProcessResult,
+    ProgramOutput, StartFacts, StdinOutput, StopAction, StreamFacts,
 };
 
 use super::linux_evidence::ProcExitMonitor;
@@ -141,7 +141,7 @@ impl ProgramRun {
 
     pub(super) fn output(
         &mut self,
-        final_environment: Availability<ImageDescriptor>,
+        final_environment: run_protocol::FinalEnvironment,
     ) -> Result<ProgramOutput, EngineError> {
         let process = self.facts.process.take().unwrap_or_else(|| {
             ProcessResult::never_started("the Program did not reach a proved start")

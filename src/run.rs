@@ -11,15 +11,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use run_engine::CancellationToken;
 #[cfg(not(target_os = "linux"))]
 use run_engine::RunEngine;
 use run_protocol::{
-    Availability, EngineError, ExecutionInterval, ImageDescriptor, Network, OperationError,
-    OperationReport, OperationStage, OperationStatus, ProcessResult, ProgramId, ProgramInput,
-    ProgramOutput, RunInput, RunOutput, RuntimeConfig, Secrets, StopActionResult, StopSignal,
-    StreamFacts,
+    Availability, EngineError, ExecutionInterval, FinalEnvironment, ImageDescriptor, Network,
+    OperationError, OperationReport, OperationStage, OperationStatus, ProcessResult, ProgramId,
+    ProgramInput, ProgramOutput, RunControls, RunInput, RunOutput, RuntimeConfig, Secrets,
+    StopActionResult, StopSignal, StreamFacts,
 };
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
@@ -65,8 +65,12 @@ impl Serialize for RunId {
 
 pub(crate) struct RunRequest {
     pub(crate) run_id: RunId,
-    pub(crate) image: ImageSelector,
     pub(crate) metadata: Metadata,
+    pub(crate) execution: ExecutionRequest,
+}
+
+pub(crate) struct ExecutionRequest {
+    pub(crate) image: ImageSelector,
     pub(crate) runtime_config: Option<PathBuf>,
     pub(crate) stdin: Option<PathBuf>,
     pub(crate) secrets: Secrets,
@@ -79,7 +83,7 @@ pub(crate) struct Runs<'a> {
     images: &'a Images<'a>,
 }
 
-struct PreparedRun {
+struct PreparedExecution {
     input: RunInput,
     input_json: Value,
     identity: Value,
@@ -90,9 +94,16 @@ pub(crate) struct RunStartResult {
     schema_version: u32,
     created: bool,
     run_id: String,
+    initial_image_name: Option<String>,
     metadata: Metadata,
     lifecycle: &'static str,
     completion: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ExecResult {
+    schema_version: u32,
+    result: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +116,7 @@ pub(crate) struct RunListResult {
 #[derive(Debug, Serialize)]
 struct RunSummary {
     run_id: String,
+    initial_image_name: Option<String>,
     metadata: Metadata,
     accepted_at: String,
     lifecycle: &'static str,
@@ -123,13 +135,14 @@ impl<'a> Runs<'a> {
     }
 
     pub(crate) fn start(&self, state: &State, request: &RunRequest) -> Result<RunStartResult> {
-        let prepared = self.prepare(request)?;
+        let prepared = self.prepare(&request.execution, true)?;
         let run_id = request.run_id.to_string();
         let engine = native_engine(state)?;
         let accepted_at = Utc::now().to_rfc3339();
         let created = self.database.run_insert(
             &run_id,
             &accepted_at,
+            request.execution.image.catalog_name(),
             &request.metadata,
             &prepared.input_json,
             &prepared.identity,
@@ -139,7 +152,12 @@ impl<'a> Runs<'a> {
                 .database
                 .run_get(&run_id)?
                 .context("Run disappeared during idempotency check")?;
-            if !matches_request(&existing, &prepared.identity, &request.metadata) {
+            if !matches_request(
+                &existing,
+                &prepared.identity,
+                request.execution.image.catalog_name(),
+                &request.metadata,
+            ) {
                 bail!("Run identity is already bound to a different request: {run_id}");
             }
             let observation = RunObservation::stderr(&run_id);
@@ -162,22 +180,10 @@ impl<'a> Runs<'a> {
         signal.close()?;
         observation.report_dropped_observation();
         observation.stage("publishing");
-        let completion = match result {
-            Ok(output) => json!({
-                "kind": "engine_returned",
-                "result": {
-                    "kind": "output",
-                    "output": output_json(&output),
-                }
-            }),
-            Err(error) => json!({
-                "kind": "engine_returned",
-                "result": {
-                    "kind": "engine_error",
-                    "error": engine_error_json(&error),
-                }
-            }),
-        };
+        let completion = json!({
+            "kind": "engine_returned",
+            "result": engine_result_json(result),
+        });
         let terminal_at = Utc::now().to_rfc3339();
         self.database
             .run_complete(&run_id, &terminal_at, &completion)?;
@@ -190,7 +196,33 @@ impl<'a> Runs<'a> {
         start_result(&record, true)
     }
 
-    fn prepare(&self, request: &RunRequest) -> Result<PreparedRun> {
+    pub(crate) fn exec(&self, state: &State, request: &ExecutionRequest) -> Result<ExecResult> {
+        let prepared = self.prepare(request, false)?;
+        let engine = native_engine(state)?;
+        let observation = RunObservation::exec_stderr();
+        observation.stage("preparing");
+        let cancellation = CancellationToken::new();
+        let signal = SignalCancellation::install(&cancellation)?;
+        let result = run_observed(
+            &engine,
+            &prepared.input,
+            &cancellation,
+            observation.engine_observer(),
+        );
+        signal.close()?;
+        observation.report_dropped_observation();
+        observation.finish();
+        Ok(ExecResult {
+            schema_version: 1,
+            result: engine_result_json(result),
+        })
+    }
+
+    fn prepare(
+        &self,
+        request: &ExecutionRequest,
+        capture_final_environment: bool,
+    ) -> Result<PreparedExecution> {
         let image = self.images.resolve(&request.image)?;
         let runtime_bytes = request
             .runtime_config
@@ -223,8 +255,11 @@ impl<'a> Runs<'a> {
         )?;
         let input = RunInput::new(
             BTreeMap::from([(ProgramId::primary(), program)]),
-            request.execution_timeout_ms,
-            request.network,
+            RunControls::new(
+                request.execution_timeout_ms,
+                request.network,
+                capture_final_environment,
+            ),
         )?;
         let input_json = input_json(
             &image.manifest,
@@ -233,6 +268,7 @@ impl<'a> Runs<'a> {
             &request.secrets,
             request.execution_timeout_ms,
             request.network,
+            capture_final_environment,
         )?;
         let identity = input_identity_json(
             &image.manifest,
@@ -242,7 +278,7 @@ impl<'a> Runs<'a> {
             request.execution_timeout_ms,
             request.network,
         )?;
-        Ok(PreparedRun {
+        Ok(PreparedExecution {
             input,
             input_json,
             identity,
@@ -279,8 +315,15 @@ impl<'a> Runs<'a> {
     }
 }
 
-fn matches_request(existing: &StoredRun, identity: &Value, metadata: &Metadata) -> bool {
-    existing.input_identity == *identity && existing.metadata == *metadata
+fn matches_request(
+    existing: &StoredRun,
+    identity: &Value,
+    initial_image_name: Option<&str>,
+    metadata: &Metadata,
+) -> bool {
+    existing.input_identity == *identity
+        && existing.initial_image_name.as_deref() == initial_image_name
+        && existing.metadata == *metadata
 }
 
 #[cfg(target_os = "linux")]
@@ -353,6 +396,7 @@ fn input_json(
     secrets: &Secrets,
     timeout: Option<NonZeroU64>,
     network: Network,
+    capture_final_environment: bool,
 ) -> Result<Value> {
     Ok(json!({
         "programs": {
@@ -369,8 +413,11 @@ fn input_json(
                 "secrets": redacted_secrets(secrets),
             }
         },
-        "execution_timeout_ms": timeout.map(NonZeroU64::get),
-        "network": network_name(network),
+        "controls": {
+            "execution_timeout_ms": timeout.map(NonZeroU64::get),
+            "network": network_name(network),
+            "capture_final_environment": capture_final_environment,
+        },
     }))
 }
 
@@ -448,6 +495,7 @@ fn record_json(record: &StoredRun) -> Value {
     json!({
         "schema_version": 1,
         "run_id": record.run_id,
+        "initial_image_name": record.initial_image_name,
         "metadata": record.metadata,
         "accepted_at": record.accepted_at,
         "lifecycle": if record.completion.is_some() { "terminal" } else { "accepted" },
@@ -462,6 +510,7 @@ fn start_result(record: &StoredRun, created: bool) -> Result<RunStartResult> {
         schema_version: 1,
         created,
         run_id: record.run_id.clone(),
+        initial_image_name: record.initial_image_name.clone(),
         metadata: record.metadata.clone(),
         lifecycle: if record.completion.is_some() {
             "terminal"
@@ -555,16 +604,28 @@ fn run_summary(record: StoredRun) -> RunSummary {
         .map(str::to_owned);
     RunSummary {
         run_id: record.run_id,
+        initial_image_name: record.initial_image_name,
         metadata: record.metadata,
-        accepted_at: record.accepted_at,
+        accepted_at: list_timestamp(&record.accepted_at),
         lifecycle: if record.completion.is_some() {
             "terminal"
         } else {
             "accepted"
         },
-        terminal_at: record.terminal_at,
+        terminal_at: record.terminal_at.as_deref().map(list_timestamp),
         completion,
     }
+}
+
+fn list_timestamp(value: &str) -> String {
+    DateTime::parse_from_rfc3339(value).map_or_else(
+        |_| value.to_owned(),
+        |value| {
+            value
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        },
+    )
 }
 
 fn engine_error_json(error: &EngineError) -> Value {
@@ -579,6 +640,19 @@ fn engine_error_json(error: &EngineError) -> Value {
         "path": error.path().map(ToString::to_string),
         "reason": error.reason(),
     })
+}
+
+fn engine_result_json(result: Result<RunOutput, EngineError>) -> Value {
+    match result {
+        Ok(output) => json!({
+            "kind": "output",
+            "output": output_json(&output),
+        }),
+        Err(error) => json!({
+            "kind": "engine_error",
+            "error": engine_error_json(&error),
+        }),
+    }
 }
 
 fn output_json(output: &RunOutput) -> Value {
@@ -642,10 +716,7 @@ fn program_output_json(output: &ProgramOutput) -> Value {
             "attempted_at": action.attempted_at().to_rfc3339(),
             "result": stop_result_json(action.result()),
         })).collect::<Vec<_>>(),
-        "final_environment": availability_json(
-            output.final_environment(),
-            |image| serde_json::to_value(image.as_oci()).expect("Descriptor serialization"),
-        ),
+        "final_environment": final_environment_json(output.final_environment()),
         "errors": output.errors().map(operation_error_json).collect::<Vec<_>>(),
     })
 }
@@ -709,6 +780,22 @@ fn availability_json<T>(value: &Availability<T>, available: impl FnOnce(&T) -> V
             "value": available(value),
         }),
         Availability::Unavailable(reason) => json!({
+            "availability": "unavailable",
+            "reason": reason.as_str(),
+        }),
+    }
+}
+
+fn final_environment_json(value: &FinalEnvironment) -> Value {
+    match value {
+        FinalEnvironment::NotRequested => json!({
+            "availability": "not_requested",
+        }),
+        FinalEnvironment::Captured(image) => json!({
+            "availability": "available",
+            "value": serde_json::to_value(image.as_oci()).expect("Descriptor serialization"),
+        }),
+        FinalEnvironment::Unavailable(reason) => json!({
             "availability": "unavailable",
             "reason": reason.as_str(),
         }),
@@ -833,8 +920,8 @@ mod tests {
         )
         .expect("Secrets");
 
-        let record =
-            input_json(&image, b"{}", b"", &first, None, Network::Isolated).expect("record input");
+        let record = input_json(&image, b"{}", b"", &first, None, Network::Isolated, true)
+            .expect("record input");
         let encoded = serde_json::to_string(&record).expect("record JSON");
         assert!(!encoded.contains("plain-environment-secret"));
         assert!(!encoded.contains("plain-file-secret"));
@@ -897,6 +984,7 @@ mod tests {
                 "schema_version": 1,
                 "created": true,
                 "run_id": "550e8400-e29b-41d4-a716-446655440000",
+                "initial_image_name": "agent-base",
                 "metadata": {
                     "description": null,
                     "labels": {},
@@ -968,19 +1056,36 @@ mod tests {
     #[test]
     fn idempotent_request_requires_the_same_metadata() {
         let existing = stored_run(None);
-        assert!(matches_request(&existing, &json!({}), &Metadata::default()));
+        assert!(matches_request(
+            &existing,
+            &json!({}),
+            Some("agent-base"),
+            &Metadata::default()
+        ));
         let changed = Metadata::new(
             Some("different intent".to_owned()),
             &["suite=swe-bench".parse().expect("label")],
         )
         .expect("metadata");
-        assert!(!matches_request(&existing, &json!({}), &changed));
+        assert!(!matches_request(
+            &existing,
+            &json!({}),
+            Some("agent-base"),
+            &changed
+        ));
+        assert!(!matches_request(
+            &existing,
+            &json!({}),
+            Some("renamed"),
+            &Metadata::default()
+        ));
     }
 
     fn stored_run(completion: Option<Value>) -> StoredRun {
         StoredRun {
             run_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
             accepted_at: "2026-08-27T00:00:00Z".to_owned(),
+            initial_image_name: Some("agent-base".to_owned()),
             metadata: Metadata::default(),
             input: json!({"stdin": "input-payload"}),
             input_identity: json!({}),

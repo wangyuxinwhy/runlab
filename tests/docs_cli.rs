@@ -23,11 +23,18 @@ fn docs_are_discoverable_without_state_or_managed_vm() {
         json_output(&listed),
         json!({
             "schema_version": 1,
-            "topics": [{
-                "name": TOPIC,
-                "title": "Build OCI Images for RunLab",
-                "summary": "Layer, configure, verify, import, and clean up Agent Images."
-            }]
+            "topics": [
+                {
+                    "name": TOPIC,
+                    "title": "Build OCI Images for RunLab",
+                    "summary": "Layer, configure, verify, import, and clean up Agent Images."
+                },
+                {
+                    "name": "how-to/query-runs",
+                    "title": "Query Runs",
+                    "summary": "Discover and query bounded Run selection facts with read-only SQL."
+                }
+            ]
         })
     );
 }
@@ -50,6 +57,12 @@ fn docs_get_returns_markdown_or_compact_json() {
     assert_eq!(json["topic"]["title"], "Build OCI Images for RunLab");
     assert_eq!(json["topic"]["media_type"], "text/markdown");
     assert_eq!(json["topic"]["content"], markdown);
+
+    let query = run(&["docs", "get", "how-to/query-runs"]);
+    assert_success(&query);
+    let query = text(&query.stdout);
+    assert!(query.starts_with("# Query Runs\n"));
+    assert!(query.contains("runlab schema get runs"));
 }
 
 #[test]

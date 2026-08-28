@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result as AnyResult;
 use oci_spec::image::{Descriptor, Digest, ImageIndex, ImageManifest, MediaType};
 use run_protocol::{
-    ImageDescriptor, Network, ProgramId, ProgramInput, RunInput, RuntimeConfig, SecretValue,
-    Secrets,
+    ImageDescriptor, Network, ProgramId, ProgramInput, RunControls, RunInput, RuntimeConfig,
+    SecretValue, Secrets,
 };
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -240,8 +240,7 @@ pub(super) fn e2e_input_with_network(
             ProgramId::primary(),
             e2e_program(image, name, script, b"", false),
         )]),
-        None,
-        network,
+        RunControls::new(None, network, true),
     )
     .expect("RunInput")
 }
@@ -307,8 +306,7 @@ pub(super) fn e2e_input_with_cwd(
     let program = e2e_program_with_options(image, name, script, stdin, cwd, false);
     RunInput::new(
         BTreeMap::from([(ProgramId::primary(), program)]),
-        timeout,
-        Network::Isolated,
+        RunControls::new(timeout, Network::Isolated, true),
     )
     .expect("RunInput")
 }
@@ -339,8 +337,7 @@ pub(super) fn e2e_input_with_file_bind(image: &ImageDescriptor, source: &Path) -
         ProgramInput::new(image.clone(), runtime, Vec::new(), Secrets::empty()).expect("program");
     RunInput::new(
         BTreeMap::from([(ProgramId::primary(), program)]),
-        None,
-        Network::Isolated,
+        RunControls::new(None, Network::Isolated, true),
     )
     .expect("RunInput")
 }
@@ -374,8 +371,7 @@ pub(super) fn e2e_input_with_secrets(image: &ImageDescriptor) -> RunInput {
     .expect("program");
     RunInput::new(
         BTreeMap::from([(ProgramId::primary(), program)]),
-        None,
-        Network::Isolated,
+        RunControls::new(None, Network::Isolated, true),
     )
     .expect("RunInput")
 }
@@ -398,8 +394,7 @@ pub(super) fn e2e_input_with_invalid_rlimit(
     let program = e2e_program_with_options(image, name, script, b"", "/", true);
     RunInput::new(
         BTreeMap::from([(ProgramId::primary(), program)]),
-        None,
-        Network::Isolated,
+        RunControls::new(None, Network::Isolated, true),
     )
     .expect("RunInput")
 }

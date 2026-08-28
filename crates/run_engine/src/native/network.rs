@@ -425,7 +425,7 @@ fn find_executable(name: &str) -> Result<PathBuf, EngineError> {
 }
 
 fn unsupported(reason: impl Into<String>) -> EngineError {
-    EngineError::unsupported(InputPath::field("network"), reason)
+    EngineError::unsupported(InputPath::field("controls").child("network"), reason)
 }
 
 #[cfg(test)]

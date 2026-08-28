@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use run_protocol::{
-    ExecutionInterval, Network, OperationStatus, ProcessResult, ProgramId, RunInput, StopSignal,
+    ExecutionInterval, Network, OperationStatus, ProcessResult, ProgramId, RunControls, RunInput,
+    StopSignal,
 };
 use rustix::process::geteuid;
 
@@ -290,8 +291,7 @@ fn real_runc_exercises_native_engine_contract() {
                 ),
             ),
         ]),
-        NonZeroU64::new(100),
-        Network::Isolated,
+        RunControls::new(NonZeroU64::new(100), Network::Isolated, true),
     )
     .expect("multi-Program input");
     let shared_grace_started = Instant::now();
@@ -332,8 +332,7 @@ fn real_runc_exercises_native_engine_contract() {
                 e2e_program(&initial, "blocked-primary", "exit 0", b"", true),
             ),
         ]),
-        None,
-        Network::Isolated,
+        RunControls::new(None, Network::Isolated, true),
     )
     .expect("dependency failure input");
     let dependency_create_failure = engine
@@ -374,8 +373,7 @@ fn real_runc_exercises_native_engine_contract() {
                     ),
                 ),
             ]),
-            NonZeroU64::new(100),
-            Network::Isolated,
+            RunControls::new(NonZeroU64::new(100), Network::Isolated, true),
         )
         .expect("large-output multi-Program input");
     let large_output = engine

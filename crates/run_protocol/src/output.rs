@@ -4,7 +4,9 @@ mod process;
 mod stdio;
 mod stop;
 
-pub use aggregate::{ExecutionInterval, ExecutionOutput, ProgramOutput, RunOutput};
+pub use aggregate::{
+    ExecutionInterval, ExecutionOutput, FinalEnvironment, ProgramOutput, RunOutput,
+};
 pub use operation::{
     Availability, Explanation, OperationError, OperationReport, OperationStage, OperationStatus,
 };

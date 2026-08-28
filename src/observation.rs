@@ -33,10 +33,14 @@ struct Utf8Stream {
 
 impl RunObservation {
     pub(crate) fn stderr(run_id: &str) -> Self {
-        Self::with_writer(run_id, std::io::stderr())
+        Self::with_writer(Some(run_id), std::io::stderr())
     }
 
-    fn with_writer(run_id: &str, writer: impl Write + Send + 'static) -> Self {
+    pub(crate) fn exec_stderr() -> Self {
+        Self::with_writer(None, std::io::stderr())
+    }
+
+    fn with_writer(run_id: Option<&str>, writer: impl Write + Send + 'static) -> Self {
         let (sender, receiver) = sync_channel(OBSERVATION_QUEUE_CAPACITY);
         let inner = Arc::new(ObservationInner {
             sender,

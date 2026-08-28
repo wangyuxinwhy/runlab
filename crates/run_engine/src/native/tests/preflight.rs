@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use run_protocol::{
-    Network, ProgramId, ProgramInput, RunInput, RuntimeConfig, SecretValue, Secrets,
+    Network, ProgramId, ProgramInput, RunControls, RunInput, RuntimeConfig, SecretValue, Secrets,
 };
 use serde_json::json;
 
@@ -21,7 +21,8 @@ fn capability_limits_fail_before_host_or_content_probe() {
         .map(|index| (ProgramId::new(format!("p{index}")), test_program()))
         .chain(std::iter::once((ProgramId::primary(), test_program())))
         .collect();
-    let input = RunInput::new(programs, None, Network::Isolated).expect("input");
+    let input =
+        RunInput::new(programs, RunControls::new(None, Network::Isolated, true)).expect("input");
     let error = engine
         .run(input, CancellationToken::new())
         .expect_err("Program cap");
@@ -32,10 +33,13 @@ fn capability_limits_fail_before_host_or_content_probe() {
 
     let input = RunInput::new(
         BTreeMap::from([(ProgramId::primary(), test_program())]),
-        NonZeroU64::new(
-            u64::try_from(MAX_EXECUTION_TIMEOUT.as_millis()).expect("milliseconds") + 1,
+        RunControls::new(
+            NonZeroU64::new(
+                u64::try_from(MAX_EXECUTION_TIMEOUT.as_millis()).expect("milliseconds") + 1,
+            ),
+            Network::Isolated,
+            true,
         ),
-        Network::Isolated,
     )
     .expect("input");
     let error = engine
@@ -43,7 +47,7 @@ fn capability_limits_fail_before_host_or_content_probe() {
         .expect_err("timeout cap");
     assert_eq!(
         error.path().map(ToString::to_string).as_deref(),
-        Some("execution_timeout_ms")
+        Some("controls.execution_timeout_ms")
     );
 }
 

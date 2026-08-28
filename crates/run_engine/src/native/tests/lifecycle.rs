@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use run_protocol::{Availability, OperationStage, ProgramId};
+use run_protocol::{FinalEnvironment, OperationStage, ProgramId};
 use rustix::process::geteuid;
 
 use super::super::{ExecutionContext, apply_runtime_cleanup_report, capture_final};
@@ -19,7 +19,7 @@ fn unattempted_output_is_structurally_valid_and_timeouts_are_stable() {
     let engine = test_engine();
     assert_eq!(engine.operation_timeouts(), OperationTimeouts::default());
     let mut run = ProgramRun::unattempted();
-    run.output(Availability::unavailable("not captured").expect("reason"))
+    run.output(FinalEnvironment::unavailable("not captured").expect("reason"))
         .expect("valid output");
 }
 

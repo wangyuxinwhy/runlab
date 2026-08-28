@@ -13,8 +13,10 @@ mod docs;
 mod filesystem;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod image;
+mod query;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) mod run;
+mod schema;
 #[cfg(target_os = "macos")]
 mod vm;
 
@@ -22,10 +24,10 @@ mod vm;
 #[command(
     name = "runlab",
     version,
-    about = "Run OCI environments and preserve immutable Run records."
+    about = "Execute OCI environments and preserve selected executions as immutable Runs."
 )]
 struct Cli {
-    /// State Directory for filesystem, Image, and Run commands; defaults to `RUNLAB_STATE`, `$XDG_DATA_HOME/runlab`, or `$HOME/.local/share/runlab`.
+    /// State Directory for filesystem, Image, Run, schema, and query commands; defaults to `RUNLAB_STATE`, `$XDG_DATA_HOME/runlab`, or `$HOME/.local/share/runlab`.
     #[cfg(not(target_os = "macos"))]
     #[arg(long, value_name = "DIRECTORY")]
     state: Option<PathBuf>,
@@ -44,6 +46,12 @@ enum Command {
         #[command(subcommand)]
         command: docs::DocsCommand,
     },
+    /// Execute once without creating a persistent Run or Final Image.
+    #[command(
+        long_about = "Execute one Run Protocol invocation for immediate observation without creating a persistent Run. The command uses the same Image resolution, Runtime Configuration, stdin, Secret, timeout, and network behavior as run start, but it has no run_id, accepted record, metadata, query/get surface, recovery, or Final Image. stderr emits the NDJSON observation stream with run_id:null. Success writes the complete bounded RunOutput or EngineError JSON to stdout because there is no later run get. Program and external side effects are real; this is not a dry run.",
+        after_long_help = "Use exec to inspect an environment or command before a persistent Run matters. Do not present a later run start as a first attempt when earlier exec calls used the same evaluation task.\n\nExamples:\n  runlab exec --image base\n  runlab exec --image pi --stdin prompt.txt --network egress --secret-env DEEPSEEK_API_KEY\n  runlab exec --image base --runtime-config config.json >execution.json"
+    )]
+    Exec(run::ExecArgs),
     /// Read paths from OCI Image filesystem views.
     Filesystem {
         #[command(subcommand)]
@@ -58,6 +66,16 @@ enum Command {
     Run {
         #[command(subcommand)]
         command: run::RunCommand,
+    },
+    /// Inspect the stable public SQL schema.
+    Schema {
+        #[command(subcommand)]
+        command: schema::SchemaCommand,
+    },
+    /// Query Runs through bounded read-only SQL.
+    Query {
+        #[command(subcommand)]
+        command: query::QueryCommand,
     },
     /// Manage the local Linux execution VM.
     #[cfg(target_os = "macos")]
@@ -96,12 +114,45 @@ pub(crate) fn run() -> Result<u8> {
             Ok(0)
         }
         Command::Docs { command } => docs::execute(command),
+        Command::Exec(arguments) => execute_exec(state, arguments),
         Command::Filesystem { command } => execute_filesystem(state, command),
         Command::Image { command } => execute_image(state, command),
         Command::Run { command } => execute_run(state, command),
+        Command::Schema { command } => execute_schema(state, command),
+        Command::Query { command } => execute_query(state, command),
         #[cfg(target_os = "macos")]
         Command::Vm { command } => vm::execute(command),
     }
+}
+
+fn execute_exec(state: Option<&PathBuf>, arguments: run::ExecArgs) -> Result<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        reject_managed_state(state)?;
+        run::execute_exec_managed(arguments)
+    }
+    #[cfg(not(target_os = "macos"))]
+    run::execute_exec(&resolve_state(state.cloned())?, arguments)
+}
+
+fn execute_schema(state: Option<&PathBuf>, command: schema::SchemaCommand) -> Result<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        reject_managed_state(state)?;
+        schema::execute_managed(command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    schema::execute(&resolve_state(state.cloned())?, command)
+}
+
+fn execute_query(state: Option<&PathBuf>, command: query::QueryCommand) -> Result<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        reject_managed_state(state)?;
+        query::execute_managed(command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    query::execute(&resolve_state(state.cloned())?, command)
 }
 
 fn execute_filesystem(

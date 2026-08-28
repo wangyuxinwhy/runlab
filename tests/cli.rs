@@ -20,7 +20,10 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(top_stdout.contains("image"));
     assert!(top_stdout.contains("run"));
     assert!(top_stdout.contains("filesystem"));
-    for removed in ["docker", "managed-service", "runtime-config", "schema"] {
+    for command in ["exec", "schema", "query"] {
+        assert!(top_stdout.contains(command), "missing command: {command}");
+    }
+    for removed in ["docker", "managed-service", "runtime-config"] {
         assert!(
             !top_stdout.contains(removed),
             "legacy command leaked: {removed}"
@@ -104,6 +107,64 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("are not execution facts"));
     assert!(stdout.contains("Keys are not interpreted"));
     assert!(stdout.contains("Examples:"));
+}
+
+#[test]
+fn exec_help_exposes_execution_without_persistent_run_arguments() {
+    let exec_help = run(&["exec", "--help"]);
+    assert_success(&exec_help);
+    let stdout = text(&exec_help.stdout);
+    for argument in [
+        "--image",
+        "--runtime-config",
+        "--stdin",
+        "--secret-env",
+        "--secret-file",
+        "--execution-timeout-ms",
+        "--network",
+    ] {
+        assert!(
+            stdout.contains(argument),
+            "missing exec argument: {argument}"
+        );
+    }
+    for persistent in ["--id", "--description", "--label"] {
+        assert!(
+            !stdout.contains(persistent),
+            "persistent Run argument leaked into exec: {persistent}"
+        );
+    }
+    assert!(stdout.contains("run_id:null"));
+    assert!(stdout.contains("not a dry run"));
+    assert!(stdout.contains("complete bounded RunOutput or EngineError JSON"));
+}
+
+#[test]
+fn schema_and_query_help_expose_the_bounded_public_surface() {
+    let schema = run(&["schema", "--help"]);
+    assert_success(&schema);
+    let stdout = text(&schema.stdout);
+    assert!(stdout.contains("list"));
+    assert!(stdout.contains("get"));
+
+    let query = run(&["query", "run", "--help"]);
+    assert_success(&query);
+    let stdout = text(&query.stdout);
+    for argument in [
+        "--file",
+        "--stdin",
+        "--limit",
+        "--max-cell-bytes",
+        "--max-output-bytes",
+        "--timeout-seconds",
+    ] {
+        assert!(
+            stdout.contains(argument),
+            "missing query argument: {argument}"
+        );
+    }
+    assert!(stdout.contains("Only the public Relations"));
+    assert!(stdout.contains("schema list/get"));
 }
 
 #[test]
@@ -309,6 +370,59 @@ fn assert_run_metadata(state: &Path, run_id: &str) {
         json_output(&run_list)["runs"][0]["metadata"]["labels"]["task"],
         "example"
     );
+    let list = json_output(&run_list);
+    assert_eq!(list["runs"][0]["initial_image_name"], "swebench/example:v1");
+    assert_eq!(list["runs"][0]["accepted_at"], "2026-08-27T00:00:00Z");
+}
+
+#[test]
+fn schema_and_query_expose_only_bounded_public_run_facts() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout(temporary.path());
+    let (manifest, _) = import_described_image(&state, &layout);
+    insert_terminal_run(&state, "550e8400-e29b-41d4-a716-446655440000", &manifest);
+
+    let listed = run_with_state(&state, &["schema", "list"]);
+    assert_success(&listed);
+    assert_eq!(json_output(&listed)["objects"][0]["name"], "runs");
+    assert_eq!(json_output(&listed)["objects"][0]["columns"], json!([]));
+
+    let schema = run_with_state(&state, &["schema", "get", "runs", "--compact"]);
+    assert_success(&schema);
+    assert!(
+        json_output(&schema)["objects"][0]["columns"]
+            .as_array()
+            .is_some_and(|columns| columns.iter().any(|column| column["name"] == "labels"))
+    );
+
+    let query = run_with_state(
+        &state,
+        &[
+            "query",
+            "run",
+            "SELECT run_id, initial_image_name, json_extract(labels, '$.task') AS task, primary_exit_code FROM runs",
+        ],
+    );
+    assert_success(&query);
+    let query = json_output(&query);
+    assert_eq!(query["complete"], true);
+    assert_eq!(query["returned"], 1);
+    assert_eq!(
+        query["rows"][0]["initial_image_name"],
+        "swebench/example:v1"
+    );
+    assert_eq!(query["rows"][0]["task"], "example");
+
+    for sql in [
+        "SELECT * FROM main.runs",
+        "SELECT * FROM sqlite_schema",
+        "DELETE FROM runs",
+    ] {
+        let rejected = run_with_state(&state, &["query", "run", sql]);
+        assert!(!rejected.status.success(), "SQL was allowed: {sql}");
+        assert!(rejected.stdout.is_empty());
+    }
 }
 
 #[cfg(unix)]
@@ -419,20 +533,24 @@ fn insert_terminal_run(state: &Path, run_id: &str, manifest: &Value) {
     connection
         .execute(
             "INSERT INTO runs(
-                run_id, accepted_at, metadata_json, input_json, input_identity_json,
-                terminal_at, completion_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                run_id, accepted_at, initial_image_name, metadata_json, input_json,
+                input_identity_json, terminal_at, completion_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 run_id,
-                "2026-08-27T00:00:00Z",
+                "2026-08-27T00:00:00.123456789Z",
+                "swebench/example:v1",
                 serde_json::to_string(&json!({
                     "description": "SWE-bench replay",
                     "labels": {"suite": "swe-bench", "task": "example"},
                 }))
                 .expect("metadata JSON"),
+                serde_json::to_string(&json!({
+                    "programs": {"primary": {"initial_environment": manifest}}
+                }))
+                .expect("input JSON"),
                 "{}",
-                "{}",
-                "2026-08-27T00:00:01Z",
+                "2026-08-27T00:00:01.123456789Z",
                 serde_json::to_string(&completion).expect("completion JSON"),
             ],
         )

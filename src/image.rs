@@ -48,6 +48,15 @@ impl fmt::Display for ImageSelector {
     }
 }
 
+impl ImageSelector {
+    pub(crate) fn catalog_name(&self) -> Option<&str> {
+        match self {
+            Self::Name(name) => Some(name),
+            Self::Digest(_) => None,
+        }
+    }
+}
+
 pub(crate) struct Images<'a> {
     store: Arc<LocalOciStore>,
     database: &'a Database,

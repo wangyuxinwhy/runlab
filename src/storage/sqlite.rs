@@ -15,6 +15,7 @@ pub(crate) struct Database {
 pub(crate) struct StoredRun {
     pub(crate) run_id: String,
     pub(crate) accepted_at: String,
+    pub(crate) initial_image_name: Option<String>,
     pub(crate) metadata: Metadata,
     pub(crate) input: Value,
     pub(crate) input_identity: Value,
@@ -25,6 +26,7 @@ pub(crate) struct StoredRun {
 type RunRow = (
     String,
     String,
+    Option<String>,
     String,
     String,
     String,
@@ -48,6 +50,7 @@ impl Database {
              CREATE TABLE IF NOT EXISTS runs (
                  run_id TEXT PRIMARY KEY,
                  accepted_at TEXT NOT NULL,
+                 initial_image_name TEXT,
                  metadata_json TEXT NOT NULL DEFAULT '{"description":null,"labels":{}}',
                  input_json TEXT NOT NULL,
                  input_identity_json TEXT NOT NULL,
@@ -59,6 +62,13 @@ impl Database {
         )?;
         ensure_metadata_column(&connection, "catalog")?;
         ensure_metadata_column(&connection, "runs")?;
+        ensure_column(
+            &connection,
+            "runs",
+            "initial_image_name",
+            "ALTER TABLE runs ADD COLUMN initial_image_name TEXT",
+        )?;
+        crate::public_schema::install(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -143,17 +153,20 @@ impl Database {
         &self,
         run_id: &str,
         accepted_at: &str,
+        initial_image_name: Option<&str>,
         metadata: &Metadata,
         input: &Value,
         input_identity: &Value,
     ) -> Result<bool> {
         let changed = self.lock()?.execute(
-            "INSERT OR IGNORE INTO runs(
-                run_id, accepted_at, metadata_json, input_json, input_identity_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO main.runs(
+                run_id, accepted_at, initial_image_name, metadata_json, input_json,
+                input_identity_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 run_id,
                 accepted_at,
+                initial_image_name,
                 serde_json::to_string(metadata)?,
                 serde_json::to_string(input)?,
                 serde_json::to_string(input_identity)?,
@@ -169,7 +182,7 @@ impl Database {
         completion: &Value,
     ) -> Result<()> {
         let changed = self.lock()?.execute(
-            "UPDATE runs SET terminal_at = ?2, completion_json = ?3
+            "UPDATE main.runs SET terminal_at = ?2, completion_json = ?3
              WHERE run_id = ?1 AND terminal_at IS NULL",
             params![run_id, terminal_at, serde_json::to_string(completion)?],
         )?;
@@ -183,9 +196,10 @@ impl Database {
         let row = self
             .lock()?
             .query_row(
-                "SELECT run_id, accepted_at, metadata_json, input_json, input_identity_json,
+                "SELECT run_id, accepted_at, initial_image_name, metadata_json, input_json,
+                        input_identity_json,
                         terminal_at, completion_json
-                 FROM runs WHERE run_id = ?1",
+                 FROM main.runs WHERE run_id = ?1",
                 [run_id],
                 read_run_row,
             )
@@ -199,7 +213,7 @@ impl Database {
             .map(|run_id| {
                 connection
                     .query_row(
-                        "SELECT accepted_at, run_id FROM runs WHERE run_id = ?1",
+                        "SELECT accepted_at, run_id FROM main.runs WHERE run_id = ?1",
                         [run_id],
                         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                     )
@@ -213,9 +227,10 @@ impl Database {
         let (after_at, after_id) =
             after_position.map_or((None, None), |(at, id)| (Some(at), Some(id)));
         let mut statement = connection.prepare(
-            "SELECT run_id, accepted_at, metadata_json, input_json, input_identity_json,
+            "SELECT run_id, accepted_at, initial_image_name, metadata_json, input_json,
+                    input_identity_json,
                     terminal_at, completion_json
-             FROM runs
+             FROM main.runs
              WHERE (?1 IS NULL OR accepted_at < ?1 OR (accepted_at = ?1 AND run_id < ?2))
              ORDER BY accepted_at DESC, run_id DESC LIMIT ?3",
         )?;
@@ -229,6 +244,14 @@ impl Database {
             .lock()
             .map_err(|_| anyhow::anyhow!("RunLab database lock is poisoned"))
     }
+
+    pub(crate) fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let connection = self.lock()?;
+        operation(&connection)
+    }
 }
 
 fn read_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
@@ -240,6 +263,7 @@ fn read_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
     ))
 }
 
@@ -247,32 +271,44 @@ fn decode_run(row: RunRow) -> Result<StoredRun> {
     Ok(StoredRun {
         run_id: row.0,
         accepted_at: row.1,
-        metadata: serde_json::from_str(&row.2).context("stored Run metadata is invalid")?,
-        input: serde_json::from_str(&row.3).context("stored RunInput is invalid")?,
-        input_identity: serde_json::from_str(&row.4)
+        initial_image_name: row.2,
+        metadata: serde_json::from_str(&row.3).context("stored Run metadata is invalid")?,
+        input: serde_json::from_str(&row.4).context("stored RunInput is invalid")?,
+        input_identity: serde_json::from_str(&row.5)
             .context("stored RunInput identity is invalid")?,
-        terminal_at: row.5,
+        terminal_at: row.6,
         completion: row
-            .6
+            .7
             .map(|value| serde_json::from_str(&value).context("stored completion is invalid"))
             .transpose()?,
     })
 }
 
 fn ensure_metadata_column(connection: &Connection, table: &str) -> Result<()> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "metadata_json" {
-            return Ok(());
-        }
-    }
-    connection.execute(
+    ensure_column(
+        connection,
+        table,
+        "metadata_json",
         &format!(
             "ALTER TABLE {table} ADD COLUMN metadata_json TEXT NOT NULL \
              DEFAULT '{{\"description\":null,\"labels\":{{}}}}'"
         ),
-        [],
-    )?;
+    )
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column_name: &str,
+    migration: &str,
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == column_name {
+            return Ok(());
+        }
+    }
+    connection.execute(migration, [])?;
     Ok(())
 }

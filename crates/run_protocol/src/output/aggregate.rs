@@ -3,10 +3,68 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, FixedOffset};
 
 use super::{
-    Availability, CreateFacts, Explanation, OperationError, OperationReport, OperationStage,
-    OperationStatus, ProcessResult, StartFacts, StdinOutput, StopAction, StopSignal, StreamFacts,
+    CreateFacts, Explanation, OperationError, OperationReport, OperationStage, OperationStatus,
+    ProcessResult, StartFacts, StdinOutput, StopAction, StopSignal, StreamFacts,
 };
 use crate::{ImageDescriptor, OutputError, ProgramId, RunInput};
+
+/// Result of the Run-level final-environment capture control for one Program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FinalEnvironment {
+    /// The caller disabled final-environment capture for this invocation.
+    NotRequested,
+    /// The Engine captured and published the complete final OCI Image.
+    Captured(Box<ImageDescriptor>),
+    /// Capture was requested, but the final environment could not be obtained.
+    Unavailable(Explanation),
+}
+
+impl FinalEnvironment {
+    /// Records that final-environment capture was disabled by the caller.
+    #[must_use]
+    pub const fn not_requested() -> Self {
+        Self::NotRequested
+    }
+
+    /// Records the complete captured final OCI Image.
+    #[must_use]
+    pub fn captured(image: ImageDescriptor) -> Self {
+        Self::Captured(Box::new(image))
+    }
+
+    /// Records why a requested final environment could not be obtained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutputError`] when `reason` is empty or whitespace.
+    pub fn unavailable(reason: impl Into<String>) -> Result<Self, OutputError> {
+        Ok(Self::Unavailable(Explanation::new(reason)?))
+    }
+
+    /// Returns the captured Image, if one was obtained.
+    #[must_use]
+    pub fn value(&self) -> Option<&ImageDescriptor> {
+        match self {
+            Self::Captured(image) => Some(image.as_ref()),
+            Self::NotRequested | Self::Unavailable(_) => None,
+        }
+    }
+
+    /// Returns the reason when requested capture was unavailable.
+    #[must_use]
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable(reason) => Some(reason.as_str()),
+            Self::NotRequested | Self::Captured(_) => None,
+        }
+    }
+
+    /// Returns whether the caller disabled final-environment capture.
+    #[must_use]
+    pub const fn is_not_requested(&self) -> bool {
+        matches!(self, Self::NotRequested)
+    }
+}
 
 /// Whether the invocation entered the monotonic-clock execution interval.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,7 +203,7 @@ pub struct ProgramOutput {
     stdout: OperationReport<StreamFacts>,
     stderr: OperationReport<StreamFacts>,
     stop_actions: Box<[StopAction]>,
-    final_environment: Availability<ImageDescriptor>,
+    final_environment: FinalEnvironment,
     additional_errors: Box<[OperationError]>,
 }
 
@@ -168,7 +226,7 @@ impl ProgramOutput {
         stdout: OperationReport<StreamFacts>,
         stderr: OperationReport<StreamFacts>,
         stop_actions: impl IntoIterator<Item = StopAction>,
-        final_environment: Availability<ImageDescriptor>,
+        final_environment: FinalEnvironment,
         additional_errors: impl IntoIterator<Item = OperationError>,
     ) -> Result<Self, OutputError> {
         let output = Self {
@@ -235,8 +293,8 @@ impl ProgramOutput {
     }
 
     #[must_use]
-    /// Returns the final OCI Image descriptor or its unavailability reason.
-    pub fn final_environment(&self) -> &Availability<ImageDescriptor> {
+    /// Returns the final-environment capture result.
+    pub fn final_environment(&self) -> &FinalEnvironment {
         &self.final_environment
     }
 
@@ -288,6 +346,14 @@ impl RunOutput {
             let input_program = &input.programs()[program_id];
             let path = format!("programs[{:?}]", program_id.as_str());
             validate_program(input_program, output, &path)?;
+            if input.controls().capture_final_environment()
+                == output.final_environment.is_not_requested()
+            {
+                return Err(OutputError::new(
+                    format!("{path}.final_environment"),
+                    "final environment result contradicts the RunInput capture control",
+                ));
+            }
         }
         validate_execution(input, &execution, &programs)?;
         validate_dependency_start_order(&programs)?;
@@ -530,7 +596,7 @@ fn validate_execution(
             "execution interval timestamps must be available exactly when a start was attempted",
         ));
     }
-    if execution.timed_out() && input.execution_timeout_ms().is_none() {
+    if execution.timed_out() && input.controls().execution_timeout_ms().is_none() {
         return Err(OutputError::new(
             "execution.timed_out",
             "execution cannot time out when the input has no execution deadline",

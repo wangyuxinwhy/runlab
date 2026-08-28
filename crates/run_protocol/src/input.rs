@@ -198,6 +198,48 @@ pub enum Network {
     Egress,
 }
 
+/// Controls that apply to the complete Run Engine invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunControls {
+    execution_timeout_ms: Option<NonZeroU64>,
+    network: Network,
+    capture_final_environment: bool,
+}
+
+impl RunControls {
+    /// Creates the complete set of invocation controls.
+    #[must_use]
+    pub const fn new(
+        execution_timeout_ms: Option<NonZeroU64>,
+        network: Network,
+        capture_final_environment: bool,
+    ) -> Self {
+        Self {
+            execution_timeout_ms,
+            network,
+            capture_final_environment,
+        }
+    }
+
+    /// Returns the optional monotonic execution deadline in milliseconds.
+    #[must_use]
+    pub const fn execution_timeout_ms(self) -> Option<NonZeroU64> {
+        self.execution_timeout_ms
+    }
+
+    /// Returns the network policy for the complete invocation.
+    #[must_use]
+    pub const fn network(self) -> Network {
+        self.network
+    }
+
+    /// Returns whether final environments must be captured and published.
+    #[must_use]
+    pub const fn capture_final_environment(self) -> bool {
+        self.capture_final_environment
+    }
+}
+
 /// Exact OCI Runtime Configuration bytes with validated JSON and typed views.
 #[derive(Clone)]
 pub struct RuntimeConfig {
@@ -387,8 +429,7 @@ impl ProgramInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunInput {
     programs: BTreeMap<ProgramId, ProgramInput>,
-    execution_timeout_ms: Option<NonZeroU64>,
-    network: Network,
+    controls: RunControls,
 }
 
 impl RunInput {
@@ -400,8 +441,7 @@ impl RunInput {
     /// Returns [`InputError`] when the `primary` Program is absent.
     pub fn new(
         programs: BTreeMap<ProgramId, ProgramInput>,
-        execution_timeout_ms: Option<NonZeroU64>,
-        network: Network,
+        controls: RunControls,
     ) -> Result<Self, InputError> {
         if !programs.contains_key(&ProgramId::primary()) {
             return Err(InputError::new(
@@ -409,11 +449,7 @@ impl RunInput {
                 "every RunInput must contain the primary Program",
             ));
         }
-        Ok(Self {
-            programs,
-            execution_timeout_ms,
-            network,
-        })
+        Ok(Self { programs, controls })
     }
 
     #[must_use]
@@ -424,14 +460,8 @@ impl RunInput {
 
     #[must_use]
     /// Returns the optional monotonic execution deadline in milliseconds.
-    pub fn execution_timeout_ms(&self) -> Option<NonZeroU64> {
-        self.execution_timeout_ms
-    }
-
-    #[must_use]
-    /// Returns the network policy for the complete invocation.
-    pub fn network(&self) -> Network {
-        self.network
+    pub const fn controls(&self) -> RunControls {
+        self.controls
     }
 }
 
@@ -561,9 +591,23 @@ mod tests {
 
         let mut programs = BTreeMap::new();
         programs.insert(ProgramId::new("dependency"), program(Vec::new()));
-        let error = RunInput::new(programs, NonZeroU64::new(1), Network::Isolated)
-            .expect_err("missing primary");
+        let error = RunInput::new(
+            programs,
+            RunControls::new(NonZeroU64::new(1), Network::Isolated, true),
+        )
+        .expect_err("missing primary");
         assert_eq!(error.path().to_string(), "programs[\"primary\"]");
+    }
+
+    #[test]
+    fn run_controls_keep_execution_choices_explicit() {
+        let controls = RunControls::new(NonZeroU64::new(25), Network::Egress, false);
+        assert_eq!(
+            controls.execution_timeout_ms().map(NonZeroU64::get),
+            Some(25)
+        );
+        assert_eq!(controls.network(), Network::Egress);
+        assert!(!controls.capture_final_environment());
     }
 
     #[test]

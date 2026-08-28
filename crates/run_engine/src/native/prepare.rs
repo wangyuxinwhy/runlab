@@ -67,7 +67,7 @@ impl Preparation<'_> {
     fn prepare(self) -> Result<PreparedInvocation, EngineError> {
         self.check_budget()?;
         validate_input_capabilities(self.input)?;
-        let egress = if self.input.network() == Network::Egress {
+        let egress = if self.input.controls().network() == Network::Egress {
             Some(EgressTools::preflight(
                 self.supervisor,
                 self.budget.deadline(),
@@ -259,11 +259,11 @@ fn validate_input_capabilities(input: &RunInput) -> Result<(), EngineError> {
             ),
         ));
     }
-    if let Some(timeout) = input.execution_timeout_ms() {
+    if let Some(timeout) = input.controls().execution_timeout_ms() {
         let duration = Duration::from_millis(timeout.get());
         if duration > MAX_EXECUTION_TIMEOUT {
             return Err(EngineError::unsupported(
-                InputPath::field("execution_timeout_ms"),
+                InputPath::field("controls").child("execution_timeout_ms"),
                 format!(
                     "NativeEngine supports execution timeouts of at most {} ms",
                     MAX_EXECUTION_TIMEOUT.as_millis()
@@ -272,7 +272,7 @@ fn validate_input_capabilities(input: &RunInput) -> Result<(), EngineError> {
         }
     }
     for (program_id, program) in input.programs() {
-        validate_runtime(program_id, program, input.network())?;
+        validate_runtime(program_id, program, input.controls().network())?;
         validate_secrets(program_id, program)?;
         validate_host_resources(program_id, program)?;
     }

@@ -35,7 +35,7 @@ flate2 = "1.1.9"
 oci-spec = { version = "0.10.0", default-features = false, features = ["image"] }
 run_engine = { version = "0.1.0", path = "crates/run_engine" }
 run_protocol = { version = "0.1.0", path = "crates/run_protocol" }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

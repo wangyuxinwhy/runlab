@@ -34,6 +34,16 @@ pub(crate) struct ForwardRunStart<'a> {
     pub(crate) network: &'a str,
 }
 
+pub(crate) struct ForwardExecution<'a> {
+    pub(crate) image: &'a str,
+    pub(crate) runtime_config: Option<&'a Path>,
+    pub(crate) stdin: Option<&'a Path>,
+    pub(crate) secret_env: &'a [String],
+    pub(crate) secret_files: &'a [SecretFileArg],
+    pub(crate) execution_timeout_ms: Option<NonZeroU64>,
+    pub(crate) network: &'a str,
+}
+
 impl From<Output> for ForwardedOutput {
     fn from(output: Output) -> Self {
         Self {
@@ -98,6 +108,36 @@ impl ManagedVm {
         &self,
         request: &ForwardRunStart<'_>,
     ) -> Result<ForwardedOutput> {
+        self.forward_execution(
+            vec![
+                "run".into(),
+                "start".into(),
+                "--id".into(),
+                request.id.into(),
+            ],
+            &ForwardExecution {
+                image: request.image,
+                runtime_config: request.runtime_config,
+                stdin: request.stdin,
+                secret_env: request.secret_env,
+                secret_files: request.secret_files,
+                execution_timeout_ms: request.execution_timeout_ms,
+                network: request.network,
+            },
+            Some(request.metadata),
+        )
+    }
+
+    pub(crate) fn forward_exec(&self, request: &ForwardExecution<'_>) -> Result<ForwardedOutput> {
+        self.forward_execution(vec!["exec".into()], request, None)
+    }
+
+    fn forward_execution(
+        &self,
+        mut command_arguments: Vec<OsString>,
+        request: &ForwardExecution<'_>,
+        metadata: Option<&Metadata>,
+    ) -> Result<ForwardedOutput> {
         self.ensure_ready()?;
         let mut staged = Vec::new();
         let arguments = (|| {
@@ -141,42 +181,40 @@ impl ManagedVm {
                 secret_file_sources.push((&secret.destination, remote));
             }
 
-            let mut arguments: Vec<OsString> = vec![
-                "run".into(),
-                "start".into(),
-                "--id".into(),
-                request.id.into(),
+            command_arguments.extend([
                 "--image".into(),
                 request.image.into(),
                 "--network".into(),
                 request.network.into(),
-            ];
-            append_metadata_arguments(&mut arguments, request.metadata);
+            ]);
+            if let Some(metadata) = metadata {
+                append_metadata_arguments(&mut command_arguments, metadata);
+            }
             if let Some(path) = &runtime_config {
-                arguments.extend(["--runtime-config".into(), path.into()]);
+                command_arguments.extend(["--runtime-config".into(), path.into()]);
             }
             if let Some(path) = &stdin {
-                arguments.extend(["--stdin".into(), path.into()]);
+                command_arguments.extend(["--stdin".into(), path.into()]);
             }
             for (name, source) in secret_environment {
-                arguments.extend([
+                command_arguments.extend([
                     "--secret-env-file".into(),
                     format!("{name}={source}").into(),
                 ]);
             }
             for (destination, source) in secret_file_sources {
-                arguments.extend([
+                command_arguments.extend([
                     "--secret-file".into(),
                     format!("{source}={destination}").into(),
                 ]);
             }
             if let Some(timeout) = request.execution_timeout_ms {
-                arguments.extend([
+                command_arguments.extend([
                     "--execution-timeout-ms".into(),
                     timeout.get().to_string().into(),
                 ]);
             }
-            Ok(arguments)
+            Ok(command_arguments)
         })();
         let arguments = match arguments {
             Ok(arguments) => arguments,
@@ -210,6 +248,55 @@ impl ManagedVm {
             arguments.extend(["--after".into(), after.into()]);
         }
         self.state_command(arguments).map(Into::into)
+    }
+
+    pub(crate) fn forward_schema_list(&self) -> Result<ForwardedOutput> {
+        self.state_command(["schema", "list"]).map(Into::into)
+    }
+
+    pub(crate) fn forward_schema_get(
+        &self,
+        object: &str,
+        compact: bool,
+    ) -> Result<ForwardedOutput> {
+        let mut arguments: Vec<OsString> = vec!["schema".into(), "get".into(), object.into()];
+        if compact {
+            arguments.push("--compact".into());
+        }
+        self.state_command(arguments).map(Into::into)
+    }
+
+    pub(crate) fn forward_query_run(
+        &self,
+        sql: &str,
+        limit: usize,
+        max_cell_bytes: usize,
+        max_output_bytes: usize,
+        timeout_seconds: u64,
+    ) -> Result<ForwardedOutput> {
+        let mut local = tempfile::NamedTempFile::new().context("failed to stage SQL input")?;
+        local
+            .write_all(sql.as_bytes())
+            .context("failed to stage SQL input")?;
+        local.flush().context("failed to stage SQL input")?;
+        let remote = self.stage_input(local.path(), "query")?;
+        let arguments: Vec<OsString> = vec![
+            "query".into(),
+            "run".into(),
+            "--file".into(),
+            remote.clone().into(),
+            "--limit".into(),
+            limit.to_string().into(),
+            "--max-cell-bytes".into(),
+            max_cell_bytes.to_string().into(),
+            "--max-output-bytes".into(),
+            max_output_bytes.to_string().into(),
+            "--timeout-seconds".into(),
+            timeout_seconds.to_string().into(),
+        ];
+        let output = self.state_command(arguments);
+        self.cleanup_inputs(&[&remote]);
+        output.map(Into::into)
     }
 
     pub(crate) fn forward_filesystem_get(

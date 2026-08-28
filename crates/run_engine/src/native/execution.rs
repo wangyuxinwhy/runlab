@@ -17,8 +17,8 @@ use super::wait::{finalize_children, poll_children};
 use crate::{CancellationToken, EngineObserver, EngineStage, OciContentStore, OperationTimeouts};
 use anyhow::{Result as AnyResult, bail};
 use run_protocol::{
-    Availability, EngineError, ExecutionInterval, ExecutionOutput, ImageDescriptor, OperationStage,
-    OperationStatus, ProcessResult, ProgramId, RunInput, RunOutput,
+    Availability, EngineError, ExecutionInterval, ExecutionOutput, FinalEnvironment,
+    OperationStage, OperationStatus, ProcessResult, ProgramId, RunInput, RunOutput,
 };
 
 pub(super) struct ExecutionContext {
@@ -76,11 +76,13 @@ pub(super) fn execute(
     let cleanup_budget = OperationBudget::new(context.timeouts.cleanup(), "invocation cleanup")
         .map_err(|error| EngineError::internal(format!("{error:#}")))?;
     let supervisor_deadline = cleanup_budget.deadline();
-    establish_capture_safety(prepared, &mut lifecycle.runs, supervisor_deadline)?;
+    establish_cleanup_safety(prepared, &mut lifecycle.runs, supervisor_deadline)?;
     cleanup_program_runtimes(context, prepared, &mut lifecycle.runs, supervisor_deadline);
-    finalize_supervisor_for_capture(prepared, &mut lifecycle.runs, supervisor_deadline)?;
-    context.observer.stage(EngineStage::Capturing);
-    let outputs = capture_outputs(context, prepared, &mut lifecycle.runs)?;
+    finalize_supervisor(prepared, &mut lifecycle.runs, supervisor_deadline)?;
+    if input.controls().capture_final_environment() {
+        context.observer.stage(EngineStage::Capturing);
+    }
+    let outputs = capture_outputs(context, input, prepared, &mut lifecycle.runs)?;
 
     let all_writers_stopped = lifecycle
         .runs
@@ -154,6 +156,7 @@ impl ExecutionLifecycle {
             interval_start: None,
             monotonic_start: None,
             execution_limit: input
+                .controls()
                 .execution_timeout_ms()
                 .map(|value| Duration::from_millis(value.get())),
             termination_reason: None,
@@ -263,7 +266,7 @@ fn program_order(input: &RunInput) -> Vec<ProgramId> {
         .collect()
 }
 
-fn establish_capture_safety(
+fn establish_cleanup_safety(
     prepared: &mut PreparedInvocation,
     runs: &mut BTreeMap<ProgramId, ProgramRun>,
     deadline: Instant,
@@ -302,7 +305,7 @@ fn cleanup_program_runtimes(
     }
 }
 
-fn finalize_supervisor_for_capture(
+fn finalize_supervisor(
     prepared: &mut PreparedInvocation,
     runs: &mut BTreeMap<ProgramId, ProgramRun>,
     deadline: Instant,
@@ -315,7 +318,7 @@ fn finalize_supervisor_for_capture(
             ));
         }
         return Err(EngineError::internal(format!(
-            "invocation supervisor could not prove every child reaped before capture: {error:#}"
+            "invocation supervisor could not prove every child reaped before output finalization: {error:#}"
         )));
     }
     for run in runs.values_mut() {
@@ -332,13 +335,18 @@ fn mark_writers_unstopped(runs: &mut BTreeMap<ProgramId, ProgramRun>) {
 
 fn capture_outputs(
     context: &ExecutionContext,
+    input: &RunInput,
     prepared: &mut PreparedInvocation,
     runs: &mut BTreeMap<ProgramId, ProgramRun>,
 ) -> Result<BTreeMap<ProgramId, run_protocol::ProgramOutput>, EngineError> {
     let mut outputs = BTreeMap::new();
     for (program_id, program) in &mut prepared.programs {
         let run = runs.get_mut(program_id).expect("output slot exists");
-        let final_environment = capture_final(context, program, run);
+        let final_environment = if input.controls().capture_final_environment() {
+            capture_final(context, program, run)
+        } else {
+            FinalEnvironment::not_requested()
+        };
         outputs.insert(program_id.clone(), run.output(final_environment)?);
     }
     Ok(outputs)
@@ -390,7 +398,7 @@ fn preserve_workspace_after_supervisor_failure(
     error: &anyhow::Error,
 ) -> EngineError {
     EngineError::internal(format!(
-        "invocation supervisor could not prove every child reaped before capture; preserved workspace {}: {error:#}",
+        "invocation supervisor could not prove every child reaped before output finalization; preserved workspace {}: {error:#}",
         workspace.display()
     ))
 }
@@ -407,15 +415,15 @@ fn capture_final(
     context: &ExecutionContext,
     program: &PreparedProgram,
     run: &mut ProgramRun,
-) -> Availability<ImageDescriptor> {
+) -> FinalEnvironment {
     if !run.runtime.writer_stopped {
-        return Availability::unavailable(
+        return FinalEnvironment::unavailable(
             "a process that could still write the rootfs was not proved stopped",
         )
         .expect("literal reason");
     }
     if run.runtime.rootfs_stability != RootfsStability::Stable {
-        return Availability::unavailable(
+        return FinalEnvironment::unavailable(
             "the underlying rootfs was not proved stable after mount and artifact cleanup",
         )
         .expect("literal reason");
@@ -425,14 +433,14 @@ fn capture_final(
         context.timeouts.final_environment_capture(),
         program,
     ) {
-        Ok(image) => Availability::available(image),
+        Ok(image) => FinalEnvironment::captured(image),
         Err(error) => {
             run.facts.errors.push(operation_error(
                 OperationStage::FinalEnvironmentCapture,
                 error.operation_message(),
                 None,
             ));
-            Availability::unavailable(error.unavailable_reason()).expect("non-empty reason")
+            FinalEnvironment::unavailable(error.unavailable_reason()).expect("non-empty reason")
         }
     }
 }

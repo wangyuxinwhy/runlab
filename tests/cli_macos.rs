@@ -15,10 +15,18 @@ fn help_exposes_the_managed_vm_product_surface() {
     assert_success(&top);
     let stdout = text(&top.stdout);
     assert!(!stdout.contains("--state"));
-    for command in ["filesystem", "image", "run", "vm"] {
+    for command in [
+        "exec",
+        "filesystem",
+        "image",
+        "run",
+        "schema",
+        "query",
+        "vm",
+    ] {
         assert!(stdout.contains(&format!("\n  {command} ")));
     }
-    for removed in ["docker", "managed-service", "runtime-config", "schema"] {
+    for removed in ["docker", "managed-service", "runtime-config"] {
         assert!(!stdout.contains(removed));
     }
 
@@ -32,6 +40,22 @@ fn help_exposes_the_managed_vm_product_surface() {
     assert!(stdout.contains("are not execution facts"));
     assert!(stdout.contains("stderr emits an NDJSON observation stream"));
     assert!(!stdout.contains("--secret-env-file"));
+
+    let exec = run(&["exec", "--help"]);
+    assert_success(&exec);
+    let stdout = text(&exec.stdout);
+    assert!(stdout.contains("--image"));
+    assert!(stdout.contains("run_id:null"));
+    assert!(!stdout.contains("--id"));
+    assert!(!stdout.contains("--description"));
+    assert!(!stdout.contains("--secret-env-file"));
+
+    let query = run(&["query", "run", "--help"]);
+    assert_success(&query);
+    let stdout = text(&query.stdout);
+    assert!(stdout.contains("--stdin"));
+    assert!(stdout.contains("--max-output-bytes"));
+    assert!(stdout.contains("Only the public Relations"));
 
     let vm = run(&["vm", "--help"]);
     assert_success(&vm);
@@ -77,10 +101,10 @@ fn managed_vm_does_not_expose_artifact_paths_or_custom_state() {
 #[test]
 fn state_query_is_forwarded_to_the_fixed_guest_state() {
     let temporary = tempfile::tempdir().expect("temporary directory");
-    let (limactl, log) = fake_limactl(temporary.path());
+    let (limactl, log_path) = fake_limactl(temporary.path());
     let output = Command::new(env!("CARGO_BIN_EXE_runlab"))
-        .env("RUNLAB_LIMACTL", limactl)
-        .env("RUNLAB_FAKE_LOG", &log)
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log_path)
         .args(["image", "list", "--limit", "7", "--after", "alpha"])
         .output()
         .expect("runlab process");
@@ -90,11 +114,25 @@ fn state_query_is_forwarded_to_the_fixed_guest_state() {
         text(&output.stdout),
         "{\"schema_version\":1,\"images\":[],\"next_after\":null}\n"
     );
-    let log = fs::read_to_string(log).expect("fake limactl log");
+    let log = fs::read_to_string(&log_path).expect("fake limactl log");
     assert!(log.contains(&format!(
         "/usr/bin/sudo /usr/local/libexec/runlab/{}/runlab --state /var/lib/runlab image list --limit 7 --after alpha",
         env!("CARGO_PKG_VERSION")
     )));
+
+    let schema = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log_path)
+        .args(["schema", "get", "runs", "--compact"])
+        .output()
+        .expect("runlab process");
+    assert_success(&schema);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&schema.stdout).expect("schema JSON")["objects"][0]["name"],
+        "runs"
+    );
+    let log = fs::read_to_string(log_path).expect("fake limactl log");
+    assert!(log.contains("schema get runs --compact"));
 }
 
 #[test]
@@ -151,6 +189,38 @@ fn run_start_forwards_guest_observations_before_completion() {
     );
 }
 
+#[test]
+fn exec_forwards_an_unidentified_observation_stream_without_persistent_arguments() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (limactl, log) = fake_limactl(temporary.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .args(["exec", "--image", "agent-base"])
+        .output()
+        .expect("runlab process");
+    assert_success(&output);
+
+    let events = text(&output.stderr)
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("observation event"))
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["kind"], "run.stream");
+    assert!(events[0]["run_id"].is_null());
+    assert_eq!(events[1]["kind"], "program.stdout");
+    let result = serde_json::from_slice::<Value>(&output.stdout).expect("exec result");
+    assert_eq!(result["result"]["kind"], "output");
+    assert_eq!(
+        result["result"]["output"]["programs"]["primary"]["final_environment"]["availability"],
+        "not_requested"
+    );
+
+    let calls = fs::read_to_string(log).expect("fake limactl log");
+    assert!(calls.contains("exec --image agent-base --network isolated"));
+    assert!(!calls.contains("run start"));
+    assert!(!calls.contains("--id"));
+}
+
 fn fake_limactl(root: &Path) -> (PathBuf, PathBuf) {
     let architecture = std::env::consts::ARCH;
     let (location, digest) = match architecture {
@@ -182,7 +252,13 @@ case "$*" in
     printf '%s\n' '{{"kind":"program.stdout","observed_at":"2026-08-28T00:00:00Z","program_id":"primary","byte_offset":0,"text":"ready\\n"}}' >&2
     printf '%s\n' '{{"schema_version":1,"created":true,"run_id":"550e8400-e29b-41d4-a716-446655440000","lifecycle":"terminal","completion":null}}'
     ;;
+  *"exec --image agent-base --network isolated"*)
+    printf '%s\n' '{{"kind":"run.stream","schema_version":1,"run_id":null}}' >&2
+    printf '%s\n' '{{"kind":"program.stdout","observed_at":"2026-08-28T00:00:00Z","program_id":"primary","byte_offset":0,"text":"ready\n"}}' >&2
+    printf '%s\n' '{{"schema_version":1,"result":{{"kind":"output","output":{{"execution":{{"interval":{{"kind":"entered"}},"timed_out":false,"cancelled":false,"errors":[]}},"programs":{{"primary":{{"final_environment":{{"availability":"not_requested"}}}}}}}}}}}}'
+    ;;
   *"image list --limit 7 --after alpha"*) printf '%s\n' '{{"schema_version":1,"images":[],"next_after":null}}' ;;
+  *"schema get runs --compact"*) printf '%s\n' '{{"schema_version":1,"objects":[{{"name":"runs","columns":[]}}]}}' ;;
   *) printf '%s\n' "unexpected fake limactl call: $*" >&2; exit 2 ;;
 esac
 "#,

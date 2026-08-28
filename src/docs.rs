@@ -25,14 +25,24 @@ struct Topic {
     content: &'static str,
 }
 
-const TOPICS: &[Topic] = &[Topic {
-    summary: TopicSummary {
-        name: "how-to/build-images",
-        title: "Build OCI Images for RunLab",
-        summary: "Layer, configure, verify, import, and clean up Agent Images.",
+const TOPICS: &[Topic] = &[
+    Topic {
+        summary: TopicSummary {
+            name: "how-to/build-images",
+            title: "Build OCI Images for RunLab",
+            summary: "Layer, configure, verify, import, and clean up Agent Images.",
+        },
+        content: include_str!("../docs/how-to/build-images.md"),
     },
-    content: include_str!("../docs/how-to/build-images.md"),
-}];
+    Topic {
+        summary: TopicSummary {
+            name: "how-to/query-runs",
+            title: "Query Runs",
+            summary: "Discover and query bounded Run selection facts with read-only SQL.",
+        },
+        content: include_str!("../docs/how-to/query-runs.md"),
+    },
+];
 
 #[must_use]
 pub(crate) fn list() -> Vec<TopicSummary> {
@@ -69,13 +79,20 @@ mod tests {
     #[test]
     fn lists_and_gets_bundled_topics() {
         let topics = list();
-        assert_eq!(topics.len(), 1);
+        assert_eq!(topics.len(), 2);
         assert_eq!(topics[0].name, "how-to/build-images");
+        assert_eq!(topics[1].name, "how-to/query-runs");
         assert!(
             get("how-to/build-images")
                 .expect("build Image documentation")
                 .content
                 .contains("base → agent → repository → task")
+        );
+        assert!(
+            get("how-to/query-runs")
+                .expect("Run query documentation")
+                .content
+                .contains("runlab schema get runs")
         );
 
         let error = get("missing").expect_err("reject unknown topic");

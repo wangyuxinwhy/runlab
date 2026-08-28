@@ -6,8 +6,8 @@ use oci_spec::image::Descriptor;
 use super::stdio::validate_stream_shape;
 use super::*;
 use crate::{
-    ImageDescriptor, Network, OutputError, ProgramId, ProgramInput, RunInput, RuntimeConfig,
-    Secrets,
+    ImageDescriptor, Network, OutputError, ProgramId, ProgramInput, RunControls, RunInput,
+    RuntimeConfig, Secrets,
 };
 
 fn at(second: u32) -> DateTime<FixedOffset> {
@@ -54,7 +54,11 @@ fn input(program_ids: &[&str]) -> RunInput {
             )
         })
         .collect();
-    RunInput::new(programs, NonZeroU64::new(1000), Network::Isolated).expect("RunInput")
+    RunInput::new(
+        programs,
+        RunControls::new(NonZeroU64::new(1000), Network::Isolated, true),
+    )
+    .expect("RunInput")
 }
 
 fn error(second: u32, stage: OperationStage, message: &str) -> OperationError {
@@ -89,7 +93,7 @@ fn program_with_lifecycle(
         OperationReport::succeeded(StreamFacts::new(Vec::new(), false, true).expect("stdout")),
         OperationReport::succeeded(StreamFacts::new(Vec::new(), false, true).expect("stderr")),
         [],
-        Availability::available(image('b')),
+        FinalEnvironment::captured(image('b')),
         [],
     )
 }
@@ -198,7 +202,7 @@ fn program_errors_are_aggregated_once_from_their_owning_operations() {
             at(4),
             StopActionResult::Rejected(error(4, OperationStage::Signal, "signal")),
         )],
-        Availability::unavailable("rootfs never became stable")
+        FinalEnvironment::unavailable("rootfs never became stable")
             .expect("unavailable final environment"),
         [error(5, OperationStage::Cleanup, "cleanup")],
     )
@@ -226,6 +230,42 @@ fn output_program_keys_must_exactly_match_input() {
     exact.insert(ProgramId::new("dependency"), simple_program());
     exact.insert(ProgramId::primary(), simple_program());
     RunOutput::new(&input, execution, exact).expect("matching output");
+}
+
+#[test]
+fn final_environment_result_matches_the_run_control() {
+    let program_input = ProgramInput::new(image('a'), runtime(), Vec::new(), Secrets::empty())
+        .expect("ProgramInput");
+    let input = RunInput::new(
+        BTreeMap::from([(ProgramId::primary(), program_input)]),
+        RunControls::new(None, Network::Isolated, false),
+    )
+    .expect("RunInput");
+    let execution =
+        ExecutionOutput::new(ExecutionInterval::entered(at(1), at(3)), false, false, [])
+            .expect("execution");
+    let captured = BTreeMap::from([(ProgramId::primary(), simple_program())]);
+    assert!(RunOutput::new(&input, execution.clone(), captured).is_err());
+
+    let base = simple_program();
+    let not_requested = ProgramOutput::new(
+        base.create().clone(),
+        base.start().clone(),
+        base.process().clone(),
+        base.stdin().clone(),
+        base.stdout().clone(),
+        base.stderr().clone(),
+        [],
+        FinalEnvironment::not_requested(),
+        [],
+    )
+    .expect("ProgramOutput");
+    RunOutput::new(
+        &input,
+        execution,
+        BTreeMap::from([(ProgramId::primary(), not_requested)]),
+    )
+    .expect("capture control matches output");
 }
 
 #[test]
@@ -307,7 +347,7 @@ fn program_constructor_rejects_stream_success_without_eof() {
         ),
         OperationReport::succeeded(StreamFacts::new(Vec::new(), false, true).expect("stderr")),
         [],
-        Availability::available(image('b')),
+        FinalEnvironment::captured(image('b')),
         [],
     )
     .expect_err("success requires EOF");

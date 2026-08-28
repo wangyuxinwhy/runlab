@@ -72,3 +72,17 @@ Do not let the inherited language, package layout, models, tests, or architectur
 Use verification appropriate to the implementation language and current vertical slice. Before reporting implementation complete, test the installed CLI as a separate process, verify stdout, stderr, exit status, invalid input, and interruption behavior, and run at least one deterministic end-to-end Run through `NativeEngine` on real Linux.
 
 Report implemented behavior, verification evidence, failures, and remaining risk separately. Do not turn current behavior into a test contract merely because the inherited implementation does it.
+
+## Managed VM Disk and Cleanup
+
+The managed `runlab` VM must provide at least a 32 GiB disk. Treat 32 GiB as the planning budget even when the current instance reports more, and treat the VM as a persistent Linux development and execution data plane rather than a disposable build container. Keep these classes separate:
+
+- RunLab facts under `/var/lib/runlab`, including the OCI Store, Catalog, Run Database, and published Run assets, are durable user data. Never remove or rewrite them as disk cleanup.
+- Installed runtime prerequisites are VM baseline: versioned RunLab binaries under `/usr/local/libexec/runlab`, `/usr/local/bin/runc`, required system executables, network configuration, and cgroup/OverlayFS support. Change them only through the corresponding install or VM lifecycle workflow.
+- The guest user's Rust installation is development baseline. Preserve `.rustup`, `.cargo/bin`, `.cargo/env`, and matching shell profile entries as one coherent unit. Cargo registry downloads and build output are caches; the Rust toolchains and launch wiring are not. Before depending on the baseline, verify `cargo --version`, `rustc --version`, and the pinned toolchain from this worktree.
+- `/var/lib/runlab/engine/snapshots-v3` is reconstructible RunLab execution cache, but warm-start behavior depends on it. Do not delete it during ordinary cleanup or an evaluation. Clear it only for an explicitly scoped cold-cache experiment or an approved cache reset, and report that subsequent timing evidence is cold.
+- Per-task source archives, extracted source trees, Cargo `target` directories, copied guest binaries, and staging files under `/tmp` or `/var/tmp` are temporary. Give every task a unique, explicit path and remove those exact paths after validation, including on failure.
+
+Before a build or another operation that can consume gigabytes, inspect `df -h /` and the size of the exact candidate directories. Keep at least 20% of the 32 GiB disk free; use an external Linux build container when a local VM build would cross that reserve. Cleanup order is: this task's staging and build output, obsolete build/download caches, then other explicitly identified reconstructible caches. Never use a broad cleanup target such as `$HOME`, `/var/tmp/*`, `/tmp/*`, `/var/lib/runlab`, or an unresolved variable.
+
+After material cleanup, verify the removed paths no longer exist, report the reclaimed size, run `runlab vm status`, and recheck the development baseline when the task used it. A cleanup that breaks a shell profile, Rust toolchain, installed RunLab runtime, or persisted State is a defect and must be reported rather than silently repaired or treated as expected cache loss.
