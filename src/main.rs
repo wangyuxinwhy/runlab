@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod cli;
+mod docs;
 // macOS reuses these modules' validated CLI value types while their State
 // implementation runs only in the managed Linux guest.
 #[cfg_attr(target_os = "macos", allow(dead_code))]

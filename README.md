@@ -31,6 +31,15 @@ runlab run get
 runlab run list
 ```
 
+Version-matched operational guidance is bundled with the binary and does not open State or start the Managed VM:
+
+```text
+runlab docs list
+runlab docs get how-to/build-images
+```
+
+`docs get` writes Markdown by default; `--output json` returns the same document in a compact JSON envelope. The initial Image authoring guide explains how to layer, configure, verify, import, and clean up standard OCI Images without turning RunLab into an Image Builder.
+
 On macOS, RunLab also exposes explicit lifecycle commands for the fixed local Linux VM:
 
 ```text

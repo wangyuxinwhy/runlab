@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::metadata::{Label, Metadata};
 
+mod docs;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod filesystem;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -38,6 +39,11 @@ enum Command {
     #[cfg(target_os = "linux")]
     #[command(name = "__managed-vm-handshake", hide = true)]
     ManagedVmHandshake,
+    /// Read version-matched guidance bundled with this CLI.
+    Docs {
+        #[command(subcommand)]
+        command: docs::DocsCommand,
+    },
     /// Read paths from OCI Image filesystem views.
     Filesystem {
         #[command(subcommand)]
@@ -89,6 +95,7 @@ pub(crate) fn run() -> Result<u8> {
             emit(&crate::managed_vm::guest_handshake())?;
             Ok(0)
         }
+        Command::Docs { command } => docs::execute(command),
         Command::Filesystem { command } => execute_filesystem(state, command),
         Command::Image { command } => execute_image(state, command),
         Command::Run { command } => execute_run(state, command),

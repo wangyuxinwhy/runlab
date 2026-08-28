@@ -13,11 +13,12 @@ runlab ----------------> run_protocol
 
 `run_protocol` 以 `ProgramInput.secrets` 表达精确的敏感环境变量和文件字节；`run_engine::NativeEngine` 在调用内交付它们，不拥有 Secret 来源或持久化。根 `runlab` package 已从 legacy 实现重写，不保留 Docker、managed service、recovery、reconcile、GC、schema、RunLab-specific runtime-config DSL、registry transport 或旧 Base/Overlay/Task 模型。
 
-`runlab` 当前由八个直接模块组成：
+`runlab` 当前由九个直接模块组成：
 
 | 模块 | 责任 |
 | --- | --- |
 | `cli` | 参数解析、命令分发、stdout JSON 与 stderr 错误边界 |
+| `docs` | 随当前二进制发布的 version-matched Markdown topic registry |
 | `filesystem` | 从 Run Final Environment 或 Image 读取文件系统路径 |
 | `image` | OCI Image Layout 导入、Catalog 查询与 Image 检查 |
 | `managed_vm` | macOS 上固定 Lima/VZ Linux VM 的显式生命周期与兼容性检查 |
@@ -25,6 +26,8 @@ runlab ----------------> run_protocol
 | `runtime_config` | 从 OCI Image Config 与固定 Linux 执行骨架生成标准 OCI Runtime Configuration |
 | `state` | 本地 State 打开及组件装配 |
 | `storage` | exact-byte OCI content store 与 SQLite catalog/Run records |
+
+仓库中的 `images/` 保存外部 Docker Buildx 使用的 Agent Image 构建源，不属于 Rust package 或 RunLab Image Builder。当前 `base` target 以 digest-pinned Ubuntu 24.04 为共同前缀，分层加入系统/native build 工具、Python 3.12、Node.js 24.20.0、uv 0.12.7 和固定的 `agent:1000:1000` 用户目录契约。`pi`、`claude` 与 `codex` 从同一 base 派生；`all` 继续复用完整 Pi Layer，再加入 Claude Code 与 Codex CLI。五个 target 都有从标准输入交给 bash 的真实 Run smoke 程序。
 
 State CLI 只有以下八个命令：
 
@@ -38,6 +41,8 @@ run start
 run get
 run list
 ```
+
+此外，`docs list/get` 在打开 State 或连接 Managed VM 之前本地执行。首个稳定 topic `how-to/build-images` 由普通 Markdown source、编译期 `include_str!` registry 和薄 CLI adapter 组成；`list` 返回带 `schema_version` 的紧凑 JSON，`get` 默认返回 Markdown并支持 `--output json`。当前只有一个 topic，尚无真实检索场景，因此没有引入 `docs search`。
 
 macOS 另外提供 `vm create/start/install/stop/status`。它们只管理固定名为 `runlab` 的 Lima 2.2.0/VZ 实例，要求宿主架构匹配、plain mode、零 host mounts 和 digest-pinned Ubuntu Image。`vm status` 不改变 VM；其他操作均可安全重试。
 
@@ -86,6 +91,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Rust 1.95 MSRV all-target check 已通过。独立进程 CLI 测试覆盖最小命令面、OCI Layout 导入、名称和 digest 查询、通过 Run 或 Image 读取文件系统路径、跨 Layer 目录合并、whiteout、opaque 目录、symlink、拒绝覆盖目标，以及错误请求不输出成功 JSON。
 
+`docs list/get` 已通过跨平台独立进程测试：root/help 可以发现该命令；无效的 `RUNLAB_STATE` 与 `RUNLAB_LIMACTL` 不影响本地文档读取；Markdown 与 JSON 返回相同正文；未知 topic 以非零状态、空 stdout 和 `docs list` 提示失败。registry 单元测试另外覆盖稳定名称与跨 checkout 的 CRLF 归一化。`cargo package --list` 已确认 Markdown source、registry、CLI adapter 和独立进程测试均进入 root package 文件集合。
+
 Image 与 Run metadata 已在 Managed Linux VM 中通过独立进程 CLI 测试：`image import` 写入的 description 和任意字符串 labels 会由名称形式的 `image get` 与 `image list` 返回，digest 形式查询返回 `metadata: null`；`run get/list` 返回持久 metadata；旧版 Catalog 与 Run 表会迁移并为既有记录补充空 metadata。相同 `run_id` 的 metadata 相等判断、8 KiB 上限、重复 label key、包含 `=` 的 value、macOS 参数转发和完整 CLI help 也有可执行覆盖。
 
 真实 Linux CLI 纵切已通过 `runc 1.5.1`：导入 arm64 OCI Image，执行返回 exit 7 的 Run，保存独立 stdout/stderr 与 Final Image，通过 Final Image digest 提取 `/result/value` 的精确字节，并验证同 identity 重试返回 `created: false`。单独的长运行进程收到 SIGINT 后得到 terminal、`cancelled: true` 的 RunOutput，Engine workspace 无残留。实时观察纵切中，`run.stream`、`accepted`、`preparing` 在 0.107 秒到达，`executing` 在 0.242 秒到达，Program 首批 stdout/stderr 在 0.253 秒到达，Program 两秒后的第二段 stdout 在 2.251 秒到达，最终 stdout 摘要在 2.621 秒返回，证明事件没有等 Run 完成后批量输出。
@@ -101,6 +108,38 @@ Secret 环境变量还通过一次完整 macOS Agent User Story 验证：`pi + d
 NativeEngine snapshot cache 与 upperdir-guided Final Image capture 已在同一 Managed VM 以 release binary 和 11-Layer SWE-bench Image 做 cold/warm 单次对照。snapshot chain 只发布 `upper`、`directories.bin` 和 `chain.bin`，解码后的 Layer 与 staged file 只存在于 build scratch；实际 cache 为 639 MiB，其中 Inventory 为 4.4 MiB，成功发布后没有 `build-*` 或 scratch 残留。cold `/bin/true` Run 从 accepted 到执行开始为 29.601 秒，warm Run 为 2.820 秒；对应完整命令 wall time 为 33.88 秒和 7.05 秒。进程结束到 terminal record 分别为 2.420 秒和 2.373 秒，两个 Run 均无 execution 或 Program error，Final Image digest 都是 `sha256:35f222e7175d8cc7bac5614f1fa0666d92ac7856d34d92c24859c11dc59dcd81`。另一次 warm Run 写入 5-byte `/artifacts/solution.patch`，wall time 为 7.13 秒，Final Image `sha256:9116f754d82d79aef469ba2f5cb4ed60afa0fd870591f2f1831c833c4fbf5f76` 可由 `filesystem get` 取回相同字节。调用后 invocation workspace 均为空。这些是固定环境中的各一次观测，不表示统计分布。
 
 Runtime Configuration 生成能力已在同一 Linux VM 通过真实 CLI 纵切验证：`run config generate` 的精确 stdout 字节分别被省略 `--runtime-config` 的 `isolated` 和 `egress` Run 原样保存，两个 Run 都通过 `runc` 正常退出。生成的 JSON 包含新的 network namespace，但不包含 Run Protocol 的 `network` 字段。另一路径通过 `jq` 修改生成配置的 `process.args`，再以显式 `--runtime-config` 执行并取得预期 stdout。
+
+Agent `base` Image 已由当前 `images/Dockerfile` 在 Docker Buildx 上构建成单 Manifest `linux/arm64` OCI archive，并导入 Managed VM Catalog 名称 `base`。Manifest digest 为 `sha256:7c5863478066a07c7222ef32bbfd6c4890a9dbf6ed7d84f3c9fee29543b6bfa6`，Config digest 为 `sha256:242d9bc64fafe946d7f6ce3b6ec07f83393fc1a30cd3c878804ba1861f824154`；7 个 Layer 共 312,484,616 compressed bytes、941,358,080 uncompressed bytes，其中最后一个是 32-byte canonical empty Layer。Catalog metadata、`run config generate` 得到的 uid/gid 1000、环境、`/workspace` cwd 和 `/bin/bash` args 均与构建契约一致。
+
+base smoke 的 cold Run `336a31a2-8789-438d-968d-4e7b5fdfa12d` 与 warm Run `0287532e-581d-4e70-878d-1afc4ec31394` 均在真实 NativeEngine 中 exit 0，且无 execution 或 Program error。验收覆盖全部 51 个显式 apt package、常用命令、普通用户和目录权限、空 cache/credential/workspace，并观察到 Python 3.12.3、uv 0.12.7、Node.js v24.20.0、npm 11.19.0。cold accepted 到 executing 为 34.539 秒，warm 为 3.502 秒；完整 host CLI wall time 分别为 46.50 秒和 14.02 秒。`filesystem get` 从 cold Run Final Image 取回 257-byte `/artifacts/base-smoke.json`，内容 digest 为 `sha256:22c0e1afc7504284c889c04d1658f38f5a9a095cc203fb75cd5bd159749f2e4c`。
+
+首次构建也如实暴露了上游身份事实：锁定的 Ubuntu 24.04 Image 已包含 `ubuntu:1000:1000`，直接创建 `agent` 会因 GID 冲突失败。最终 Dockerfile 原地将该用户和组重命名为 `agent` 并迁移 HOME，没有创建重复数字身份。
+
+四个 Agent Catalog 名称现在解析到以下 `linux/arm64` Image。它们的前 7 个 Layer descriptor 与 base 完全相同；`all` 的前 8 个 descriptor 又与 Pi 完全相同：
+
+| Name | Manifest digest | Config digest | Layers | Compressed bytes | Uncompressed bytes |
+| --- | --- | --- | ---: | ---: | ---: |
+| `pi` | `sha256:a7d295aa5102ece7325568beadb61804f60e8d31e77c5f826f8aa0c71166a7b0` | `sha256:892436b8c809e39031678ed61734f5f545e1db3d0f1d014918c017c93a5fd42b` | 8 | 339,468,684 | 1,063,075,328 |
+| `claude` | `sha256:850e23f0fdf05e62a70c595e90d65ec9dd89d4022cfe4ab520b4035b002d713a` | `sha256:b1c7840ae9bff5a2677a1427fcbe528a0fb8b9c7512e0a5da57d5eeea2347aac` | 8 | 409,211,967 | 1,164,697,088 |
+| `codex` | `sha256:4246fa269ec2a9acf1aec225456e89bafea06d1166c0bf62fe124cff56f7597f` | `sha256:58f5d48768dc63ad9ea7cba0d4fcda1f0be439f476e5e445dbe6b13f3b3703a8` | 9 | 435,665,897 | 1,232,515,584 |
+| `all` | `sha256:9ff162485fe0905d5e2212b707258fcf844d282a1e9b3a8d2052a11af99b52ea` | `sha256:0308428d229741fb77f0534373022e870b2cee1d9b5fdd63617e67eae91e8811` | 11 | 559,376,712 | 1,577,566,720 |
+
+Pi 0.84.3、Claude Code 2.1.250 与 Codex CLI 0.150.1 都安装在不可由 uid 1000 修改的 `/opt/agents/<agent>`。各 Image 预建对应的 uid/gid 1000、mode 0700 可写状态目录，但不包含登录态。Pi、Claude 和 Codex 默认分别执行 `pi --approve`、`claude --print --dangerously-skip-permissions` 和 `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -`；`all` 默认执行 `/bin/bash`。Layer 审计没有发现 npm 下载 cache、Node compile cache、日志或 Codex `tmp/arg0`。
+
+最终 digest 的离线 smoke 都在真实 Managed VM / NativeEngine 中 exit 0，execution 和 Program errors 均为空；每个产物又由 `filesystem get` 从 Final Environment 取回：
+
+| Image | Run ID | Artifact SHA-256 |
+| --- | --- | --- |
+| `pi` | `8c2f1467-acae-45c2-930c-cee597636684` | `bffbb13e3e740da410341ec459305f5c48bbffa95234ae94361e446a0e7cff7e` |
+| `claude` | `10f4a9d7-c449-43c2-b0e0-9f7829ff42e1` | `15d33607b61bcb6480ee241161119a6d584631ad8893e8e07a92f25502bd010d` |
+| `codex` | `ed87181a-8e40-47e3-8eda-35ec2fcfed37` | `563be2fff0d684d93dfe3384f2ccd399ba665ed10cc714475b35ad54de61ad24` |
+| `all` | `09b9e261-055f-4755-9f99-011ad7ace005` | `d267dc19acc977aac355c14af098c171aac5e2d7a9619e7f1a836d37e6e960bc` |
+
+最终 Codex Image 还通过 Run `b713b2be-1ea5-4852-b9e7-9ba83e5b3969` 完成一次真实订阅认证与 egress 调用：只读 Secret file 把宿主 `auth.json` 交付到 `/home/agent/.codex/auth.json`，Codex stdout 为 `RUNLAB_CODEX_OK\n`，process exit 0，且无 execution 或 Program error。Run Record 只保留目标与 `retained: false`；`filesystem get` 从 Final Environment 读取该 Secret path 得到 `Filesystem path does not exist`。宿主 Claude 订阅态当前只存在 macOS Keychain，没有可移植的 env 或 file credential，因此 Claude Image 当前只完成离线验收，不把本机认证复制进 Image，也不声称在线验证通过。
+
+构建与运行检查曾拒绝多个中间结果。最早两个 Pi Image 分别把 `/home/agent/.npm` 与 `/tmp/node-compile-cache` 带入 Layer；旧 Run `8e90044d-7cbf-414a-8e8f-feec7433da50`、`7153c6f5-2f87-48f1-a2c0-7c6032717146` 不作为最终证据。Run `a3b88ea8-35ca-4247-85a7-188227d53ae1` 还因 smoke 误用 `readlink -f` 而 exit 1。Codex Run `fd9a05dd-e713-4760-a8ed-378033722178` 证明只注入 `OPENAI_API_KEY` 不等价于 Codex CLI 登录；Run `90159d40-6c4a-46c4-b349-bcc831249d91` 暴露旧 Image 缺少可写 `/home/agent/.codex` 状态目录。一次 Layer 审计又发现 tmpfs 内创建的状态目录没有进入独立 Codex Image，最终实现把它拆成单独的 146-byte Layer。所有旧 Catalog digest 已被上表中的最终 Image 替换；旧 Run Record 均未删除或重写。
+
+更早的 Pi Image `sha256:405d2c8d3bcca9816efb4901349f2bfe0a70b541689965f20732ff17951217ef` 曾由 Run `cfb833d3-896d-4738-8b52-336f7ee313c8` 通过 `deepseek/deepseek-v4-flash`、Secret env 与 egress 返回 `PI_OK\n`。之后只增加了空的可写 Pi 状态目录，形成当前 Manifest；由于没有重跑同一在线调用，该旧 Run 只作为直接前身的功能证据，不冒充当前 digest 的在线证据。
 
 `filesystem get --run` 已在同一 Linux VM 对真实 SWE-bench Run 验证。命令从最终 Image 取出 571-byte `/artifacts/solution.patch`，内容 digest 为 `sha256:adfa5771ae09b6ff1d91eb2a57943d20f0a899df777528a2233821e8f73fc20a`。最终代码的 release 构建首次观测为 27 ms，随后六次为 17–20 ms；debug 构建随后六次约为 179–180 ms。此前正序读取并重复校验全部 Layer 的实现稳定约为 30.8–31.0 s。
 
