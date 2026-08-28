@@ -7,6 +7,7 @@ mod cancellation;
 mod content;
 #[cfg(target_os = "linux")]
 mod native;
+mod observer;
 #[cfg(target_os = "linux")]
 mod oci;
 #[cfg(target_os = "linux")]
@@ -17,6 +18,7 @@ pub use cancellation::CancellationToken;
 pub use content::{ContentError, ContentErrorKind, OciContent, OciContentStore};
 #[cfg(target_os = "linux")]
 pub use native::NativeEngine;
+pub use observer::{EngineObserver, EngineStage, ProgramStream};
 pub use timeouts::{
     MAX_OPERATION_TIMEOUT, OperationTimeoutError, OperationTimeouts, STOP_GRACE_PERIOD,
 };

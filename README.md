@@ -54,7 +54,11 @@ cargo build --release --locked
 runlab=./target/release/runlab
 state=./runlab-state
 
-$runlab --state "$state" image import ./image-layout --name agent-base
+$runlab --state "$state" image import ./image-layout \
+  --name agent-base \
+  --description "Python 3.12 + uv; no Agent installed" \
+  --label runtime=python \
+  --label package_manager=uv
 $runlab --state "$state" image list
 $runlab --state "$state" image get agent-base
 $runlab --state "$state" filesystem get --image agent-base /workspace/result.patch --output ./result.patch
@@ -84,7 +88,10 @@ The generated configuration always creates a new network namespace and is compat
 ```bash
 $runlab --state "$state" run start \
   --id "$(uuidgen | tr '[:upper:]' '[:lower:]')" \
-  --image agent-base
+  --image agent-base \
+  --description "SWE-bench django__django-11099 with pi" \
+  --label suite=swe-bench \
+  --label task=django__django-11099
 
 $runlab --state "$state" run start \
   --id "$(uuidgen | tr '[:upper:]' '[:lower:]')" \
@@ -98,11 +105,13 @@ $runlab --state "$state" run list
 $runlab --state "$state" run get <run-id>
 ```
 
-The same Run identity and semantically identical input make `run start` idempotent. Reusing the identity with different input fails.
+`description` and repeatable `--label KEY=VALUE` store caller-provided metadata for Agent selection. Label keys and values are arbitrary strings that RunLab does not interpret. Image metadata belongs to the mutable Catalog entry and does not change the OCI digest; Run metadata is fixed when the Run is accepted and is not passed to the Engine. The combined metadata is limited to 8 KiB.
+
+The same Run identity, semantically identical input, and identical metadata make `run start` idempotent. Reusing the identity with different input or metadata fails.
 
 `--secret-env NAME` reads one variable from the caller environment. `--secret-file HOST_FILE=CONTAINER_PATH` reads one host file and exposes its exact bytes as a read-only regular file during execution. Secret values are part of the in-memory Run Protocol input, but RunLab does not serialize them from the Secret fields into the public Run record or Final Environment. A Program can still disclose a Secret by writing it to stdout, stderr, or its writable filesystem.
 
-`run start` writes a compact JSON result containing the Run identity, lifecycle, execution facts, process results, final environments, and errors. It does not repeat the exact input or captured stdout/stderr. Use `run get RUN_ID` only when the complete persisted Run record is required.
+While `run start` is active, stderr emits an NDJSON observation stream beginning with `run.stream`, followed by `run.stage`, `program.stdout`, and `program.stderr` records as those observations occur. stdout remains reserved for one compact final JSON result containing the Run identity, lifecycle, execution facts, process results, final environments, and errors. It does not repeat the exact input or captured stdout/stderr. Use `run get RUN_ID` when the complete persisted Run record is required.
 
 `--state` can be replaced by `RUNLAB_STATE`. Otherwise RunLab uses `$XDG_DATA_HOME/runlab` or `$HOME/.local/share/runlab`.
 

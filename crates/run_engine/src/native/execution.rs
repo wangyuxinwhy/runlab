@@ -14,7 +14,7 @@ use super::stop::stop_all;
 use super::subprocess::{InvocationSupervisor, SupervisorLifecycle};
 use super::time::{POLL_INTERVAL, execution_expired, wall_clock_now};
 use super::wait::{finalize_children, poll_children};
-use crate::{CancellationToken, OciContentStore, OperationTimeouts};
+use crate::{CancellationToken, EngineObserver, EngineStage, OciContentStore, OperationTimeouts};
 use anyhow::{Result as AnyResult, bail};
 use run_protocol::{
     Availability, EngineError, ExecutionInterval, ExecutionOutput, ImageDescriptor, OperationStage,
@@ -24,11 +24,20 @@ use run_protocol::{
 pub(super) struct ExecutionContext {
     store: Arc<dyn OciContentStore>,
     timeouts: OperationTimeouts,
+    observer: Arc<dyn EngineObserver>,
 }
 
 impl ExecutionContext {
-    pub(super) const fn new(store: Arc<dyn OciContentStore>, timeouts: OperationTimeouts) -> Self {
-        Self { store, timeouts }
+    pub(super) const fn new(
+        store: Arc<dyn OciContentStore>,
+        timeouts: OperationTimeouts,
+        observer: Arc<dyn EngineObserver>,
+    ) -> Self {
+        Self {
+            store,
+            timeouts,
+            observer,
+        }
     }
 }
 
@@ -52,6 +61,9 @@ pub(super) fn execute(
         run.freeze_stdin();
     }
     let interval_end = wall_clock_now();
+    if lifecycle.requires_stop_observation() {
+        context.observer.stage(EngineStage::Stopping);
+    }
     stop_all(
         &prepared.runc,
         &prepared.runtime_root,
@@ -67,6 +79,7 @@ pub(super) fn execute(
     establish_capture_safety(prepared, &mut lifecycle.runs, supervisor_deadline)?;
     cleanup_program_runtimes(context, prepared, &mut lifecycle.runs, supervisor_deadline);
     finalize_supervisor_for_capture(prepared, &mut lifecycle.runs, supervisor_deadline)?;
+    context.observer.stage(EngineStage::Capturing);
     let outputs = capture_outputs(context, prepared, &mut lifecycle.runs)?;
 
     let all_writers_stopped = lifecycle
@@ -159,12 +172,14 @@ impl ExecutionLifecycle {
             &prepared.runc,
             &prepared.runtime_root,
             context.timeouts,
+            Arc::clone(&context.observer),
         );
         for program_id in program_order(input) {
             if self.stop_requested(cancellation) {
                 break;
             }
             let run = starter.start(
+                &program_id,
                 &prepared.programs[&program_id],
                 &input.programs()[&program_id],
                 StartControl::new(cancellation, self.monotonic_start, self.execution_limit),
@@ -227,6 +242,14 @@ impl ExecutionLifecycle {
     fn termination_reason(&self) -> TerminationReason {
         self.termination_reason
             .unwrap_or(TerminationReason::Lifecycle)
+    }
+
+    fn requires_stop_observation(&self) -> bool {
+        self.termination_reason() != TerminationReason::PrimaryEnded
+            && self
+                .runs
+                .values()
+                .any(|run| run.runtime.execution_entry.is_some())
     }
 }
 

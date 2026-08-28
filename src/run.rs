@@ -6,12 +6,15 @@ use std::fs;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
-use run_engine::{CancellationToken, RunEngine};
+use run_engine::CancellationToken;
+#[cfg(not(target_os = "linux"))]
+use run_engine::RunEngine;
 use run_protocol::{
     Availability, EngineError, ExecutionInterval, ImageDescriptor, Network, OperationError,
     OperationReport, OperationStage, OperationStatus, ProcessResult, ProgramId, ProgramInput,
@@ -23,6 +26,8 @@ use serde_json::{Value, json};
 use uuid::{Uuid, Version};
 
 use crate::image::{ImageSelector, Images};
+use crate::metadata::Metadata;
+use crate::observation::RunObservation;
 use crate::state::State;
 use crate::storage::{Database, StoredRun};
 
@@ -61,6 +66,7 @@ impl Serialize for RunId {
 pub(crate) struct RunRequest {
     pub(crate) run_id: RunId,
     pub(crate) image: ImageSelector,
+    pub(crate) metadata: Metadata,
     pub(crate) runtime_config: Option<PathBuf>,
     pub(crate) stdin: Option<PathBuf>,
     pub(crate) secrets: Secrets,
@@ -73,11 +79,18 @@ pub(crate) struct Runs<'a> {
     images: &'a Images<'a>,
 }
 
+struct PreparedRun {
+    input: RunInput,
+    input_json: Value,
+    identity: Value,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct RunStartResult {
     schema_version: u32,
     created: bool,
     run_id: String,
+    metadata: Metadata,
     lifecycle: &'static str,
     completion: Option<Value>,
 }
@@ -92,6 +105,7 @@ pub(crate) struct RunListResult {
 #[derive(Debug, Serialize)]
 struct RunSummary {
     run_id: String,
+    metadata: Metadata,
     accepted_at: String,
     lifecycle: &'static str,
     terminal_at: Option<String>,
@@ -109,6 +123,74 @@ impl<'a> Runs<'a> {
     }
 
     pub(crate) fn start(&self, state: &State, request: &RunRequest) -> Result<RunStartResult> {
+        let prepared = self.prepare(request)?;
+        let run_id = request.run_id.to_string();
+        let engine = native_engine(state)?;
+        let accepted_at = Utc::now().to_rfc3339();
+        let created = self.database.run_insert(
+            &run_id,
+            &accepted_at,
+            &request.metadata,
+            &prepared.input_json,
+            &prepared.identity,
+        )?;
+        if !created {
+            let existing = self
+                .database
+                .run_get(&run_id)?
+                .context("Run disappeared during idempotency check")?;
+            if !matches_request(&existing, &prepared.identity, &request.metadata) {
+                bail!("Run identity is already bound to a different request: {run_id}");
+            }
+            let observation = RunObservation::stderr(&run_id);
+            observation.finish();
+            return start_result(&existing, false);
+        }
+
+        let observation = RunObservation::stderr(&run_id);
+        observation.stage("accepted");
+        observation.stage("preparing");
+        let cancellation = CancellationToken::new();
+        let signal = SignalCancellation::install(&cancellation)?;
+        let input = prepared.input;
+        let result = run_observed(
+            &engine,
+            &input,
+            &cancellation,
+            observation.engine_observer(),
+        );
+        signal.close()?;
+        observation.report_dropped_observation();
+        observation.stage("publishing");
+        let completion = match result {
+            Ok(output) => json!({
+                "kind": "engine_returned",
+                "result": {
+                    "kind": "output",
+                    "output": output_json(&output),
+                }
+            }),
+            Err(error) => json!({
+                "kind": "engine_returned",
+                "result": {
+                    "kind": "engine_error",
+                    "error": engine_error_json(&error),
+                }
+            }),
+        };
+        let terminal_at = Utc::now().to_rfc3339();
+        self.database
+            .run_complete(&run_id, &terminal_at, &completion)?;
+        observation.stage("terminal");
+        observation.finish();
+        let record = self
+            .database
+            .run_get(&run_id)?
+            .context("completed Run disappeared")?;
+        start_result(&record, true)
+    }
+
+    fn prepare(&self, request: &RunRequest) -> Result<PreparedRun> {
         let image = self.images.resolve(&request.image)?;
         let runtime_bytes = request
             .runtime_config
@@ -160,52 +242,11 @@ impl<'a> Runs<'a> {
             request.execution_timeout_ms,
             request.network,
         )?;
-        let run_id = request.run_id.to_string();
-
-        let engine = native_engine(state)?;
-        let accepted_at = Utc::now().to_rfc3339();
-        let created = self
-            .database
-            .run_insert(&run_id, &accepted_at, &input_json, &identity)?;
-        if !created {
-            let existing = self
-                .database
-                .run_get(&run_id)?
-                .context("Run disappeared during idempotency check")?;
-            if existing.input_identity != identity {
-                bail!("Run identity is already bound to a different RunInput: {run_id}");
-            }
-            return start_result(&existing, false);
-        }
-
-        let cancellation = CancellationToken::new();
-        let signal = SignalCancellation::install(&cancellation)?;
-        let result = engine.run(input, cancellation);
-        signal.close()?;
-        let completion = match result {
-            Ok(output) => json!({
-                "kind": "engine_returned",
-                "result": {
-                    "kind": "output",
-                    "output": output_json(&output),
-                }
-            }),
-            Err(error) => json!({
-                "kind": "engine_returned",
-                "result": {
-                    "kind": "engine_error",
-                    "error": engine_error_json(&error),
-                }
-            }),
-        };
-        let terminal_at = Utc::now().to_rfc3339();
-        self.database
-            .run_complete(&run_id, &terminal_at, &completion)?;
-        let record = self
-            .database
-            .run_get(&run_id)?
-            .context("completed Run disappeared")?;
-        start_result(&record, true)
+        Ok(PreparedRun {
+            input,
+            input_json,
+            identity,
+        })
     }
 
     pub(crate) fn get(&self, run_id: RunId) -> Result<Value> {
@@ -236,6 +277,30 @@ impl<'a> Runs<'a> {
             next_after,
         })
     }
+}
+
+fn matches_request(existing: &StoredRun, identity: &Value, metadata: &Metadata) -> bool {
+    existing.input_identity == *identity && existing.metadata == *metadata
+}
+
+#[cfg(target_os = "linux")]
+fn run_observed(
+    engine: &run_engine::NativeEngine,
+    input: &RunInput,
+    cancellation: &CancellationToken,
+    observer: Arc<dyn run_engine::EngineObserver>,
+) -> Result<RunOutput, EngineError> {
+    engine.run_observed(input, cancellation, observer)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_observed(
+    _engine: &UnavailableEngine,
+    _input: &RunInput,
+    _cancellation: &CancellationToken,
+    _observer: Arc<dyn run_engine::EngineObserver>,
+) -> Result<RunOutput, EngineError> {
+    unreachable!("unavailable engine is never constructed")
 }
 
 #[cfg(target_os = "linux")]
@@ -383,6 +448,7 @@ fn record_json(record: &StoredRun) -> Value {
     json!({
         "schema_version": 1,
         "run_id": record.run_id,
+        "metadata": record.metadata,
         "accepted_at": record.accepted_at,
         "lifecycle": if record.completion.is_some() { "terminal" } else { "accepted" },
         "input": record.input,
@@ -396,6 +462,7 @@ fn start_result(record: &StoredRun, created: bool) -> Result<RunStartResult> {
         schema_version: 1,
         created,
         run_id: record.run_id.clone(),
+        metadata: record.metadata.clone(),
         lifecycle: if record.completion.is_some() {
             "terminal"
         } else {
@@ -488,6 +555,7 @@ fn run_summary(record: StoredRun) -> RunSummary {
         .map(str::to_owned);
     RunSummary {
         run_id: record.run_id,
+        metadata: record.metadata,
         accepted_at: record.accepted_at,
         lifecycle: if record.completion.is_some() {
             "terminal"
@@ -829,6 +897,10 @@ mod tests {
                 "schema_version": 1,
                 "created": true,
                 "run_id": "550e8400-e29b-41d4-a716-446655440000",
+                "metadata": {
+                    "description": null,
+                    "labels": {},
+                },
                 "lifecycle": "terminal",
                 "completion": {
                     "kind": "output",
@@ -893,10 +965,23 @@ mod tests {
         assert!(value["completion"].is_null());
     }
 
+    #[test]
+    fn idempotent_request_requires_the_same_metadata() {
+        let existing = stored_run(None);
+        assert!(matches_request(&existing, &json!({}), &Metadata::default()));
+        let changed = Metadata::new(
+            Some("different intent".to_owned()),
+            &["suite=swe-bench".parse().expect("label")],
+        )
+        .expect("metadata");
+        assert!(!matches_request(&existing, &json!({}), &changed));
+    }
+
     fn stored_run(completion: Option<Value>) -> StoredRun {
         StoredRun {
             run_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
             accepted_at: "2026-08-27T00:00:00Z".to_owned(),
+            metadata: Metadata::default(),
             input: json!({"stdin": "input-payload"}),
             input_identity: json!({}),
             terminal_at: completion

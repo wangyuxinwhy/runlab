@@ -1,9 +1,10 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -14,6 +15,7 @@ use super::host::{
     guest_binary_path,
 };
 use crate::cli::run::SecretFileArg;
+use crate::metadata::Metadata;
 
 pub(crate) struct ForwardedOutput {
     pub(crate) stdout: Vec<u8>,
@@ -23,6 +25,7 @@ pub(crate) struct ForwardedOutput {
 pub(crate) struct ForwardRunStart<'a> {
     pub(crate) id: &'a str,
     pub(crate) image: &'a str,
+    pub(crate) metadata: &'a Metadata,
     pub(crate) runtime_config: Option<&'a Path>,
     pub(crate) stdin: Option<&'a Path>,
     pub(crate) secret_env: &'a [String],
@@ -45,19 +48,22 @@ impl ManagedVm {
         &self,
         source: &Path,
         name: &str,
+        metadata: &Metadata,
     ) -> Result<ForwardedOutput> {
         let archive = archive_if_directory(source)?;
         let source = archive
             .as_ref()
             .map_or(source, tempfile::NamedTempFile::path);
         let staged = self.stage_input(source, "image")?;
-        let output = self.state_command([
-            OsStr::new("image"),
-            OsStr::new("import"),
-            OsStr::new(&staged),
-            OsStr::new("--name"),
-            OsStr::new(name),
-        ]);
+        let mut arguments = vec![
+            OsString::from("image"),
+            OsString::from("import"),
+            OsString::from(&staged),
+            OsString::from("--name"),
+            OsString::from(name),
+        ];
+        append_metadata_arguments(&mut arguments, metadata);
+        let output = self.state_command(arguments);
         self.cleanup_inputs(&[&staged]);
         output.map(Into::into)
     }
@@ -145,6 +151,7 @@ impl ManagedVm {
                 "--network".into(),
                 request.network.into(),
             ];
+            append_metadata_arguments(&mut arguments, request.metadata);
             if let Some(path) = &runtime_config {
                 arguments.extend(["--runtime-config".into(), path.into()]);
             }
@@ -179,9 +186,9 @@ impl ManagedVm {
             }
         };
         let references = staged.iter().collect::<Vec<_>>();
-        let output = self.systemd_state_command(arguments, &references);
+        let output = self.systemd_state_command_streaming(arguments, &references);
         self.cleanup_inputs(&references);
-        output.map(Into::into)
+        output
     }
 
     pub(crate) fn forward_run_get(&self, id: &str) -> Result<ForwardedOutput> {
@@ -272,11 +279,51 @@ impl ManagedVm {
         self.guest_output(command)
     }
 
-    fn systemd_state_command(
+    fn systemd_state_command_streaming(
         &self,
         arguments: Vec<OsString>,
         cleanup: &[&String],
-    ) -> Result<Output> {
+    ) -> Result<ForwardedOutput> {
+        self.ensure_ready()?;
+        let mut command = Command::new(&self.limactl);
+        command.args(["shell", "--tty=false", INSTANCE, "--"]);
+        command.args(Self::systemd_state_arguments(arguments, cleanup));
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to run {} shell", self.limactl.display()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("managed VM stderr is unavailable")?;
+        let forward = thread::spawn(move || -> std::io::Result<()> {
+            let mut destination = std::io::stderr();
+            let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+            loop {
+                let count = stderr.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                destination.write_all(&buffer[..count])?;
+                destination.flush()?;
+            }
+            Ok(())
+        });
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for managed VM command")?;
+        forward
+            .join()
+            .map_err(|_| anyhow::anyhow!("managed VM stderr forwarding thread panicked"))?
+            .context("failed to forward managed VM stderr")?;
+        ensure_success(&output, "managed VM command")?;
+        Ok(ForwardedOutput {
+            stdout: output.stdout,
+            stderr: Vec::new(),
+        })
+    }
+
+    fn systemd_state_arguments(arguments: Vec<OsString>, cleanup: &[&String]) -> Vec<OsString> {
         let mut command = vec![
             OsString::from("/usr/bin/sudo"),
             OsString::from("/usr/bin/systemd-run"),
@@ -308,7 +355,7 @@ impl ManagedVm {
             OsString::from(STATE_PATH),
         ]);
         command.extend(arguments);
-        self.guest_output(command)
+        command
     }
 
     fn stage_input(&self, source: &Path, label: &str) -> Result<String> {
@@ -372,6 +419,15 @@ impl ManagedVm {
             )
         })?;
         Ok(())
+    }
+}
+
+fn append_metadata_arguments(arguments: &mut Vec<OsString>, metadata: &Metadata) {
+    if let Some(description) = metadata.description() {
+        arguments.extend(["--description".into(), description.into()]);
+    }
+    for (key, value) in metadata.labels() {
+        arguments.extend(["--label".into(), format!("{key}={value}").into()]);
     }
 }
 

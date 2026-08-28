@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
+use std::sync::Arc;
 
 use chrono::Local;
 use run_protocol::{
@@ -8,6 +9,8 @@ use run_protocol::{
     StdinWriteFacts, StreamFacts,
 };
 use rustix::{fs::OFlags, fs::fcntl_getfl, fs::fcntl_setfl};
+
+use crate::{EngineObserver, ProgramStream};
 
 const PIPE_PUMP_BYTE_BUDGET: usize = 1024 * 1024;
 
@@ -103,6 +106,15 @@ pub(super) struct StreamDrain {
     omitted: bool,
     eof: bool,
     error: Option<String>,
+    observation: Option<Box<StreamObservation>>,
+}
+
+struct StreamObservation {
+    program_id: run_protocol::ProgramId,
+    stream: ProgramStream,
+    byte_offset: u64,
+    closed: bool,
+    observer: Arc<dyn EngineObserver>,
 }
 
 impl StreamDrain {
@@ -122,24 +134,47 @@ impl StreamDrain {
             omitted: false,
             eof: false,
             error,
+            observation: None,
         }
     }
 
+    pub(super) fn observe(
+        &mut self,
+        program_id: run_protocol::ProgramId,
+        stream: ProgramStream,
+        observer: Arc<dyn EngineObserver>,
+    ) {
+        self.observation = Some(Box::new(StreamObservation {
+            program_id,
+            stream,
+            byte_offset: 0,
+            closed: false,
+            observer,
+        }));
+    }
+
     pub(super) fn pump(&mut self) {
-        let Some(pipe) = &mut self.pipe else {
+        if self.pipe.is_none() {
             return;
-        };
+        }
         let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
         let mut pumped = 0;
         while pumped < PIPE_PUMP_BYTE_BUDGET {
-            match pipe.read(&mut buffer) {
+            let read = self
+                .pipe
+                .as_mut()
+                .expect("checked stream pipe")
+                .read(&mut buffer);
+            match read {
                 Ok(0) => {
                     self.eof = true;
                     self.pipe = None;
+                    self.observe_closed();
                     return;
                 }
                 Ok(count) => {
                     pumped += count;
+                    self.observe_bytes(&buffer[..count]);
                     let available = MAX_CAPTURED_STREAM_BYTES.saturating_sub(self.bytes.len());
                     let keep = available.min(count);
                     self.bytes.extend_from_slice(&buffer[..keep]);
@@ -150,6 +185,7 @@ impl StreamDrain {
                 Err(error) => {
                     self.error = Some(error.to_string());
                     self.pipe = None;
+                    self.observe_closed();
                     return;
                 }
             }
@@ -174,6 +210,7 @@ impl StreamDrain {
             self.error = Some("stream did not reach EOF before stream drain deadline".to_owned());
         }
         self.pipe = None;
+        self.observe_closed();
         let facts = StreamFacts::new(self.bytes, self.omitted, self.eof)
             .expect("nonblocking drainer preserves stream shape");
         match self.error {
@@ -183,6 +220,33 @@ impl StreamDrain {
                 [],
             ),
             None => OperationReport::succeeded(facts),
+        }
+    }
+
+    fn observe_bytes(&mut self, bytes: &[u8]) {
+        let Some(observation) = &mut self.observation else {
+            return;
+        };
+        observation.observer.program_output(
+            &observation.program_id,
+            observation.stream,
+            observation.byte_offset,
+            bytes,
+        );
+        observation.byte_offset = observation
+            .byte_offset
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    }
+
+    fn observe_closed(&mut self) {
+        let Some(observation) = &mut self.observation else {
+            return;
+        };
+        if !observation.closed {
+            observation.closed = true;
+            observation
+                .observer
+                .program_stream_closed(&observation.program_id, observation.stream);
         }
     }
 }
@@ -200,12 +264,43 @@ fn operation_error(stage: OperationStage, message: impl Into<String>) -> Operati
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use run_protocol::OperationStatus;
 
     use super::*;
+
+    #[derive(Default)]
+    struct CountingObserver {
+        bytes: AtomicU64,
+        closed: AtomicBool,
+    }
+
+    impl EngineObserver for CountingObserver {
+        fn program_output(
+            &self,
+            _program_id: &run_protocol::ProgramId,
+            _stream: ProgramStream,
+            byte_offset: u64,
+            bytes: &[u8],
+        ) {
+            assert_eq!(byte_offset, self.bytes.load(Ordering::Acquire));
+            self.bytes.fetch_add(
+                u64::try_from(bytes.len()).expect("test stream length"),
+                Ordering::AcqRel,
+            );
+        }
+
+        fn program_stream_closed(
+            &self,
+            _program_id: &run_protocol::ProgramId,
+            _stream: ProgramStream,
+        ) {
+            assert!(!self.closed.swap(true, Ordering::AcqRel));
+        }
+    }
 
     #[test]
     fn stream_drain_keeps_exact_binary_limit_and_continues_to_eof() {
@@ -221,6 +316,12 @@ mod tests {
             }
         });
         let mut drain = StreamDrain::new(reader);
+        let observer = Arc::new(CountingObserver::default());
+        drain.observe(
+            run_protocol::ProgramId::primary(),
+            ProgramStream::Stdout,
+            observer.clone(),
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while !drain.is_closed() {
             drain.pump();
@@ -236,5 +337,10 @@ mod tests {
         assert_eq!(&facts.bytes()[..2], &[0xff, 0]);
         assert!(facts.omitted_after_limit());
         assert!(facts.eof());
+        assert_eq!(
+            observer.bytes.load(Ordering::Acquire),
+            u64::try_from(MAX_CAPTURED_STREAM_BYTES + 17).expect("test stream length")
+        );
+        assert!(observer.closed.load(Ordering::Acquire));
     }
 }

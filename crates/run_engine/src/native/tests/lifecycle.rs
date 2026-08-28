@@ -30,7 +30,11 @@ fn final_environment_unavailability_preserves_the_failed_capture_evidence() {
     let prepared =
         empty_prepared_invocation(workspace, "/bin/true".into(), supervisor, "capture-failure");
     let program = &prepared.programs[&ProgramId::primary()];
-    let context = ExecutionContext::new(Arc::new(UnavailableStore), OperationTimeouts::default());
+    let context = ExecutionContext::new(
+        Arc::new(UnavailableStore),
+        OperationTimeouts::default(),
+        Arc::new(crate::observer::IgnoreObserver),
+    );
 
     let mut active_writer = ProgramRun::unattempted();
     active_writer.runtime.writer_stopped = false;
@@ -123,7 +127,11 @@ fn runtime_cleanup_reports_nonempty_mount_artifact_as_rootfs_instability() {
             .message()
             .contains("left the rootfs unstable: rootfs instability")
     }));
-    let context = ExecutionContext::new(Arc::new(UnavailableStore), OperationTimeouts::default());
+    let context = ExecutionContext::new(
+        Arc::new(UnavailableStore),
+        OperationTimeouts::default(),
+        Arc::new(crate::observer::IgnoreObserver),
+    );
     let unavailable = capture_final(
         &context,
         &prepared.programs[&ProgramId::primary()],

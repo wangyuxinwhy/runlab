@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+use crate::metadata::Metadata;
 use crate::storage::{Database, LocalOciStore};
 
 const MAX_PAGE_SIZE: usize = 1_000;
@@ -58,6 +59,7 @@ pub(crate) struct ImageImportResult {
     name: String,
     manifest: Descriptor,
     platform: ImagePlatform,
+    metadata: Metadata,
     imported_blobs: usize,
 }
 
@@ -72,6 +74,7 @@ pub(crate) struct ImageListResult {
 struct ImageListItem {
     name: String,
     manifest: Value,
+    metadata: Metadata,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +85,7 @@ pub(crate) struct ImageGetResult {
     config: Descriptor,
     layers: Vec<Descriptor>,
     platform: ImagePlatform,
+    metadata: Option<Metadata>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -116,10 +120,15 @@ impl<'a> Images<'a> {
         Self { store, database }
     }
 
-    pub(crate) fn import(&self, source: &Path, name: &str) -> Result<ImageImportResult> {
+    pub(crate) fn import(
+        &self,
+        source: &Path,
+        name: &str,
+        metadata: &Metadata,
+    ) -> Result<ImageImportResult> {
         validate_name(name)?;
         if source.is_dir() {
-            return self.import_layout(source, name);
+            return self.import_layout(source, name, metadata);
         }
         if !source.is_file() {
             bail!("OCI Image source does not exist: {}", source.display());
@@ -131,7 +140,7 @@ impl<'a> Images<'a> {
         )
         .unpack(temporary.path())
         .with_context(|| format!("failed to unpack OCI archive {}", source.display()))?;
-        self.import_layout(temporary.path(), name)
+        self.import_layout(temporary.path(), name, metadata)
     }
 
     pub(crate) fn list(&self, limit: usize, after: Option<&str>) -> Result<ImageListResult> {
@@ -151,14 +160,29 @@ impl<'a> Images<'a> {
             schema_version: 1,
             images: entries
                 .into_iter()
-                .map(|(name, manifest)| ImageListItem { name, manifest })
+                .map(|(name, manifest, metadata)| ImageListItem {
+                    name,
+                    manifest,
+                    metadata,
+                })
                 .collect(),
             next_after,
         })
     }
 
     pub(crate) fn get(&self, selector: &ImageSelector) -> Result<ImageGetResult> {
-        let image = self.inspect(selector)?;
+        let (image, metadata) = match selector {
+            ImageSelector::Name(name) => {
+                let (descriptor, metadata) = self
+                    .database
+                    .catalog_get(name)?
+                    .with_context(|| format!("local Image name is unknown: {name}"))?;
+                let descriptor = serde_json::from_value(descriptor)
+                    .context("stored Image descriptor is invalid")?;
+                (inspect_descriptor(&self.store, descriptor)?, Some(metadata))
+            }
+            ImageSelector::Digest(_) => (self.inspect(selector)?, None),
+        };
         Ok(ImageGetResult {
             schema_version: 1,
             requested: selector.to_string(),
@@ -166,6 +190,7 @@ impl<'a> Images<'a> {
             config: image.config,
             layers: image.layers,
             platform: image.platform,
+            metadata,
         })
     }
 
@@ -192,16 +217,21 @@ impl<'a> Images<'a> {
         match selector {
             ImageSelector::Digest(digest) => self.store.manifest_descriptor(digest),
             ImageSelector::Name(name) => {
-                let value = self
+                let (value, _) = self
                     .database
-                    .catalog_resolve(name)?
+                    .catalog_get(name)?
                     .with_context(|| format!("local Image name is unknown: {name}"))?;
                 serde_json::from_value(value).context("stored Image descriptor is invalid")
             }
         }
     }
 
-    fn import_layout(&self, layout: &Path, name: &str) -> Result<ImageImportResult> {
+    fn import_layout(
+        &self,
+        layout: &Path,
+        name: &str,
+        metadata: &Metadata,
+    ) -> Result<ImageImportResult> {
         validate_layout_marker(layout)?;
         let index_bytes = fs::read(layout.join("index.json"))
             .context("OCI Image Layout does not contain a readable index.json")?;
@@ -246,12 +276,13 @@ impl<'a> Images<'a> {
         let inspected = inspect_descriptor(&self.store, (*manifest).clone())?;
         let descriptor_value = serde_json::to_value(&inspected.manifest)?;
         self.database
-            .catalog_set(name, &descriptor_value, &Utc::now().to_rfc3339())?;
+            .catalog_set(name, &descriptor_value, metadata, &Utc::now().to_rfc3339())?;
         Ok(ImageImportResult {
             schema_version: 1,
             name: name.to_owned(),
             manifest: inspected.manifest,
             platform: inspected.platform,
+            metadata: metadata.clone(),
             imported_blobs: blobs.len(),
         })
     }

@@ -39,6 +39,18 @@ fn help_exposes_only_the_minimal_product_surface() {
     }
     assert!(!stdout.contains("file"));
 
+    let image_import = run(&["image", "import", "--help"]);
+    assert_success(&image_import);
+    let stdout = text(&image_import.stdout);
+    for argument in ["--description", "--label <KEY=VALUE>"] {
+        assert!(
+            stdout.contains(argument),
+            "missing metadata argument: {argument}"
+        );
+    }
+    assert!(stdout.contains("do not change the OCI Manifest digest"));
+    assert!(stdout.contains("Keys are not interpreted"));
+
     let filesystem = run(&["filesystem", "--help"]);
     assert_success(&filesystem);
     let stdout = text(&filesystem.stdout);
@@ -83,9 +95,14 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("generated from the Image when omitted"));
     assert!(stdout.contains("possible values: isolated, egress"));
     assert!(stdout.contains("compact JSON summary"));
+    assert!(stdout.contains("stderr emits an NDJSON observation stream"));
     assert!(stdout.contains("Use run get for the complete persisted Run record"));
     assert!(stdout.contains("--secret-env"));
     assert!(stdout.contains("--secret-file"));
+    assert!(stdout.contains("--description"));
+    assert!(stdout.contains("--label <KEY=VALUE>"));
+    assert!(stdout.contains("are not execution facts"));
+    assert!(stdout.contains("Keys are not interpreted"));
     assert!(stdout.contains("Examples:"));
 }
 
@@ -139,27 +156,7 @@ fn image_and_filesystem_commands_import_discover_and_get_paths() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let state = temporary.path().join("state");
     let layout = create_layout(temporary.path());
-    let imported = import_image(&state, &layout, "swebench/example:v1");
-    assert_eq!(imported["name"], "swebench/example:v1");
-    let manifest_descriptor = imported["manifest"].clone();
-    let manifest = manifest_descriptor["digest"]
-        .as_str()
-        .expect("manifest digest")
-        .to_owned();
-
-    let listed = run_with_state(&state, &["image", "list"]);
-    assert_success(&listed);
-    let listed = json_output(&listed);
-    assert_eq!(listed["images"][0]["name"], "swebench/example:v1");
-    assert!(listed["next_after"].is_null());
-
-    let by_name = run_with_state(&state, &["image", "get", "swebench/example:v1"]);
-    assert_success(&by_name);
-    assert_eq!(json_output(&by_name)["manifest"]["digest"], manifest);
-
-    let by_digest = run_with_state(&state, &["image", "get", &manifest]);
-    assert_success(&by_digest);
-    assert_eq!(json_output(&by_digest)["platform"]["os"], "linux");
+    let (manifest_descriptor, manifest) = import_described_image(&state, &layout);
 
     let output = temporary.path().join("actual.patch");
     let file = run_with_state(
@@ -204,6 +201,7 @@ fn image_and_filesystem_commands_import_discover_and_get_paths() {
 
     let run_id = "550e8400-e29b-41d4-a716-446655440000";
     insert_terminal_run(&state, run_id, &manifest_descriptor);
+    assert_run_metadata(&state, run_id);
     let run_output = temporary.path().join("from-run.patch");
     let from_run = run_with_state(
         &state,
@@ -241,10 +239,76 @@ fn image_and_filesystem_commands_import_discover_and_get_paths() {
     assert!(text(&overwrite.stderr).contains("output path already exists"));
 }
 
-fn import_image(state: &Path, layout: &Path, name: &str) -> Value {
-    let imported = run_with_state(state, &["image", "import", path(layout), "--name", name]);
+fn import_described_image(state: &Path, layout: &Path) -> (Value, String) {
+    let imported = run_with_state(
+        state,
+        &[
+            "image",
+            "import",
+            path(layout),
+            "--name",
+            "swebench/example:v1",
+            "--description",
+            "Python + uv task environment",
+            "--label",
+            "runtime=python",
+            "--label",
+            "command=a=b",
+        ],
+    );
     assert_success(&imported);
-    json_output(&imported)
+    let imported = json_output(&imported);
+    assert_eq!(imported["name"], "swebench/example:v1");
+    assert_eq!(
+        imported["metadata"],
+        json!({
+            "description": "Python + uv task environment",
+            "labels": {"command": "a=b", "runtime": "python"},
+        })
+    );
+    let manifest_descriptor = imported["manifest"].clone();
+    let manifest = manifest_descriptor["digest"]
+        .as_str()
+        .expect("manifest digest")
+        .to_owned();
+
+    let listed = run_with_state(state, &["image", "list"]);
+    assert_success(&listed);
+    let listed = json_output(&listed);
+    assert_eq!(listed["images"][0]["name"], "swebench/example:v1");
+    assert_eq!(listed["images"][0]["metadata"], imported["metadata"]);
+    assert!(listed["next_after"].is_null());
+
+    let by_name = run_with_state(state, &["image", "get", "swebench/example:v1"]);
+    assert_success(&by_name);
+    let by_name = json_output(&by_name);
+    assert_eq!(by_name["manifest"]["digest"], manifest);
+    assert_eq!(by_name["metadata"], imported["metadata"]);
+
+    let by_digest = run_with_state(state, &["image", "get", &manifest]);
+    assert_success(&by_digest);
+    let by_digest = json_output(&by_digest);
+    assert_eq!(by_digest["platform"]["os"], "linux");
+    assert!(by_digest["metadata"].is_null());
+    (manifest_descriptor, manifest)
+}
+
+fn assert_run_metadata(state: &Path, run_id: &str) {
+    let run_record = run_with_state(state, &["run", "get", run_id]);
+    assert_success(&run_record);
+    assert_eq!(
+        json_output(&run_record)["metadata"],
+        json!({
+            "description": "SWE-bench replay",
+            "labels": {"suite": "swe-bench", "task": "example"},
+        })
+    );
+    let run_list = run_with_state(state, &["run", "list"]);
+    assert_success(&run_list);
+    assert_eq!(
+        json_output(&run_list)["runs"][0]["metadata"]["labels"]["task"],
+        "example"
+    );
 }
 
 #[cfg(unix)]
@@ -355,11 +419,17 @@ fn insert_terminal_run(state: &Path, run_id: &str, manifest: &Value) {
     connection
         .execute(
             "INSERT INTO runs(
-                run_id, accepted_at, input_json, input_identity_json, terminal_at, completion_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                run_id, accepted_at, metadata_json, input_json, input_identity_json,
+                terminal_at, completion_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 run_id,
                 "2026-08-27T00:00:00Z",
+                serde_json::to_string(&json!({
+                    "description": "SWE-bench replay",
+                    "labels": {"suite": "swe-bench", "task": "example"},
+                }))
+                .expect("metadata JSON"),
                 "{}",
                 "{}",
                 "2026-08-27T00:00:01Z",
@@ -400,6 +470,51 @@ fn generated_runtime_config_is_exact_json_and_network_independent() {
 }
 
 #[test]
+fn existing_state_is_migrated_with_empty_metadata() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    fs::create_dir_all(&state).expect("state directory");
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    connection
+        .execute_batch(
+            "CREATE TABLE catalog (
+                 name TEXT PRIMARY KEY,
+                 descriptor_json TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             ) STRICT;
+             CREATE TABLE runs (
+                 run_id TEXT PRIMARY KEY,
+                 accepted_at TEXT NOT NULL,
+                 input_json TEXT NOT NULL,
+                 input_identity_json TEXT NOT NULL,
+                 terminal_at TEXT,
+                 completion_json TEXT
+             ) STRICT;
+             INSERT INTO catalog VALUES ('legacy', '{}', '2026-08-27T00:00:00Z');
+             INSERT INTO runs VALUES (
+                 '550e8400-e29b-41d4-a716-446655440000',
+                 '2026-08-27T00:00:00Z', '{}', '{}', NULL, NULL
+             );",
+        )
+        .expect("legacy schema");
+    drop(connection);
+
+    let images = run_with_state(&state, &["image", "list"]);
+    assert_success(&images);
+    assert_eq!(
+        json_output(&images)["images"][0]["metadata"],
+        json!({"description": null, "labels": {}})
+    );
+
+    let runs = run_with_state(&state, &["run", "list"]);
+    assert_success(&runs);
+    assert_eq!(
+        json_output(&runs)["runs"][0]["metadata"],
+        json!({"description": null, "labels": {}})
+    );
+}
+
+#[test]
 fn invalid_requests_do_not_emit_success_json() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let state = temporary.path().join("state");
@@ -416,6 +531,22 @@ fn invalid_requests_do_not_emit_success_json() {
     assert!(!bad_id.status.success());
     assert!(bad_id.stdout.is_empty());
     assert!(text(&bad_id.stderr).contains("UUID v4"));
+
+    let malformed_label = run_with_state(
+        &state,
+        &[
+            "image",
+            "import",
+            "missing.oci",
+            "--name",
+            "example",
+            "--label",
+            "missing-equals",
+        ],
+    );
+    assert!(!malformed_label.status.success());
+    assert!(malformed_label.stdout.is_empty());
+    assert!(text(&malformed_label.stderr).contains("KEY=VALUE"));
 }
 
 fn create_layout(root: &Path) -> PathBuf {

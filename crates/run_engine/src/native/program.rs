@@ -1,5 +1,6 @@
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset};
@@ -14,6 +15,7 @@ use super::report::output_internal;
 use super::stdio::{InputTransfer, StreamDrain};
 use super::subprocess::{InvocationSupervisor, RunningHelper, SupervisorToken};
 use super::time::{checked_deadline, wall_clock_now};
+use crate::{EngineObserver, ProgramStream};
 
 pub(super) struct ProgramRun {
     pub(super) supervision: SupervisionState,
@@ -117,6 +119,23 @@ impl ProgramRun {
                 stop_actions: Vec::new(),
                 errors: Vec::new(),
             },
+        }
+    }
+
+    pub(super) fn observe_output(
+        &mut self,
+        program_id: run_protocol::ProgramId,
+        observer: Arc<dyn EngineObserver>,
+    ) {
+        if let Some(stdout) = &mut self.io.stdout_drain {
+            stdout.observe(
+                program_id.clone(),
+                ProgramStream::Stdout,
+                Arc::clone(&observer),
+            );
+        }
+        if let Some(stderr) = &mut self.io.stderr_drain {
+            stderr.observe(program_id, ProgramStream::Stderr, observer);
         }
     }
 

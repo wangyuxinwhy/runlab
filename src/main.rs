@@ -8,6 +8,8 @@ mod filesystem;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod image;
 mod managed_vm;
+mod metadata;
+mod observation;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod run;
 #[cfg_attr(target_os = "macos", allow(dead_code))]

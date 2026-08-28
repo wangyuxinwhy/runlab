@@ -3,8 +3,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
+
+use crate::metadata::{Label, Metadata};
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod filesystem;
@@ -57,6 +59,22 @@ enum Command {
         #[command(subcommand)]
         command: vm::VmCommand,
     },
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub(crate) struct MetadataArgs {
+    /// Short caller-provided description stored for Agent selection. Combined metadata must fit in 8 KiB.
+    #[arg(long, value_name = "TEXT")]
+    description: Option<String>,
+    /// Caller-defined metadata label as KEY=VALUE; repeatable. Keys are not interpreted.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    labels: Vec<Label>,
+}
+
+impl MetadataArgs {
+    pub(crate) fn resolve(&self) -> Result<Metadata> {
+        Metadata::new(self.description.clone(), &self.labels)
+    }
 }
 
 pub(crate) fn run() -> Result<u8> {

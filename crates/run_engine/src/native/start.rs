@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,14 +27,15 @@ use super::subprocess::{
     terminate_child,
 };
 use super::time::{POLL_INTERVAL, checked_deadline, execution_expired, wall_clock_now};
-use crate::{CancellationToken, OperationTimeouts};
+use crate::{CancellationToken, EngineObserver, OperationTimeouts};
 
-#[derive(Clone, Copy)]
 pub(super) struct ProgramStarter<'a> {
     supervisor: &'a InvocationSupervisor,
     runc: &'a Path,
     runtime_root: &'a Path,
     timeouts: OperationTimeouts,
+    observer: Arc<dyn EngineObserver>,
+    execution_observed: Cell<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -62,12 +65,15 @@ impl<'a> ProgramStarter<'a> {
         runc: &'a Path,
         runtime_root: &'a Path,
         timeouts: OperationTimeouts,
+        observer: Arc<dyn EngineObserver>,
     ) -> Self {
         Self {
             supervisor,
             runc,
             runtime_root,
             timeouts,
+            observer,
+            execution_observed: Cell::new(false),
         }
     }
 }
@@ -75,6 +81,7 @@ impl<'a> ProgramStarter<'a> {
 impl ProgramStarter<'_> {
     pub(super) fn start(
         &self,
+        program_id: &ProgramId,
         prepared: &PreparedProgram,
         input: &ProgramInput,
         control: StartControl<'_>,
@@ -86,7 +93,10 @@ impl ProgramStarter<'_> {
             return ProgramRun::unattempted_with(self.supervisor.clone());
         }
         match self.create(prepared, input, control, other_runs) {
-            CreateOutcome::Ready(run) => self.start_created(prepared, control, other_runs, run),
+            CreateOutcome::Ready(mut run) => {
+                run.observe_output(program_id.clone(), Arc::clone(&self.observer));
+                self.start_created(prepared, control, other_runs, run)
+            }
             CreateOutcome::Finished(run) => run,
         }
     }
@@ -103,7 +113,8 @@ impl ProgramStarter<'_> {
             runc,
             runtime_root,
             timeouts,
-        } = *self;
+            ..
+        } = self;
         let StartControl {
             cancellation,
             execution_start,
@@ -113,7 +124,7 @@ impl ProgramStarter<'_> {
             supervisor,
             runc,
             runtime_root,
-            timeouts,
+            timeouts: *timeouts,
             prepared,
             input,
             cancellation,
@@ -175,6 +186,9 @@ impl ProgramStarter<'_> {
         let start_wall = wall_clock_now();
         let start_monotonic = Instant::now();
         run.runtime.execution_entry = Some((start_wall, start_monotonic));
+        if !self.execution_observed.replace(true) {
+            self.observer.stage(crate::EngineStage::Executing);
+        }
         let (start_deadline, deadline_message) =
             start_deadline(start_monotonic, execution_start, execution_limit, timeouts);
         let mut command = runc_command(runc, runtime_root);

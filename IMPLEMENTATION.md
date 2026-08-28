@@ -47,6 +47,8 @@ macOS 上所有 State 命令都在固定 Guest State `/var/lib/runlab` 执行，
 
 `filesystem get` 当前只跨 VM 传回普通文件。Guest 与 Host 文件 identity 一致后才以 no-clobber 方式发布到请求的 macOS 路径，返回 JSON 中只出现该路径，不泄露 Guest staging path。
 
+`image import` 和 `run start` 通过 `--description` 与可重复的 `--label KEY=VALUE` 接受总计不超过 8 KiB 的 Agent-facing metadata。Image metadata 属于可变 Catalog Entry，不改变 OCI digest；Run metadata 在 accepted 时固定，保存在 Run Record 中，不进入 Run Protocol 或 Engine。相应的 `list/get` 输出都会返回 metadata；按 digest 查询 Image 时没有唯一 Catalog Entry，因此 metadata 为 `null`。
+
 `run config generate` 把完整 OCI Runtime Configuration JSON 写到 stdout，供 `jq` 等普通 JSON 工具继续处理。`run start` 省略 `--runtime-config` 时复用同一个生成器。生成器固定创建新的 network namespace，`isolated` 或 `egress` 仍只由 `run start --network` 选择，不写入 `config.json`。
 
 `run start --secret-env NAME` 从调用方环境读取一个值，`--secret-file HOST_FILE=CONTAINER_PATH` 读取一个宿主文件。RunLab 在内存中构造 Protocol `Secrets`，公开 Run Record 只保存名称、目标和 `retained: false`；内部 identity 只保存内容摘要。NativeEngine 仅在私有调用 workspace 中派生 Runtime config 和只读 file mounts，Secret file 会在 Final Environment 捕获前移除。macOS transport 只传输 mode 0600 的临时 Secret 文件，不把值放入 argv，并在 transient systemd unit 结束后清理。
@@ -55,7 +57,7 @@ macOS 上所有 State 命令都在固定 Guest State `/var/lib/runlab` 执行，
 
 State 目录包含 `oci/blobs/sha256`、`runlab.sqlite3` 和 Linux 执行时使用的 `engine` 目录。`engine` 内的 `invocations` 只保存调用期间的私有 workspace，正常返回后为空；`snapshots-v3` 保存由有序 DiffID chain 标识的只读 OverlayFS snapshot 与初始 filesystem Inventory。每次 Run 仍重新验证完整 OCI 输入；命中缓存只省去重复展开 Layer 和扫描初始 Inventory，每次调用使用独立 upperdir/workdir。OCI 内容按 Descriptor 的 size 与 digest 校验，并通过同目录临时文件原子发布。Image 名称只在完整 Manifest、Config、Layers 和 DiffIDs 验证后写入 Catalog。
 
-Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调用 Engine 前写入 accepted record；同一 identity 与语义相同的输入返回已有记录，输入不同则拒绝。Engine 正常返回 `RunOutput` 或 `EngineError` 后写入 terminal completion。命令只返回有界摘要，包括 lifecycle、execution、各 Program 的 process、final environment 与 errors；完整输入和标准流仍通过显式 `run get` 读取。
+Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调用 Engine 前写入 accepted record；同一 identity、语义相同的输入与相同 metadata 返回已有记录，输入或 metadata 不同则拒绝。Engine 正常返回 `RunOutput` 或 `EngineError` 后写入 terminal completion。stdout 只返回有界摘要，包括 metadata、lifecycle、execution、各 Program 的 process、final environment 与 errors；stderr 同时输出以 `run.stream` 开始的实时 NDJSON，包含 `run.stage`、`program.stdout` 与 `program.stderr`。完整输入和持久标准流仍通过显式 `run get` 读取。
 
 当前不实现跨进程恢复。进程在 accepted 之后、terminal 写入之前崩溃时，记录会诚实地保持 accepted 状态；没有 reconcile 或隐式重试。
 
@@ -68,7 +70,7 @@ Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调
 - NativeEngine snapshot cache 当前没有公开命令、容量策略或淘汰机制；这些能力尚无使用场景，不在本次实现中。
 - Native Linux 的 `filesystem get` 支持文件、目录和 symlink；macOS Managed VM transport 当前只传回普通文件。
 - `filesystem get` 从 Run Program 的 Final Environment 或指定 Image 读取普通文件、目录或 symlink。目标路径必须尚不存在；单文件从最新 Layer 向前解析，目录只合并目标子树。
-- stdout/stderr 当前作为协议事实保存在完整 Run record 中；独立 stream 命令尚未因真实场景而引入。
+- stdout/stderr 既作为协议事实保存在完整 Run record 中，也在 `run start` 期间作为实时观察事件输出；独立 stream 命令尚未因真实场景而引入。
 - 不实现恢复、验证、评分、golden comparison 或实验编排。
 
 ## 当前验证
@@ -84,7 +86,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Rust 1.95 MSRV all-target check 已通过。独立进程 CLI 测试覆盖最小命令面、OCI Layout 导入、名称和 digest 查询、通过 Run 或 Image 读取文件系统路径、跨 Layer 目录合并、whiteout、opaque 目录、symlink、拒绝覆盖目标，以及错误请求不输出成功 JSON。
 
-真实 Linux CLI 纵切已通过 `runc 1.5.1`：导入 arm64 OCI Image，执行返回 exit 7 的 Run，保存独立 stdout/stderr 与 Final Image，通过 Final Image digest 提取 `/result/value` 的精确字节，并验证同 identity 重试返回 `created: false`。单独的长运行进程收到 SIGINT 后得到 terminal、`cancelled: true` 的 RunOutput，Engine workspace 无残留。
+Image 与 Run metadata 已在 Managed Linux VM 中通过独立进程 CLI 测试：`image import` 写入的 description 和任意字符串 labels 会由名称形式的 `image get` 与 `image list` 返回，digest 形式查询返回 `metadata: null`；`run get/list` 返回持久 metadata；旧版 Catalog 与 Run 表会迁移并为既有记录补充空 metadata。相同 `run_id` 的 metadata 相等判断、8 KiB 上限、重复 label key、包含 `=` 的 value、macOS 参数转发和完整 CLI help 也有可执行覆盖。
+
+真实 Linux CLI 纵切已通过 `runc 1.5.1`：导入 arm64 OCI Image，执行返回 exit 7 的 Run，保存独立 stdout/stderr 与 Final Image，通过 Final Image digest 提取 `/result/value` 的精确字节，并验证同 identity 重试返回 `created: false`。单独的长运行进程收到 SIGINT 后得到 terminal、`cancelled: true` 的 RunOutput，Engine workspace 无残留。实时观察纵切中，`run.stream`、`accepted`、`preparing` 在 0.107 秒到达，`executing` 在 0.242 秒到达，Program 首批 stdout/stderr 在 0.253 秒到达，Program 两秒后的第二段 stdout 在 2.251 秒到达，最终 stdout 摘要在 2.621 秒返回，证明事件没有等 Run 完成后批量输出。
 
 紧凑 `run start` 结果也已通过真实 Linux CLI 验证：确定性 Program 分别写入 `compact-stdout` 与 `compact-stderr` 后 exit 7，命令返回 663-byte 摘要，保留 process 与 Final Environment 且不包含两个 stream payload；随后 `run get` 从完整 Record 精确恢复两段字节。同 identity 重试只把 `created` 改为 `false`，其余摘要一致。
 
