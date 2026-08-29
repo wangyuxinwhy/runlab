@@ -312,6 +312,10 @@ impl ManagedVm {
         self.state_command(["run", "cancel", id]).map(Into::into)
     }
 
+    pub(crate) fn forward_run_reconcile(&self, id: &str) -> Result<ForwardedOutput> {
+        self.state_command(["run", "reconcile", id]).map(Into::into)
+    }
+
     pub(crate) fn forward_run_list(
         &self,
         limit: usize,

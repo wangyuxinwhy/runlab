@@ -443,12 +443,13 @@ fn detached_run_returns_after_acceptance_while_the_worker_continues() {
     let (limactl, log) = fake_limactl(temporary.path());
     let accepted = temporary.path().join("accepted");
     let completed = temporary.path().join("completed");
-    let started = Instant::now();
+    let release = temporary.path().join("release");
     let output = Command::new(env!("CARGO_BIN_EXE_runlab"))
         .env("RUNLAB_LIMACTL", limactl)
         .env("RUNLAB_FAKE_LOG", &log)
         .env("RUNLAB_FAKE_ACCEPTED", &accepted)
         .env("RUNLAB_FAKE_COMPLETED", &completed)
+        .env("RUNLAB_FAKE_RELEASE", &release)
         .args([
             "run",
             "start",
@@ -461,11 +462,6 @@ fn detached_run_returns_after_acceptance_while_the_worker_continues() {
         .output()
         .expect("runlab process");
     assert_success(&output);
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "detach acceptance wait took {elapsed:?}"
-    );
     let result = serde_json::from_slice::<Value>(&output.stdout).expect("detached result");
     assert_eq!(result["detached"], true);
     assert_eq!(result["created"], true);
@@ -478,6 +474,7 @@ fn detached_run_returns_after_acceptance_while_the_worker_continues() {
         !completed.exists(),
         "worker unexpectedly completed before detach returned"
     );
+    fs::write(&release, b"release").expect("release detached worker");
     let deadline = Instant::now() + Duration::from_secs(2);
     while !completed.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -671,7 +668,7 @@ case "$*" in
     ;;
   *"run start --id e11ce005-0000-4000-8000-000000000005 --detached-worker --image agent-base --network isolated"*)
     : > "$RUNLAB_FAKE_ACCEPTED"
-    sleep 1
+    while test ! -e "$RUNLAB_FAKE_RELEASE"; do sleep 0.02; done
     printf '%s\n' '{{"schema_version":1,"created":true,"run_id":"e11ce005-0000-4000-8000-000000000005","lifecycle":"terminal","completion":null}}'
     : > "$RUNLAB_FAKE_COMPLETED"
     ;;

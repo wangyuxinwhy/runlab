@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{ArgGroup, Args, Subcommand};
 
 #[cfg(not(target_os = "macos"))]
@@ -88,18 +88,27 @@ pub(super) fn execute_managed(command: QueryCommand) -> Result<u8> {
 impl QueryRunArgs {
     fn validate(&self) -> Result<()> {
         if !(1..=10_000).contains(&self.limit) {
-            bail!("--limit must be between 1 and 10000");
+            return Err(crate::error::invalid_input(
+                anyhow::anyhow!("--limit must be between 1 and 10000"),
+                "query_input",
+            ));
         }
         for (name, value) in [
             ("--max-cell-bytes", self.max_cell_bytes),
             ("--max-output-bytes", self.max_output_bytes),
         ] {
             if !(1..=MAX_BOUND).contains(&value) {
-                bail!("{name} must be between 1 and {MAX_BOUND}");
+                return Err(crate::error::invalid_input(
+                    anyhow::anyhow!("{name} must be between 1 and {MAX_BOUND}"),
+                    "query_input",
+                ));
             }
         }
         if !(1..=300).contains(&self.timeout_seconds) {
-            bail!("--timeout-seconds must be between 1 and 300");
+            return Err(crate::error::invalid_input(
+                anyhow::anyhow!("--timeout-seconds must be between 1 and 300"),
+                "query_input",
+            ));
         }
         Ok(())
     }
@@ -107,7 +116,12 @@ impl QueryRunArgs {
     fn read_sql(&self) -> Result<String> {
         if let Some(sql) = &self.sql {
             if sql.len() > MAX_SQL_INPUT_BYTES {
-                bail!("inline SQL exceeds the {MAX_SQL_INPUT_BYTES}-byte input limit");
+                return Err(crate::error::invalid_input(
+                    anyhow::anyhow!(
+                        "inline SQL exceeds the {MAX_SQL_INPUT_BYTES}-byte input limit"
+                    ),
+                    "query_input",
+                ));
             }
             return Ok(sql.clone());
         }
@@ -130,7 +144,17 @@ fn read_bounded(reader: impl std::io::Read, source: &str) -> Result<String> {
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {source}"))?;
     if bytes.len() > MAX_SQL_INPUT_BYTES {
-        bail!("{source} exceeds the {MAX_SQL_INPUT_BYTES}-byte input limit");
+        return Err(crate::error::invalid_input(
+            anyhow::anyhow!("{source} exceeds the {MAX_SQL_INPUT_BYTES}-byte input limit"),
+            "query_input",
+        ));
     }
-    String::from_utf8(bytes).with_context(|| format!("{source} is not valid UTF-8"))
+    String::from_utf8(bytes)
+        .map_err(anyhow::Error::from)
+        .map_err(|error| {
+            crate::error::invalid_input(
+                error.context(format!("{source} is not valid UTF-8")),
+                "query_input",
+            )
+        })
 }

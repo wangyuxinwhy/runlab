@@ -161,6 +161,8 @@ For a foreground `exec`, `SIGINT` and `SIGTERM` cancel the current synchronous E
 
 `storage status` reports filesystem capacity, State component allocation, immutable asset references, missing referenced content, and safely reclaimable bytes. `storage prune check` returns the same bounded deletion plan without mutation. `storage prune apply` requires exclusive State access and removes only unreferenced OCI blobs, unreachable snapshot cache entries, and stale invocation staging; it never deletes Catalog entries, Run records, or their referenced OCI content.
 
+`assets.active_runs` counts Runs for which no terminal completion has been published. It is a persistent lifecycle count, not proof that a Coordinator or Program process is currently alive. `run reconcile RUN_ID` consults the private execution journal: it can publish a durably staged Engine result, or publish `interrupted` when the recorded owner is dead and the journal proves the Engine was never started. Once the Engine has started, the Run remains accepted with `evidence_incomplete` unless safe resource cleanup or an Engine result has been proved.
+
 `image export` writes a Catalog Image or Run Final Image as a standard uncompressed OCI Image Layout archive. It verifies every exported blob while streaming, publishes atomically, and never overwrites an existing output path. RunLab still does not build Images or own registry transport.
 
 ## Development checks
@@ -173,4 +175,4 @@ cargo +1.95.0 check --workspace --all-targets --locked
 cargo package -p run_protocol --no-verify --locked
 ```
 
-Package dependents can be checked in publication order after `run_protocol 0.1.0` is available from the target registry. Linux completion additionally requires end-to-end `run start` and `exec` invocations through the real `NativeEngine` and `runc`.
+Package dependents can be checked in publication order after `run_protocol 0.1.0` is available from the target registry. Linux completion additionally runs `scripts/verify-linux.sh` as root with `RUNLAB_NATIVE_E2E_OCI_LAYOUT` set to a deterministic OCI fixture; the gate fails unless all six opt-in real-`runc` scenarios actually run.

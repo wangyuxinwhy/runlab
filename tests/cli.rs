@@ -77,7 +77,8 @@ fn help_exposes_only_the_minimal_product_surface() {
     for command in ["config", "start", "cancel", "get", "list"] {
         assert!(stdout.contains(command), "missing run command: {command}");
     }
-    for removed in ["stdout", "stderr", "verify", "reconcile", "diff"] {
+    assert!(stdout.contains("reconcile"));
+    for removed in ["stdout", "stderr", "verify", "diff"] {
         assert!(
             !stdout.contains(removed),
             "unadmitted run command leaked: {removed}"
@@ -156,36 +157,7 @@ fn image_export_round_trips_catalog_and_final_images_without_overwrite() {
     );
 
     let run_id = "550e8400-e29b-41d4-a716-446655440001";
-    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
-    connection
-        .execute(
-            "INSERT INTO runs(
-                run_id, accepted_at, initial_image_name, metadata_json, input_json,
-                input_identity_json, terminal_at, completion_json
-             ) VALUES (?1, '2026-08-28T00:00:00Z', 'base',
-                       '{\"description\":null,\"labels\":{}}', '{}', '{}',
-                       '2026-08-28T00:00:01Z', ?2)",
-            rusqlite::params![
-                run_id,
-                serde_json::to_string(&json!({
-                    "result": {
-                        "kind": "output",
-                        "output": {
-                            "programs": {
-                                "primary": {
-                                    "final_environment": {
-                                        "availability": "available",
-                                        "value": manifest,
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }))
-                .expect("completion JSON")
-            ],
-        )
-        .expect("terminal Run");
+    insert_terminal_run(&state, run_id, &manifest);
     let final_archive = temporary.path().join("final.oci.tar");
     assert_success(&run_with_state(
         &state,
@@ -293,14 +265,23 @@ fn run_cancel_is_persisted_idempotently_and_preserves_terminal_runs() {
     assert_success(&run_with_state(&state, &["image", "list"]));
     let run_id = "550e8400-e29b-41d4-a716-446655440000";
     let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    let manifest = json!({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size": 1
+    });
     connection
         .execute(
             "INSERT INTO runs(
                 run_id, accepted_at, initial_image_name, metadata_json, input_json,
                 input_identity_json
              ) VALUES (?1, '2026-08-28T00:00:00Z', NULL,
-                       '{\"description\":null,\"labels\":{}}', '{}', '{}')",
-            [run_id],
+                       '{\"description\":null,\"labels\":{}}', ?2, ?3)",
+            rusqlite::params![
+                run_id,
+                stored_input(&manifest).to_string(),
+                stored_identity(&manifest).to_string()
+            ],
         )
         .expect("insert accepted Run");
 
@@ -330,9 +311,20 @@ fn run_cancel_is_persisted_idempotently_and_preserves_terminal_runs() {
 
     connection
         .execute(
-            "UPDATE runs SET terminal_at = '2026-08-28T00:00:01Z', completion_json = '{}'
+            "UPDATE runs SET terminal_at = '2026-08-28T00:00:01Z', completion_json = ?2
              WHERE run_id = ?1",
-            [run_id],
+            rusqlite::params![
+                run_id,
+                json!({
+                    "kind": "engine_returned",
+                    "record_version": 1,
+                    "result": {
+                        "kind": "engine_error",
+                        "error": {"kind": "internal", "path": null, "reason": "test terminal"}
+                    }
+                })
+                .to_string()
+            ],
         )
         .expect("complete Run");
     let terminal = run_with_state(&state, &["run", "cancel", run_id]);
@@ -341,6 +333,123 @@ fn run_cancel_is_persisted_idempotently_and_preserves_terminal_runs() {
     assert_eq!(terminal["lifecycle"], "terminal");
     assert_eq!(terminal["cancellation_requested_at"], requested_at);
     assert_eq!(terminal["terminal_at"], "2026-08-28T00:00:01Z");
+}
+
+#[test]
+fn run_reconcile_publishes_a_durably_staged_engine_result() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    assert_success(&run_with_state(&state, &["image", "list"]));
+    let run_id = "550e8400-e29b-41d4-a716-446655440000";
+    let manifest = json!({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size": 1
+    });
+    let completion = stored_completion(&manifest);
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    connection
+        .execute(
+            "INSERT INTO runs(
+                run_id, accepted_at, initial_image_name, metadata_json, input_json,
+                input_identity_json
+             ) VALUES (?1, '2026-08-28T00:00:00Z', NULL,
+                       '{\"description\":null,\"labels\":{}}', ?2, ?3)",
+            rusqlite::params![
+                run_id,
+                stored_input(&manifest).to_string(),
+                stored_identity(&manifest).to_string()
+            ],
+        )
+        .expect("insert accepted Run");
+    connection
+        .execute(
+            "INSERT INTO run_executions(
+                run_id, owner_boot_id, owner_pid, owner_start_ticks, phase, completion_json
+             ) VALUES (?1, 'old-boot', 1, 1, 'result_staged', ?2)",
+            rusqlite::params![run_id, completion.to_string()],
+        )
+        .expect("insert staged Engine result");
+    drop(connection);
+
+    let reconciled = run_with_state(&state, &["run", "reconcile", run_id]);
+    assert_success(&reconciled);
+    let reconciled = json_output(&reconciled);
+    assert_eq!(reconciled["run_id"], run_id);
+    assert_eq!(reconciled["lifecycle"], "terminal");
+    assert_eq!(reconciled["outcome"], "published_staged_result");
+
+    let record = run_with_state(&state, &["run", "get", run_id]);
+    assert_success(&record);
+    let record = json_output(&record);
+    assert_eq!(record["lifecycle"], "terminal");
+    assert_eq!(record["completion"], completion);
+}
+
+#[test]
+fn run_reconcile_publishes_interrupted_only_when_engine_was_not_started() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    assert_success(&run_with_state(&state, &["image", "list"]));
+    let run_id = "550e8400-e29b-41d4-a716-446655440001";
+    let manifest = json!({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size": 1
+    });
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    connection
+        .execute(
+            "INSERT INTO runs(
+                run_id, accepted_at, initial_image_name, metadata_json, input_json,
+                input_identity_json
+             ) VALUES (?1, '2026-08-28T00:00:00Z', NULL,
+                       '{\"description\":null,\"labels\":{}}', ?2, ?3)",
+            rusqlite::params![
+                run_id,
+                stored_input(&manifest).to_string(),
+                stored_identity(&manifest).to_string()
+            ],
+        )
+        .expect("insert accepted Run");
+    connection
+        .execute(
+            "INSERT INTO run_executions(
+                run_id, owner_boot_id, owner_pid, owner_start_ticks, phase
+             ) VALUES (?1, 'old-boot', 1, 1, 'accepted')",
+            [run_id],
+        )
+        .expect("insert pre-Engine execution journal");
+    drop(connection);
+
+    let reconciled = run_with_state(&state, &["run", "reconcile", run_id]);
+    assert_success(&reconciled);
+    let reconciled = json_output(&reconciled);
+    assert_eq!(reconciled["lifecycle"], "terminal");
+    assert_eq!(reconciled["outcome"], "published_interrupted");
+
+    let record = run_with_state(&state, &["run", "get", run_id]);
+    assert_success(&record);
+    let record = json_output(&record);
+    assert_eq!(record["completion"]["kind"], "interrupted");
+    assert_eq!(
+        record["completion"]["interruption"]["unavailable_results"]["engine_result"],
+        "Run Engine was not invoked, so no RunOutput or EngineError exists"
+    );
+
+    let query = run_with_state(
+        &state,
+        &[
+            "query",
+            "run",
+            &format!("SELECT completion_kind FROM runs WHERE run_id = '{run_id}'"),
+        ],
+    );
+    assert_success(&query);
+    assert_eq!(
+        json_output(&query)["rows"][0]["completion_kind"],
+        "interrupted"
+    );
 }
 
 #[test]
@@ -908,43 +1017,7 @@ fn insert_terminal_run_with_final(
 ) {
     let connection =
         rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("Run database");
-    let completion = json!({
-        "kind": "engine_returned",
-        "result": {
-            "kind": "output",
-            "output": {
-                "execution": {
-                    "timed_out": false,
-                    "cancelled": false
-                },
-                "programs": {
-                    "primary": {
-                        "start": {
-                            "status": "succeeded",
-                            "facts": {"started_at": "2026-08-27T00:00:00.373456789Z"}
-                        },
-                        "process": {
-                            "kind": "exited",
-                            "code": 0,
-                            "ended_at": "2026-08-27T00:00:00.873456789Z"
-                        },
-                        "stdout": {
-                            "status": "succeeded",
-                            "facts": {"bytes": {"encoding": "base64", "value": "aGVsbG8="}}
-                        },
-                        "stderr": {
-                            "status": "succeeded",
-                            "facts": {"bytes": {"encoding": "base64", "value": ""}}
-                        },
-                        "final_environment": {
-                            "availability": "available",
-                            "value": final_manifest,
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let completion = stored_completion(final_manifest);
     connection
         .execute(
             "INSERT INTO runs(
@@ -960,16 +1033,117 @@ fn insert_terminal_run_with_final(
                     "labels": {"suite": "swe-bench", "task": "example"},
                 }))
                 .expect("metadata JSON"),
-                serde_json::to_string(&json!({
-                    "programs": {"primary": {"initial_environment": initial_manifest}}
-                }))
-                .expect("input JSON"),
-                "{}",
+                stored_input(initial_manifest).to_string(),
+                stored_identity(initial_manifest).to_string(),
                 "2026-08-27T00:00:01.123456789Z",
                 serde_json::to_string(&completion).expect("completion JSON"),
             ],
         )
         .expect("insert terminal Run");
+}
+
+fn stored_completion(final_manifest: &Value) -> Value {
+    json!({
+        "kind": "engine_returned",
+        "record_version": 1,
+        "result": {
+            "kind": "output",
+            "output": {
+                "execution": {
+                    "interval": {
+                        "kind": "entered",
+                        "started_at": "2026-08-27T00:00:00.373456789Z",
+                        "ended_at": "2026-08-27T00:00:00.873456789Z"
+                    },
+                    "timed_out": false,
+                    "cancelled": false,
+                    "errors": []
+                },
+                "programs": {
+                    "primary": {
+                        "create": {
+                            "status": "succeeded",
+                            "facts": {"completed_at": "2026-08-27T00:00:00.273456789Z"},
+                            "reason": null
+                        },
+                        "start": {
+                            "status": "succeeded",
+                            "facts": {"started_at": "2026-08-27T00:00:00.373456789Z"},
+                            "reason": null
+                        },
+                        "process": {
+                            "kind": "exited",
+                            "code": 0,
+                            "ended_at": "2026-08-27T00:00:00.873456789Z"
+                        },
+                        "stdin": {
+                            "write": {
+                                "status": "succeeded",
+                                "facts": {"bytes_written": 0},
+                                "reason": null
+                            },
+                            "close": {"status": "succeeded", "facts": null, "reason": null}
+                        },
+                        "stdout": {
+                            "status": "succeeded",
+                            "facts": {
+                                "bytes": {"encoding": "base64", "value": "aGVsbG8=", "byte_length": 5},
+                                "omitted_after_limit": false,
+                                "eof": true
+                            },
+                            "reason": null
+                        },
+                        "stderr": {
+                            "status": "succeeded",
+                            "facts": {
+                                "bytes": {"encoding": "base64", "value": "", "byte_length": 0},
+                                "omitted_after_limit": false,
+                                "eof": true
+                            },
+                            "reason": null
+                        },
+                        "stop_actions": [],
+                        "final_environment": {
+                            "availability": "available",
+                            "value": final_manifest,
+                        },
+                        "errors": []
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn stored_input(manifest: &Value) -> Value {
+    json!({
+        "record_version": 1,
+        "programs": {"primary": {
+            "initial_environment": manifest,
+            "runtime_config": {"encoding": "base64", "bytes": "e30="},
+            "stdin": {"encoding": "base64", "bytes": ""},
+            "secrets": {"env": {}, "files": {}}
+        }},
+        "controls": {
+            "execution_timeout_ms": null,
+            "network": "isolated",
+            "capture_final_environment": true
+        }
+    })
+}
+
+fn stored_identity(manifest: &Value) -> Value {
+    json!({
+        "record_version": 1,
+        "programs": {"primary": {
+            "initial_environment": manifest,
+            "runtime_config": {},
+            "stdin": "",
+            "secrets": {"env": {}, "files": {}}
+        }},
+        "execution_timeout_ms": null,
+        "network": "isolated"
+    })
 }
 
 #[test]
@@ -1023,13 +1197,48 @@ fn existing_state_is_migrated_with_empty_metadata() {
                  terminal_at TEXT,
                  completion_json TEXT
              ) STRICT;
-             INSERT INTO catalog VALUES ('legacy', '{}', '2026-08-27T00:00:00Z');
-             INSERT INTO runs VALUES (
-                 '550e8400-e29b-41d4-a716-446655440000',
-                 '2026-08-27T00:00:00Z', '{}', '{}', NULL, NULL
-             );",
+             INSERT INTO catalog VALUES ('legacy', '{}', '2026-08-27T00:00:00Z');",
         )
         .expect("legacy schema");
+    let descriptor = json!({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size": 1
+    });
+    let input = json!({
+        "programs": {"primary": {
+            "initial_environment": descriptor,
+            "runtime_config": {"encoding": "base64", "bytes": "e30="},
+            "stdin": {"encoding": "base64", "bytes": ""},
+            "secrets": {"env": {}, "files": {}}
+        }},
+        "controls": {
+            "execution_timeout_ms": null,
+            "network": "isolated",
+            "capture_final_environment": true
+        }
+    });
+    let identity = json!({
+        "programs": {"primary": {
+            "initial_environment": descriptor,
+            "runtime_config": {},
+            "stdin": "",
+            "secrets": {"env": {}, "files": {}}
+        }},
+        "execution_timeout_ms": null,
+        "network": "isolated"
+    });
+    connection
+        .execute(
+            "INSERT INTO runs VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+            rusqlite::params![
+                "550e8400-e29b-41d4-a716-446655440000",
+                "2026-08-27T00:00:00Z",
+                input.to_string(),
+                identity.to_string()
+            ],
+        )
+        .expect("legacy Run");
     drop(connection);
 
     let images = run_with_state(&state, &["image", "list"]);
@@ -1112,6 +1321,22 @@ fn invalid_requests_do_not_emit_success_json() {
             .as_str()
             .is_some_and(|value| value.contains("KEY=VALUE"))
     );
+
+    for (arguments, stage) in [
+        (&["query", "run", ""][..], "query_input"),
+        (&["image", "list", "--limit", "0"][..], "image_input"),
+        (&["run", "list", "--limit", "0"][..], "run_input"),
+    ] {
+        let output = run_with_state(&state, arguments);
+        assert!(!output.status.success(), "request unexpectedly succeeded");
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+        assert_eq!(error["category"], "invalid_input");
+        assert_eq!(error["stage"], stage);
+        assert_eq!(error["accepted"], false);
+        assert_eq!(error["run_created"], false);
+        assert_eq!(error["retryable"], false);
+    }
 }
 
 fn create_layout(root: &Path) -> PathBuf {

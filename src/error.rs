@@ -103,6 +103,13 @@ pub(crate) fn classify(source: Error, facts: ErrorFacts) -> Error {
     })
 }
 
+pub(crate) fn invalid_input(source: Error, stage: &'static str) -> Error {
+    classify(
+        source,
+        ErrorFacts::before_run(ErrorCategory::InvalidInput, stage),
+    )
+}
+
 pub(crate) fn parse_remote(stderr: &[u8], already_emitted: bool) -> Option<RemoteError> {
     let text = String::from_utf8_lossy(stderr);
     text.lines().rev().find_map(|line| {

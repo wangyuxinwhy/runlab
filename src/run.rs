@@ -15,17 +15,13 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, SecondsFormat, Utc};
 use run_engine::CancellationToken;
 #[cfg(not(target_os = "linux"))]
 use run_engine::RunEngine;
 use run_protocol::{
-    Availability, EngineError, ExecutionInterval, FinalEnvironment, ImageDescriptor, Network,
-    OperationError, OperationReport, OperationStage, OperationStatus, ProcessResult, ProgramId,
-    ProgramInput, ProgramOutput, RunControls, RunInput, RunOutput, RuntimeConfig, Secrets,
-    StopActionResult, StopSignal, StreamFacts,
+    EngineError, ImageDescriptor, Network, ProgramId, ProgramInput, RunControls, RunInput,
+    RunOutput, RuntimeConfig, Secrets,
 };
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
@@ -34,8 +30,11 @@ use uuid::{Uuid, Version};
 use crate::image::{ImageSelector, Images};
 use crate::metadata::Metadata;
 use crate::observation::RunObservation;
+use crate::run_record::{CompletionRecord, EngineResultRecord, InputIdentityRecord, InputRecord};
 use crate::state::State;
-use crate::storage::{Database, RunCancellation, StoredRun};
+use crate::storage::{
+    Database, ExecutionOwner, ExecutionPhase, NewRun, RunCancellation, StoredRun,
+};
 
 const MAX_PAGE_SIZE: usize = 100;
 
@@ -91,8 +90,8 @@ pub(crate) struct Runs<'a> {
 
 struct PreparedExecution {
     input: RunInput,
-    input_json: Value,
-    identity: Value,
+    input_record: InputRecord,
+    identity: InputIdentityRecord,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,6 +114,15 @@ pub(crate) struct RunCancelResult {
     cancellation_requested: bool,
     cancellation_requested_at: Option<String>,
     terminal_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RunReconcileResult {
+    schema_version: u32,
+    run_id: String,
+    lifecycle: &'static str,
+    outcome: &'static str,
+    evidence: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,14 +190,16 @@ impl<'a> Runs<'a> {
         let run_id = request.run_id.to_string();
         let engine = native_engine(state)?;
         let accepted_at = Utc::now().to_rfc3339();
-        let created = self.database.run_insert(
-            &run_id,
-            &accepted_at,
-            request.execution.image.catalog_name(),
-            &request.metadata,
-            &prepared.input_json,
-            &prepared.identity,
-        )?;
+        let owner = current_execution_owner()?;
+        let created = self.database.run_insert(&NewRun {
+            run_id: &run_id,
+            accepted_at: &accepted_at,
+            initial_image_name: request.execution.image.catalog_name(),
+            metadata: &request.metadata,
+            input: &prepared.input_record,
+            input_identity: &prepared.identity,
+            owner: &owner,
+        })?;
         if !created {
             let existing = self
                 .database
@@ -227,6 +237,7 @@ impl<'a> Runs<'a> {
             observation.stage("preparing");
             let cancellation = CancellationToken::new();
             let signal = SignalCancellation::install(&cancellation)?;
+            self.database.run_mark_engine_running(&run_id)?;
             let input = prepared.input;
             let (result, cancellation_monitor) = run_persistent_observed(
                 &engine,
@@ -239,13 +250,12 @@ impl<'a> Runs<'a> {
             signal.close()?;
             observation.report_dropped_observation();
             observation.stage("publishing");
-            let completion = json!({
-                "kind": "engine_returned",
-                "result": engine_result_json(result),
-            });
+            let completion = CompletionRecord::engine_returned(result);
             let terminal_at = Utc::now().to_rfc3339();
-            self.database
-                .run_complete(&run_id, &terminal_at, &completion)?;
+            self.database.run_stage_completion(&run_id, &completion)?;
+            if !self.database.run_publish_staged(&run_id, &terminal_at)? {
+                bail!("staged Run completion disappeared before publication");
+            }
             observation.stage("terminal");
             observation.finish();
             cancellation_monitor?;
@@ -297,7 +307,7 @@ impl<'a> Runs<'a> {
         observation.finish();
         Ok(ExecResult {
             schema_version: 1,
-            result: engine_result_json(result),
+            result: serde_json::to_value(EngineResultRecord::from(result))?,
         })
     }
 
@@ -344,7 +354,7 @@ impl<'a> Runs<'a> {
                 capture_final_environment,
             ),
         )?;
-        let input_json = input_json(
+        let input_record = InputRecord::primary(
             &image.manifest,
             &runtime_bytes,
             &stdin,
@@ -352,18 +362,18 @@ impl<'a> Runs<'a> {
             request.execution_timeout_ms,
             request.network,
             capture_final_environment,
-        )?;
-        let identity = input_identity_json(
+        );
+        let identity = InputIdentityRecord::primary(
             &image.manifest,
             runtime.as_json(),
             &stdin,
             &request.secrets,
             request.execution_timeout_ms,
             request.network,
-        )?;
+        );
         Ok(PreparedExecution {
             input,
-            input_json,
+            input_record,
             identity,
         })
     }
@@ -421,7 +431,10 @@ impl<'a> Runs<'a> {
 
     pub(crate) fn list(&self, limit: usize, after: Option<RunId>) -> Result<RunListResult> {
         if !(1..=MAX_PAGE_SIZE).contains(&limit) {
-            bail!("--limit must be between 1 and {MAX_PAGE_SIZE}");
+            return Err(crate::error::invalid_input(
+                anyhow::anyhow!("--limit must be between 1 and {MAX_PAGE_SIZE}"),
+                "run_input",
+            ));
         }
         let after = after.map(|value| value.to_string());
         let mut records = self.database.run_list(limit + 1, after.as_deref())?;
@@ -438,6 +451,170 @@ impl<'a> Runs<'a> {
             next_after,
         })
     }
+
+    pub(crate) fn reconcile(&self, run_id: RunId) -> Result<RunReconcileResult> {
+        let run_id = run_id.to_string();
+        let record = self.database.run_get(&run_id)?.ok_or_else(|| {
+            crate::error::classify(
+                anyhow::anyhow!("Run does not exist: {run_id}"),
+                crate::error::ErrorFacts::before_run(
+                    crate::error::ErrorCategory::NotFound,
+                    "run_lookup",
+                ),
+            )
+        })?;
+        if record.completion.is_some() {
+            return Ok(RunReconcileResult {
+                schema_version: 1,
+                run_id,
+                lifecycle: "terminal",
+                outcome: "already_terminal",
+                evidence: None,
+            });
+        }
+        let Some(journal) = self.database.run_execution(&run_id)? else {
+            return Ok(RunReconcileResult {
+                schema_version: 1,
+                run_id,
+                lifecycle: "accepted",
+                outcome: "evidence_incomplete",
+                evidence: Some("no persistent execution journal exists for this Run".to_owned()),
+            });
+        };
+        if journal.phase == ExecutionPhase::ResultStaged {
+            if journal.completion.is_none() {
+                bail!("staged Run execution has no durable completion: {run_id}");
+            }
+            if !self
+                .database
+                .run_publish_staged(&run_id, &Utc::now().to_rfc3339())?
+            {
+                bail!("staged Run completion disappeared during reconciliation");
+            }
+            return Ok(RunReconcileResult {
+                schema_version: 1,
+                run_id,
+                lifecycle: "terminal",
+                outcome: "published_staged_result",
+                evidence: Some("durably staged Engine result".to_owned()),
+            });
+        }
+        match execution_owner_state(&journal.owner)? {
+            ExecutionOwnerState::Alive => Ok(RunReconcileResult {
+                schema_version: 1,
+                run_id,
+                lifecycle: "accepted",
+                outcome: "coordinator_alive",
+                evidence: Some("boot ID, PID, and process start time match".to_owned()),
+            }),
+            ExecutionOwnerState::Dead(evidence) => {
+                if journal.phase == ExecutionPhase::Accepted {
+                    let evidence = format!(
+                        "{evidence}; execution journal proves the Run Engine call was not begun"
+                    );
+                    let completion = CompletionRecord::interrupted_before_engine_start(
+                        Utc::now().to_rfc3339(),
+                        evidence.clone(),
+                    );
+                    self.database
+                        .run_stage_pre_engine_interruption(&run_id, &completion)?;
+                    if !self
+                        .database
+                        .run_publish_staged(&run_id, &Utc::now().to_rfc3339())?
+                    {
+                        bail!("staged Run interruption disappeared during reconciliation");
+                    }
+                    return Ok(RunReconcileResult {
+                        schema_version: 1,
+                        run_id,
+                        lifecycle: "terminal",
+                        outcome: "published_interrupted",
+                        evidence: Some(evidence),
+                    });
+                }
+                Ok(RunReconcileResult {
+                    schema_version: 1,
+                    run_id,
+                    lifecycle: "accepted",
+                    outcome: "evidence_incomplete",
+                    evidence: Some(format!(
+                        "{evidence}; Engine resource cleanup has not been proved, so interrupted was not published"
+                    )),
+                })
+            }
+        }
+    }
+}
+
+enum ExecutionOwnerState {
+    Alive,
+    Dead(&'static str),
+}
+
+#[cfg(target_os = "linux")]
+fn execution_owner_state(owner: &ExecutionOwner) -> Result<ExecutionOwnerState> {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    if boot_id.trim() != owner.boot_id {
+        return Ok(ExecutionOwnerState::Dead("Linux boot identity changed"));
+    }
+    let pid = u32::try_from(owner.pid).context("stored coordinator PID is invalid")?;
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExecutionOwnerState::Dead("coordinator process is absent"));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let suffix = stat
+        .rfind(") ")
+        .map(|index| &stat[index + 2..])
+        .context("coordinator process identity is malformed")?;
+    let start_ticks = suffix
+        .split_whitespace()
+        .nth(19)
+        .context("coordinator process start time is absent")?
+        .parse::<i64>()?;
+    Ok(if start_ticks == owner.start_ticks {
+        ExecutionOwnerState::Alive
+    } else {
+        ExecutionOwnerState::Dead("coordinator PID was reused")
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execution_owner_state(_owner: &ExecutionOwner) -> Result<ExecutionOwnerState> {
+    bail!("Run reconciliation requires Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn current_execution_owner() -> Result<ExecutionOwner> {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("failed to read Linux boot identity")?
+        .trim()
+        .to_owned();
+    let pid = std::process::id();
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .context("failed to read coordinator process identity")?;
+    let suffix = stat
+        .rfind(") ")
+        .map(|index| &stat[index + 2..])
+        .context("coordinator process identity is malformed")?;
+    let start_ticks = suffix
+        .split_whitespace()
+        .nth(19)
+        .context("coordinator process start time is absent")?
+        .parse::<i64>()
+        .context("coordinator process start time is invalid")?;
+    Ok(ExecutionOwner {
+        boot_id,
+        pid: i64::from(pid),
+        start_ticks,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_execution_owner() -> Result<ExecutionOwner> {
+    bail!("persistent Run execution requires Linux")
 }
 
 fn persistent_observation(
@@ -501,7 +678,7 @@ fn run_persistent_observed(
 
 fn matches_request(
     existing: &StoredRun,
-    identity: &Value,
+    identity: &InputIdentityRecord,
     initial_image_name: Option<&str>,
     metadata: &Metadata,
 ) -> bool {
@@ -573,108 +750,6 @@ impl RunEngine for UnavailableEngine {
     }
 }
 
-fn input_json(
-    image: &oci_spec::image::Descriptor,
-    runtime: &[u8],
-    stdin: &[u8],
-    secrets: &Secrets,
-    timeout: Option<NonZeroU64>,
-    network: Network,
-    capture_final_environment: bool,
-) -> Result<Value> {
-    Ok(json!({
-        "programs": {
-            "primary": {
-                "initial_environment": serde_json::to_value(image)?,
-                "runtime_config": {
-                    "encoding": "base64",
-                    "bytes": BASE64.encode(runtime),
-                },
-                "stdin": {
-                    "encoding": "base64",
-                    "bytes": BASE64.encode(stdin),
-                },
-                "secrets": redacted_secrets(secrets),
-            }
-        },
-        "controls": {
-            "execution_timeout_ms": timeout.map(NonZeroU64::get),
-            "network": network_name(network),
-            "capture_final_environment": capture_final_environment,
-        },
-    }))
-}
-
-fn input_identity_json(
-    image: &oci_spec::image::Descriptor,
-    runtime: &Value,
-    stdin: &[u8],
-    secrets: &Secrets,
-    timeout: Option<NonZeroU64>,
-    network: Network,
-) -> Result<Value> {
-    Ok(json!({
-        "programs": {
-            "primary": {
-                "initial_environment": serde_json::to_value(image)?,
-                "runtime_config": runtime,
-                "stdin": BASE64.encode(stdin),
-                "secrets": secret_identity(secrets),
-            }
-        },
-        "execution_timeout_ms": timeout.map(NonZeroU64::get),
-        "network": network_name(network),
-    }))
-}
-
-fn redacted_secrets(secrets: &Secrets) -> Value {
-    json!({
-        "env": secrets
-            .env()
-            .keys()
-            .map(|name| (name.clone(), json!({"retained": false})))
-            .collect::<serde_json::Map<_, _>>(),
-        "files": secrets
-            .files()
-            .keys()
-            .map(|path| (path.clone(), json!({"retained": false})))
-            .collect::<serde_json::Map<_, _>>(),
-    })
-}
-
-fn secret_identity(secrets: &Secrets) -> Value {
-    json!({
-        "env": secrets
-            .env()
-            .iter()
-            .map(|(name, value)| (name.clone(), Value::String(sha256_digest(value.as_bytes()))))
-            .collect::<serde_json::Map<_, _>>(),
-        "files": secrets
-            .files()
-            .iter()
-            .map(|(path, value)| (path.clone(), Value::String(sha256_digest(value.as_bytes()))))
-            .collect::<serde_json::Map<_, _>>(),
-    })
-}
-
-fn sha256_digest(bytes: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    format!("sha256:{encoded}")
-}
-
-fn network_name(network: Network) -> &'static str {
-    match network {
-        Network::Isolated => "isolated",
-        Network::Egress => "egress",
-    }
-}
-
 fn record_json(record: &StoredRun) -> Value {
     json!({
         "schema_version": 1,
@@ -706,87 +781,16 @@ fn start_result(record: &StoredRun, created: bool) -> Result<RunStartResult> {
         completion: record
             .completion
             .as_ref()
-            .map(completion_summary)
+            .map(CompletionRecord::summary)
             .transpose()?,
     })
-}
-
-fn completion_summary(completion: &Value) -> Result<Value> {
-    let completion_kind = completion
-        .get("kind")
-        .and_then(Value::as_str)
-        .context("persisted Run completion has no kind")?;
-    if completion_kind != "engine_returned" {
-        bail!("persisted Run completion has unsupported kind: {completion_kind}");
-    }
-
-    let result = completion
-        .get("result")
-        .and_then(Value::as_object)
-        .context("persisted engine completion has no result")?;
-    match result.get("kind").and_then(Value::as_str) {
-        Some("output") => output_summary(
-            result
-                .get("output")
-                .context("persisted engine output is missing")?,
-        ),
-        Some("engine_error") => Ok(json!({
-            "kind": "engine_error",
-            "error": result
-                .get("error")
-                .context("persisted EngineError is missing")?,
-        })),
-        Some(kind) => bail!("persisted engine result has unsupported kind: {kind}"),
-        None => bail!("persisted engine result has no kind"),
-    }
-}
-
-fn output_summary(output: &Value) -> Result<Value> {
-    let execution = output
-        .get("execution")
-        .and_then(Value::as_object)
-        .context("persisted RunOutput has no execution facts")?;
-    let programs = output
-        .get("programs")
-        .and_then(Value::as_object)
-        .context("persisted RunOutput has no programs")?;
-    let program_summaries = programs
-        .iter()
-        .map(|(program_id, program)| {
-            let program = program
-                .as_object()
-                .with_context(|| format!("persisted ProgramOutput is invalid: {program_id}"))?;
-            Ok((
-                program_id.clone(),
-                json!({
-                    "process": program
-                        .get("process")
-                        .with_context(|| format!("persisted ProgramOutput has no process facts: {program_id}"))?,
-                    "final_environment": program
-                        .get("final_environment")
-                        .with_context(|| format!("persisted ProgramOutput has no final environment: {program_id}"))?,
-                    "errors": program
-                        .get("errors")
-                        .with_context(|| format!("persisted ProgramOutput has no errors: {program_id}"))?,
-                }),
-            ))
-        })
-        .collect::<Result<serde_json::Map<_, _>>>()?;
-
-    Ok(json!({
-        "kind": "output",
-        "execution": execution,
-        "programs": program_summaries,
-    }))
 }
 
 fn run_summary(record: StoredRun) -> RunSummary {
     let completion = record
         .completion
         .as_ref()
-        .and_then(|value| value.get("result"))
-        .and_then(|value| value.get("kind"))
-        .and_then(Value::as_str)
+        .and_then(CompletionRecord::result_kind)
         .map(str::to_owned);
     RunSummary {
         run_id: record.run_id,
@@ -812,220 +816,6 @@ fn list_timestamp(value: &str) -> String {
                 .to_rfc3339_opts(SecondsFormat::Secs, true)
         },
     )
-}
-
-fn engine_error_json(error: &EngineError) -> Value {
-    let kind = match error {
-        EngineError::InvalidInput { .. } => "invalid_input",
-        EngineError::InputUnavailable { .. } => "input_unavailable",
-        EngineError::UnsupportedInput { .. } => "unsupported_input",
-        EngineError::Internal { .. } => "internal",
-    };
-    json!({
-        "kind": kind,
-        "path": error.path().map(ToString::to_string),
-        "reason": error.reason(),
-    })
-}
-
-fn engine_result_json(result: Result<RunOutput, EngineError>) -> Value {
-    match result {
-        Ok(output) => json!({
-            "kind": "output",
-            "output": output_json(&output),
-        }),
-        Err(error) => json!({
-            "kind": "engine_error",
-            "error": engine_error_json(&error),
-        }),
-    }
-}
-
-fn output_json(output: &RunOutput) -> Value {
-    let programs = output
-        .programs()
-        .iter()
-        .map(|(id, output)| (id.as_str().to_owned(), program_output_json(output)))
-        .collect::<serde_json::Map<_, _>>();
-    json!({
-        "execution": execution_json(output),
-        "programs": programs,
-    })
-}
-
-fn execution_json(output: &RunOutput) -> Value {
-    let execution = output.execution();
-    let interval = match execution.interval() {
-        ExecutionInterval::NotEntered { reason } => json!({
-            "kind": "not_entered",
-            "reason": reason.as_str(),
-        }),
-        ExecutionInterval::Entered {
-            started_at,
-            ended_at,
-        } => json!({
-            "kind": "entered",
-            "started_at": started_at.to_rfc3339(),
-            "ended_at": ended_at.to_rfc3339(),
-        }),
-    };
-    json!({
-        "interval": interval,
-        "timed_out": execution.timed_out(),
-        "cancelled": execution.cancelled(),
-        "errors": execution.errors().map(operation_error_json).collect::<Vec<_>>(),
-    })
-}
-
-fn program_output_json(output: &ProgramOutput) -> Value {
-    json!({
-        "create": report_json(output.create(), |facts| json!({
-            "completed_at": facts.completed_at().to_rfc3339(),
-        })),
-        "start": report_json(output.start(), |facts| json!({
-            "started_at": facts.started_at().to_rfc3339(),
-        })),
-        "process": process_json(output.process()),
-        "stdin": {
-            "write": report_json(output.stdin().write(), |facts| json!({
-                "bytes_written": facts.bytes_written(),
-            })),
-            "close": report_json(output.stdin().close(), |()| Value::Null),
-        },
-        "stdout": report_json(output.stdout(), stream_json),
-        "stderr": report_json(output.stderr(), stream_json),
-        "stop_actions": output.stop_actions().iter().map(|action| json!({
-            "signal": match action.signal() {
-                StopSignal::Term => "term",
-                StopSignal::Kill => "kill",
-            },
-            "attempted_at": action.attempted_at().to_rfc3339(),
-            "result": stop_result_json(action.result()),
-        })).collect::<Vec<_>>(),
-        "final_environment": final_environment_json(output.final_environment()),
-        "errors": output.errors().map(operation_error_json).collect::<Vec<_>>(),
-    })
-}
-
-fn report_json<T>(report: &OperationReport<T>, facts: impl FnOnce(&T) -> Value) -> Value {
-    json!({
-        "status": status_name(report.status()),
-        "facts": report.facts().map(facts),
-        "reason": report.reason(),
-    })
-}
-
-fn status_name(status: OperationStatus) -> &'static str {
-    match status {
-        OperationStatus::NotAttempted => "not_attempted",
-        OperationStatus::Succeeded => "succeeded",
-        OperationStatus::Failed => "failed",
-        OperationStatus::Unknown => "unknown",
-    }
-}
-
-fn stream_json(stream: &StreamFacts) -> Value {
-    json!({
-        "bytes": {
-            "encoding": "base64",
-            "value": BASE64.encode(stream.bytes()),
-        },
-        "omitted_after_limit": stream.omitted_after_limit(),
-        "eof": stream.eof(),
-    })
-}
-
-fn process_json(process: &ProcessResult) -> Value {
-    match process {
-        ProcessResult::NeverStarted { reason } => json!({
-            "kind": "never_started",
-            "reason": reason.as_str(),
-        }),
-        ProcessResult::Exited { code, ended_at } => json!({
-            "kind": "exited",
-            "code": code,
-            "ended_at": ended_at.to_rfc3339(),
-        }),
-        ProcessResult::Signaled { signal, ended_at } => json!({
-            "kind": "signaled",
-            "signal": signal.get(),
-            "ended_at": ended_at.to_rfc3339(),
-        }),
-        ProcessResult::Unknown { reason, ended_at } => json!({
-            "kind": "unknown",
-            "reason": reason.as_str(),
-            "ended_at": availability_json(ended_at, |time| Value::String(time.to_rfc3339())),
-        }),
-    }
-}
-
-fn availability_json<T>(value: &Availability<T>, available: impl FnOnce(&T) -> Value) -> Value {
-    match value {
-        Availability::Available(value) => json!({
-            "availability": "available",
-            "value": available(value),
-        }),
-        Availability::Unavailable(reason) => json!({
-            "availability": "unavailable",
-            "reason": reason.as_str(),
-        }),
-    }
-}
-
-fn final_environment_json(value: &FinalEnvironment) -> Value {
-    match value {
-        FinalEnvironment::NotRequested => json!({
-            "availability": "not_requested",
-        }),
-        FinalEnvironment::Captured(image) => json!({
-            "availability": "available",
-            "value": serde_json::to_value(image.as_oci()).expect("Descriptor serialization"),
-        }),
-        FinalEnvironment::Unavailable(reason) => json!({
-            "availability": "unavailable",
-            "reason": reason.as_str(),
-        }),
-    }
-}
-
-fn stop_result_json(result: &StopActionResult) -> Value {
-    match result {
-        StopActionResult::Accepted => json!({"status": "accepted"}),
-        StopActionResult::Rejected(_) => json!({"status": "rejected"}),
-        StopActionResult::Unknown { reason, .. } => json!({
-            "status": "unknown",
-            "reason": reason.as_str(),
-        }),
-    }
-}
-
-fn operation_error_json(error: &OperationError) -> Value {
-    json!({
-        "observed_at": error.observed_at().to_rfc3339(),
-        "stage": operation_stage_name(error.stage()),
-        "message": error.message(),
-        "code": error.code(),
-    })
-}
-
-fn operation_stage_name(stage: OperationStage) -> &'static str {
-    match stage {
-        OperationStage::Preparation => "preparation",
-        OperationStage::Create => "create",
-        OperationStage::Start => "start",
-        OperationStage::ProcessSupervision => "process_supervision",
-        OperationStage::StdinWrite => "stdin_write",
-        OperationStage::StdinClose => "stdin_close",
-        OperationStage::StdoutRead => "stdout_read",
-        OperationStage::StderrRead => "stderr_read",
-        OperationStage::Signal => "signal",
-        OperationStage::Wait => "wait",
-        OperationStage::RuntimeFilesystemRemoval => "runtime_filesystem_removal",
-        OperationStage::FinalEnvironmentCapture => "final_environment_capture",
-        OperationStage::Cleanup => "cleanup",
-        OperationStage::Coordination => "coordination",
-        OperationStage::Timing => "timing",
-    }
 }
 
 struct SignalCancellation {
@@ -1106,22 +896,21 @@ mod tests {
         )
         .expect("Secrets");
 
-        let record = input_json(&image, b"{}", b"", &first, None, Network::Isolated, true)
-            .expect("record input");
+        let record =
+            InputRecord::primary(&image, b"{}", b"", &first, None, Network::Isolated, true);
         let encoded = serde_json::to_string(&record).expect("record JSON");
         assert!(!encoded.contains("plain-environment-secret"));
         assert!(!encoded.contains("plain-file-secret"));
         assert_eq!(
-            record["programs"]["primary"]["secrets"]["env"]["TOKEN"]["retained"],
+            serde_json::to_value(&record).expect("record value")["programs"]["primary"]["secrets"]
+                ["env"]["TOKEN"]["retained"],
             false
         );
 
         let first_identity =
-            input_identity_json(&image, &json!({}), b"", &first, None, Network::Isolated)
-                .expect("first identity");
+            InputIdentityRecord::primary(&image, &json!({}), b"", &first, None, Network::Isolated);
         let second_identity =
-            input_identity_json(&image, &json!({}), b"", &second, None, Network::Isolated)
-                .expect("second identity");
+            InputIdentityRecord::primary(&image, &json!({}), b"", &second, None, Network::Isolated);
         assert_ne!(first_identity, second_identity);
         let identity = serde_json::to_string(&first_identity).expect("identity JSON");
         assert!(!identity.contains("plain-environment-secret"));
@@ -1132,26 +921,71 @@ mod tests {
     fn start_result_keeps_execution_facts_without_record_payloads() {
         let completion = json!({
             "kind": "engine_returned",
+            "record_version": 1,
             "result": {
                 "kind": "output",
                 "output": {
                     "execution": {
-                        "interval": {"kind": "entered"},
+                        "interval": {
+                            "kind": "entered",
+                            "started_at": "2026-08-27T00:00:00Z",
+                            "ended_at": "2026-08-27T00:00:01Z"
+                        },
                         "timed_out": false,
                         "cancelled": false,
                         "errors": [],
                     },
                     "programs": {
                         "primary": {
-                            "create": {"status": "succeeded"},
-                            "start": {"status": "succeeded"},
-                            "process": {"kind": "exited", "code": 0},
-                            "stdin": {"write": {"status": "succeeded"}},
-                            "stdout": {"facts": {"bytes": {"value": "large-output"}}},
-                            "stderr": {"facts": {"bytes": {"value": "large-error"}}},
+                            "create": {
+                                "status": "succeeded",
+                                "facts": {"completed_at": "2026-08-27T00:00:00Z"},
+                                "reason": null
+                            },
+                            "start": {
+                                "status": "succeeded",
+                                "facts": {"started_at": "2026-08-27T00:00:00Z"},
+                                "reason": null
+                            },
+                            "process": {
+                                "kind": "exited",
+                                "code": 0,
+                                "ended_at": "2026-08-27T00:00:01Z"
+                            },
+                            "stdin": {
+                                "write": {
+                                    "status": "succeeded",
+                                    "facts": {"bytes_written": 0},
+                                    "reason": null
+                                },
+                                "close": {"status": "succeeded", "facts": null, "reason": null}
+                            },
+                            "stdout": {
+                                "status": "succeeded",
+                                "facts": {
+                                    "bytes": {"encoding": "base64", "value": "bGFyZ2Utb3V0cHV0", "byte_length": 12},
+                                    "omitted_after_limit": false,
+                                    "eof": true
+                                },
+                                "reason": null
+                            },
+                            "stderr": {
+                                "status": "succeeded",
+                                "facts": {
+                                    "bytes": {"encoding": "base64", "value": "bGFyZ2UtZXJyb3I=", "byte_length": 11},
+                                    "omitted_after_limit": false,
+                                    "eof": true
+                                },
+                                "reason": null
+                            },
+                            "stop_actions": [],
                             "final_environment": {
                                 "availability": "available",
-                                "value": {"digest": "sha256:final"},
+                                "value": {
+                                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                    "size": 1
+                                }
                             },
                             "errors": [],
                         }
@@ -1164,39 +998,17 @@ mod tests {
         let value = serde_json::to_value(start_result(&record, true).expect("start result"))
             .expect("start result JSON");
 
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["created"], true);
+        assert_eq!(value["lifecycle"], "terminal");
+        assert_eq!(value["completion"]["kind"], "output");
         assert_eq!(
-            value,
-            json!({
-                "schema_version": 1,
-                "created": true,
-                "run_id": "550e8400-e29b-41d4-a716-446655440000",
-                "initial_image_name": "agent-base",
-                "metadata": {
-                    "description": null,
-                    "labels": {},
-                },
-                "lifecycle": "terminal",
-                "cancellation_requested_at": null,
-                "completion": {
-                    "kind": "output",
-                    "execution": {
-                        "interval": {"kind": "entered"},
-                        "timed_out": false,
-                        "cancelled": false,
-                        "errors": [],
-                    },
-                    "programs": {
-                        "primary": {
-                            "process": {"kind": "exited", "code": 0},
-                            "final_environment": {
-                                "availability": "available",
-                                "value": {"digest": "sha256:final"},
-                            },
-                            "errors": [],
-                        }
-                    }
-                }
-            })
+            value["completion"]["programs"]["primary"]["process"]["code"],
+            0
+        );
+        assert_eq!(
+            value["completion"]["programs"]["primary"]["final_environment"]["availability"],
+            "available"
         );
         let encoded = serde_json::to_string(&value).expect("encoded start result");
         assert!(!encoded.contains("large-output"));
@@ -1208,6 +1020,7 @@ mod tests {
     fn start_result_summarizes_engine_error_and_idempotent_retry() {
         let completion = json!({
             "kind": "engine_returned",
+            "record_version": 1,
             "result": {
                 "kind": "engine_error",
                 "error": {
@@ -1243,9 +1056,10 @@ mod tests {
     #[test]
     fn idempotent_request_requires_the_same_metadata() {
         let existing = stored_run(None);
+        let identity = existing.input_identity.clone();
         assert!(matches_request(
             &existing,
-            &json!({}),
+            &identity,
             Some("agent-base"),
             &Metadata::default()
         ));
@@ -1256,31 +1070,54 @@ mod tests {
         .expect("metadata");
         assert!(!matches_request(
             &existing,
-            &json!({}),
+            &identity,
             Some("agent-base"),
             &changed
         ));
         assert!(!matches_request(
             &existing,
-            &json!({}),
+            &identity,
             Some("renamed"),
             &Metadata::default()
         ));
     }
 
     fn stored_run(completion: Option<Value>) -> StoredRun {
+        let image: oci_spec::image::Descriptor = serde_json::from_value(json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1
+        }))
+        .expect("descriptor");
+        let secrets = Secrets::default();
         StoredRun {
             run_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
             accepted_at: "2026-08-27T00:00:00Z".to_owned(),
             initial_image_name: Some("agent-base".to_owned()),
             metadata: Metadata::default(),
-            input: json!({"stdin": "input-payload"}),
-            input_identity: json!({}),
+            input: InputRecord::primary(
+                &image,
+                b"{}",
+                b"input-payload",
+                &secrets,
+                None,
+                Network::Isolated,
+                true,
+            ),
+            input_identity: InputIdentityRecord::primary(
+                &image,
+                &json!({}),
+                b"input-payload",
+                &secrets,
+                None,
+                Network::Isolated,
+            ),
             cancellation_requested_at: None,
             terminal_at: completion
                 .as_ref()
                 .map(|_| "2026-08-27T00:00:01Z".to_owned()),
-            completion,
+            completion: completion
+                .map(|value| serde_json::from_value(value).expect("typed completion fixture")),
         }
     }
 }

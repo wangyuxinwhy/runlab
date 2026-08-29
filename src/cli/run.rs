@@ -52,6 +52,11 @@ pub(super) enum RunCommand {
         /// Canonical lowercase UUID v4 of the Run to cancel.
         run_id: RunId,
     },
+    /// Reconcile one non-terminal Run from durable execution evidence.
+    Reconcile {
+        /// Canonical lowercase UUID v4 of the Run to reconcile.
+        run_id: RunId,
+    },
     /// Read one complete Run record, including caller-provided metadata, by identity.
     Get {
         /// Canonical lowercase UUID v4 assigned when the Run was started.
@@ -331,6 +336,7 @@ pub(super) fn execute(state_path: &Path, command: RunCommand) -> Result<u8> {
             emit(&result)?;
         }
         RunCommand::Cancel { run_id } => emit(&runs.cancel(run_id)?)?,
+        RunCommand::Reconcile { run_id } => emit(&runs.reconcile(run_id)?)?,
         RunCommand::Get { run_id } => emit(&runs.get(run_id)?)?,
         RunCommand::List { limit, after } => emit(&runs.list(limit, after)?)?,
     }
@@ -384,6 +390,7 @@ pub(super) fn execute_managed(command: RunCommand) -> Result<u8> {
             })?
         }
         RunCommand::Cancel { run_id } => vm.forward_run_cancel(&run_id.to_string())?,
+        RunCommand::Reconcile { run_id } => vm.forward_run_reconcile(&run_id.to_string())?,
         RunCommand::Get { run_id } => vm.forward_run_get(&run_id.to_string())?,
         RunCommand::List { limit, after } => {
             let after = after.map(|value| value.to_string());

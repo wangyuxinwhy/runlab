@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rusqlite::Connection;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::ValueRef;
@@ -32,7 +32,10 @@ pub(crate) fn run(
     timeout: Duration,
 ) -> Result<QueryReport> {
     if sql.trim().is_empty() {
-        bail!("SQL must not be empty");
+        return Err(crate::error::invalid_input(
+            anyhow::anyhow!("SQL must not be empty"),
+            "query_input",
+        ));
     }
     database.with_connection(|connection| {
         let started = Instant::now();
@@ -93,9 +96,14 @@ fn execute_query(
     max_output_bytes: usize,
     executing: &AtomicBool,
 ) -> Result<QueryReport> {
-    let mut statement = connection.prepare(sql)?;
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| crate::error::invalid_input(anyhow::Error::from(error), "query_input"))?;
     if !statement.readonly() {
-        bail!("only read-only SQL against public Relations is allowed");
+        return Err(crate::error::invalid_input(
+            anyhow::anyhow!("only read-only SQL against public Relations is allowed"),
+            "query_input",
+        ));
     }
     let columns = statement
         .column_names()
@@ -103,7 +111,10 @@ fn execute_query(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() {
-        bail!("query output has duplicate column names; use SQL aliases");
+        return Err(crate::error::invalid_input(
+            anyhow::anyhow!("query output has duplicate column names; use SQL aliases"),
+            "query_input",
+        ));
     }
 
     executing.store(true, Ordering::Relaxed);
@@ -248,30 +259,60 @@ fn is_interrupted(error: &anyhow::Error) -> bool {
 mod tests {
     use std::time::Duration;
 
+    use run_protocol::{EngineError, Network, Secrets};
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::run;
+    use crate::run_record::{CompletionRecord, InputIdentityRecord, InputRecord};
     use crate::storage::Database;
 
     fn database() -> Database {
         let directory = tempdir().expect("temporary directory");
         let path = directory.keep().join("runlab.sqlite3");
         let database = Database::open(&path).expect("database");
+        let descriptor = serde_json::from_value(json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1
+        }))
+        .expect("descriptor");
+        let input = InputRecord::primary(
+            &descriptor,
+            b"{}",
+            b"",
+            &Secrets::empty(),
+            None,
+            Network::Isolated,
+            true,
+        );
+        let identity = InputIdentityRecord::primary(
+            &descriptor,
+            &json!({}),
+            b"",
+            &Secrets::empty(),
+            None,
+            Network::Isolated,
+        );
+        let completion = CompletionRecord::engine_returned(Err(EngineError::internal(
+            "query fixture EngineError",
+        )));
         database
             .with_connection(|connection| {
                 connection.execute(
                     "INSERT INTO main.runs(
                         run_id, accepted_at, initial_image_name, metadata_json,
                         input_json, input_identity_json, terminal_at, completion_json
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![
                         "550e8400-e29b-41d4-a716-446655440000",
                         "2026-08-28T01:02:03.123456789Z",
                         "pi",
                         r#"{"description":"task","labels":{"suite":"swe-bench"}}"#,
-                        r#"{"programs":{"primary":{"initial_environment":{"digest":"sha256:abc"}}}}"#,
+                        serde_json::to_string(&input)?,
+                        serde_json::to_string(&identity)?,
                         "2026-08-28T01:02:04.123456789Z",
-                        r#"{"kind":"engine_returned","result":{"kind":"output","output":{"execution":{"timed_out":false,"cancelled":false},"programs":{"primary":{"process":{"kind":"exited","code":0}}}}}}"#,
+                        serde_json::to_string(&completion)?,
                     ],
                 )?;
                 Ok(())
@@ -295,15 +336,18 @@ mod tests {
         };
         let report = execute(
             "SELECT run_id, initial_image_name, initial_image_digest, description, \
-                    json_extract(labels, '$.suite') AS suite, primary_exit_code \
+                    json_extract(labels, '$.suite') AS suite, completion_kind \
              FROM runs",
         )
         .expect("public query");
         assert_eq!(report.returned, 1);
         assert_eq!(report.rows[0]["initial_image_name"], "pi");
-        assert_eq!(report.rows[0]["initial_image_digest"], "sha256:abc");
+        assert_eq!(
+            report.rows[0]["initial_image_digest"],
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(report.rows[0]["suite"], "swe-bench");
-        assert_eq!(report.rows[0]["primary_exit_code"], 0);
+        assert_eq!(report.rows[0]["completion_kind"], "engine_error");
 
         let count = execute("SELECT COUNT(*) AS run_count FROM runs").expect("public count");
         assert_eq!(count.rows[0]["run_count"], 1);

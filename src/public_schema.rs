@@ -14,7 +14,10 @@ SELECT
     json_extract(metadata_json, '$.labels') AS labels,
     CASE WHEN completion_json IS NULL THEN 'accepted' ELSE 'terminal' END AS lifecycle,
     terminal_at,
-    json_extract(completion_json, '$.result.kind') AS completion_kind,
+    CASE json_extract(completion_json, '$.kind')
+        WHEN 'interrupted' THEN 'interrupted'
+        ELSE json_extract(completion_json, '$.result.kind')
+    END AS completion_kind,
     json_extract(completion_json, '$.result.output.programs.primary.process.kind')
         AS primary_process_kind,
     json_extract(completion_json, '$.result.output.programs.primary.process.code')
@@ -37,26 +40,10 @@ SELECT
         unixepoch(terminal_at, 'subsec')
         - unixepoch(json_extract(completion_json, '$.result.output.programs.primary.process.ended_at'), 'subsec')
     ) * 1000.0, 3) AS primary_end_to_terminal_ms
-    ,CASE
-        WHEN json_extract(completion_json, '$.result.output.programs.primary.stdout.status') = 'succeeded'
-        THEN (length(json_extract(completion_json, '$.result.output.programs.primary.stdout.facts.bytes.value')) * 3 / 4)
-            - CASE
-                WHEN json_extract(completion_json, '$.result.output.programs.primary.stdout.facts.bytes.value') LIKE '%==' THEN 2
-                WHEN json_extract(completion_json, '$.result.output.programs.primary.stdout.facts.bytes.value') LIKE '%=' THEN 1
-                ELSE 0
-              END
-        ELSE NULL
-     END AS primary_stdout_bytes
-    ,CASE
-        WHEN json_extract(completion_json, '$.result.output.programs.primary.stderr.status') = 'succeeded'
-        THEN (length(json_extract(completion_json, '$.result.output.programs.primary.stderr.facts.bytes.value')) * 3 / 4)
-            - CASE
-                WHEN json_extract(completion_json, '$.result.output.programs.primary.stderr.facts.bytes.value') LIKE '%==' THEN 2
-                WHEN json_extract(completion_json, '$.result.output.programs.primary.stderr.facts.bytes.value') LIKE '%=' THEN 1
-                ELSE 0
-              END
-        ELSE NULL
-     END AS primary_stderr_bytes
+    ,json_extract(completion_json, '$.result.output.programs.primary.stdout.facts.bytes.byte_length')
+        AS primary_stdout_bytes
+    ,json_extract(completion_json, '$.result.output.programs.primary.stderr.facts.bytes.byte_length')
+        AS primary_stderr_bytes
     ,json_extract(completion_json, '$.result.output.programs.primary.final_environment.value.digest')
         AS primary_final_image_digest
 FROM main.runs;
@@ -123,7 +110,7 @@ const COLUMNS: &[Column] = &[
         name: "completion_kind",
         data_type: "TEXT",
         nullable: true,
-        description: "Engine result kind: output or engine_error.",
+        description: "Completion kind: output, engine_error, or interrupted.",
     },
     Column {
         name: "primary_process_kind",
