@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use oci_spec::image::Descriptor;
 use serde::Serialize;
 use serde_json::Value;
@@ -57,10 +57,44 @@ enum ExtractedNode {
     Symlink { target: String },
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct FilesystemChangesResult {
+    schema_version: u32,
+    run_id: String,
+    program: String,
+    initial_image: Descriptor,
+    final_image: Descriptor,
+    changes: Vec<FilesystemChange>,
+    next_after: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FilesystemChange {
+    path: String,
+    change: &'static str,
+    node_type: &'static str,
+    size: Option<u64>,
+    subtree: bool,
+}
+
+#[derive(Clone)]
+struct NodeSummary {
+    node_type: &'static str,
+    size: Option<u64>,
+}
+
+#[derive(Default)]
+struct ChangeCandidate {
+    final_node: Option<NodeSummary>,
+    subtree: bool,
+}
+
+#[derive(Clone)]
 enum ResolvedNode {
     File(Vec<u8>),
     Directory,
     Symlink(PathBuf),
+    HardLink(PathBuf),
     Unsupported(&'static str),
 }
 
@@ -83,8 +117,15 @@ impl<'a> Filesystems<'a> {
     ) -> Result<FilesystemGetResult> {
         let target = normalize_absolute_path(path)?;
         let (image, source) = self.resolve_source(source)?;
-        let node = resolve_node(&image, &target)?
-            .with_context(|| format!("Filesystem path does not exist: {path}"))?;
+        let node = resolve_node(&image, &target)?.ok_or_else(|| {
+            crate::error::classify(
+                anyhow::anyhow!("Filesystem path does not exist: {path}"),
+                crate::error::ErrorFacts::before_run(
+                    crate::error::ErrorCategory::NotFound,
+                    "filesystem_resolution",
+                ),
+            )
+        })?;
         let output = new_output_path(output)?;
         let extracted = match node {
             ResolvedNode::File(bytes) => {
@@ -106,6 +147,7 @@ impl<'a> Filesystems<'a> {
                 write_symlink(&output, Path::new(&target))?;
                 ExtractedNode::Symlink { target }
             }
+            ResolvedNode::HardLink(_) => unreachable!("hard links are resolved to file content"),
             ResolvedNode::Unsupported(kind) => {
                 bail!("Filesystem path has unsupported node type {kind}: {path}")
             }
@@ -119,6 +161,53 @@ impl<'a> Filesystems<'a> {
                 .context("output path is not valid UTF-8")?
                 .to_owned(),
             node: extracted,
+        })
+    }
+
+    pub(crate) fn changes(
+        &self,
+        run_id: RunId,
+        program: String,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<FilesystemChangesResult> {
+        if !(1..=1000).contains(&limit) {
+            bail!("--limit must be between 1 and 1000");
+        }
+        let after = after.map(normalize_absolute_path).transpose()?;
+        let run_id = run_id.to_string();
+        let record = self.database.run_get(&run_id)?.ok_or_else(|| {
+            crate::error::classify(
+                anyhow::anyhow!("Run does not exist: {run_id}"),
+                crate::error::ErrorFacts::before_run(
+                    crate::error::ErrorCategory::NotFound,
+                    "run_lookup",
+                ),
+            )
+        })?;
+        let initial_image = initial_environment(&record, &program)?;
+        let final_image = final_environment(&record, &program)?;
+        let initial = self
+            .images
+            .filesystem_from_manifest(initial_image.clone())?;
+        let final_filesystem = self.images.filesystem_from_manifest(final_image.clone())?;
+        let mut changes = derive_changes(&initial, &final_filesystem)?;
+        if let Some(after) = after {
+            changes
+                .retain(|change| Path::new(change.path.trim_start_matches('/')) > after.as_path());
+        }
+        let next_after = (changes.len() > limit)
+            .then(|| changes.get(limit - 1).map(|change| change.path.clone()))
+            .flatten();
+        changes.truncate(limit);
+        Ok(FilesystemChangesResult {
+            schema_version: 1,
+            run_id,
+            program,
+            initial_image,
+            final_image,
+            changes,
+            next_after,
         })
     }
 
@@ -138,10 +227,15 @@ impl<'a> Filesystems<'a> {
             }
             FilesystemSource::Run { run_id, program } => {
                 let run_id = run_id.to_string();
-                let record = self
-                    .database
-                    .run_get(&run_id)?
-                    .with_context(|| format!("Run does not exist: {run_id}"))?;
+                let record = self.database.run_get(&run_id)?.ok_or_else(|| {
+                    crate::error::classify(
+                        anyhow::anyhow!("Run does not exist: {run_id}"),
+                        crate::error::ErrorFacts::before_run(
+                            crate::error::ErrorCategory::NotFound,
+                            "run_lookup",
+                        ),
+                    )
+                })?;
                 let manifest = final_environment(&record, &program)?;
                 let image = self.images.filesystem_from_manifest(manifest.clone())?;
                 let resolved = ResolvedSource::Run {
@@ -155,7 +249,20 @@ impl<'a> Filesystems<'a> {
     }
 }
 
-fn final_environment(record: &StoredRun, program: &str) -> Result<Descriptor> {
+fn initial_environment(record: &StoredRun, program: &str) -> Result<Descriptor> {
+    serde_json::from_value(
+        record
+            .input
+            .get("programs")
+            .and_then(|programs| programs.get(program))
+            .and_then(|program| program.get("initial_environment"))
+            .with_context(|| format!("Run Program does not exist: {program}"))?
+            .clone(),
+    )
+    .context("stored initial_environment descriptor is invalid")
+}
+
+pub(crate) fn final_environment(record: &StoredRun, program: &str) -> Result<Descriptor> {
     let completion = record
         .completion
         .as_ref()
@@ -196,10 +303,218 @@ fn final_environment(record: &StoredRun, program: &str) -> Result<Descriptor> {
     }
 }
 
+fn derive_changes(
+    initial: &ImageFilesystem,
+    final_filesystem: &ImageFilesystem,
+) -> Result<Vec<FilesystemChange>> {
+    ensure_layer_prefix(initial, final_filesystem)?;
+    let mut candidates = BTreeMap::new();
+    for layer in &final_filesystem.layers[initial.layers.len()..] {
+        let bytes = final_filesystem.read_layer(layer)?;
+        apply_change_layer(layer, &bytes, &mut candidates)?;
+    }
+    let mut initial_nodes = candidates
+        .keys()
+        .cloned()
+        .map(|path| (path, None))
+        .collect::<BTreeMap<_, _>>();
+    for layer in &initial.layers {
+        let bytes = initial.read_layer(layer)?;
+        apply_initial_layer(layer, &bytes, &mut initial_nodes)?;
+    }
+    for (path, candidate) in &mut candidates {
+        if candidate
+            .final_node
+            .as_ref()
+            .is_some_and(|node| node.node_type == "file" && node.size.is_none())
+            && let Some(ResolvedNode::File(bytes)) = resolve_node(final_filesystem, path)?
+        {
+            candidate.final_node = Some(NodeSummary {
+                node_type: "file",
+                size: Some(u64::try_from(bytes.len()).context("file size overflow")?),
+            });
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .filter_map(|(path, candidate)| {
+            let initial = initial_nodes.remove(&path).flatten();
+            let (change, node) = match (initial, candidate.final_node) {
+                (None, None) => return None,
+                (None, Some(node)) => ("added", node),
+                (Some(node), None) => ("deleted", node),
+                (Some(_), Some(node)) => ("modified", node),
+            };
+            Some(FilesystemChange {
+                path: absolute_image_path(&path),
+                change,
+                node_type: node.node_type,
+                size: node.size,
+                subtree: candidate.subtree,
+            })
+        })
+        .collect())
+}
+
+fn ensure_layer_prefix(
+    initial: &ImageFilesystem,
+    final_filesystem: &ImageFilesystem,
+) -> Result<()> {
+    ensure!(
+        final_filesystem.layers.starts_with(&initial.layers),
+        "Final Environment does not extend the Run's Initial Image layer chain"
+    );
+    Ok(())
+}
+
+fn apply_change_layer(
+    descriptor: &Descriptor,
+    bytes: &[u8],
+    candidates: &mut BTreeMap<PathBuf, ChangeCandidate>,
+) -> Result<()> {
+    let reader = layer_reader(descriptor, bytes)?;
+    let mut archive = tar::Archive::new(reader);
+    for entry in archive
+        .entries()
+        .context("failed to read Final Image Layer tar")?
+    {
+        let entry = entry.context("failed to read Final Image Layer entry")?;
+        let path = normalize_layer_path(&entry.path()?)?;
+        if let Some(removed) = whiteout_target(&path) {
+            candidates
+                .retain(|candidate, _| candidate != &removed && !candidate.starts_with(&removed));
+            candidates.insert(removed, ChangeCandidate::default());
+        } else if is_opaque_whiteout(&path) {
+            let directory = path
+                .parent()
+                .context("opaque whiteout has no parent")?
+                .to_owned();
+            candidates.retain(|candidate, _| {
+                candidate == &directory || !candidate.starts_with(&directory)
+            });
+            candidates.entry(directory).or_default().subtree = true;
+        } else {
+            for (candidate_path, candidate) in candidates.iter_mut() {
+                if path.starts_with(candidate_path) && path != *candidate_path {
+                    candidate.final_node = Some(NodeSummary {
+                        node_type: "directory",
+                        size: None,
+                    });
+                }
+            }
+            let subtree = candidates
+                .get(&path)
+                .is_some_and(|candidate| candidate.subtree);
+            candidates.insert(
+                path,
+                ChangeCandidate {
+                    final_node: Some(summary_from_entry(&entry)?),
+                    subtree,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn apply_initial_layer(
+    descriptor: &Descriptor,
+    bytes: &[u8],
+    nodes: &mut BTreeMap<PathBuf, Option<NodeSummary>>,
+) -> Result<()> {
+    let reader = layer_reader(descriptor, bytes)?;
+    let mut archive = tar::Archive::new(reader);
+    for entry in archive
+        .entries()
+        .context("failed to read Initial Image Layer tar")?
+    {
+        let entry = entry.context("failed to read Initial Image Layer entry")?;
+        let path = normalize_layer_path(&entry.path()?)?;
+        if let Some(removed) = whiteout_target(&path) {
+            clear_subtree(nodes, &removed, true);
+        } else if is_opaque_whiteout(&path) {
+            let directory = path.parent().context("opaque whiteout has no parent")?;
+            clear_subtree(nodes, directory, false);
+        } else {
+            let summary = summary_from_entry(&entry)?;
+            if let Some(node) = nodes.get_mut(&path) {
+                *node = Some(summary.clone());
+            }
+            if summary.node_type != "directory" {
+                clear_subtree(nodes, &path, false);
+            }
+            for (candidate, node) in nodes.iter_mut() {
+                if path.starts_with(candidate) && path != *candidate {
+                    *node = Some(NodeSummary {
+                        node_type: "directory",
+                        size: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clear_subtree(
+    nodes: &mut BTreeMap<PathBuf, Option<NodeSummary>>,
+    root: &Path,
+    include_root: bool,
+) {
+    for (path, node) in nodes {
+        if (include_root && path == root) || (path != root && path.starts_with(root)) {
+            *node = None;
+        }
+    }
+}
+
+fn summary_from_entry(entry: &tar::Entry<'_, Box<dyn Read + '_>>) -> Result<NodeSummary> {
+    let entry_type = entry.header().entry_type();
+    let (node_type, size) = if entry_type.is_file() {
+        ("file", Some(entry.header().size()?))
+    } else if entry_type.is_hard_link() {
+        ("file", None)
+    } else if entry_type.is_dir() {
+        ("directory", None)
+    } else if entry_type.is_symlink() {
+        ("symlink", None)
+    } else {
+        ("special", None)
+    };
+    Ok(NodeSummary { node_type, size })
+}
+
+fn absolute_image_path(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", path.display())
+    }
+}
+
 fn resolve_node(image: &ImageFilesystem, target: &Path) -> Result<Option<ResolvedNode>> {
-    for layer in image.layers.iter().rev() {
+    let Some(last_layer) = image.layers.len().checked_sub(1) else {
+        return Ok(None);
+    };
+    resolve_node_in_layers(image, target, last_layer, &mut Vec::new())
+}
+
+fn resolve_node_in_layers(
+    image: &ImageFilesystem,
+    target: &Path,
+    last_layer: usize,
+    followed: &mut Vec<PathBuf>,
+) -> Result<Option<ResolvedNode>> {
+    if followed.iter().any(|path| path == target) {
+        bail!("Filesystem hard link cycle includes /{}", target.display());
+    }
+    followed.push(target.to_owned());
+    for (layer_index, layer) in image.layers[..=last_layer].iter().enumerate().rev() {
         let bytes = image.read_layer(layer)?;
         match inspect_layer(layer, &bytes, target)? {
+            Some(LayerDecision::Node(ResolvedNode::HardLink(link))) => {
+                return resolve_node_in_layers(image, &link, layer_index, followed);
+            }
             Some(LayerDecision::Node(node)) => return Ok(Some(node)),
             Some(LayerDecision::Removed) => return Ok(None),
             Some(LayerDecision::Blocked) => {
@@ -277,7 +592,8 @@ fn node_from_entry(entry: &mut tar::Entry<'_, Box<dyn Read + '_>>) -> Result<Res
             .into_owned();
         Ok(ResolvedNode::Symlink(target))
     } else if entry_type.is_hard_link() {
-        Ok(ResolvedNode::Unsupported("hard_link"))
+        let target = entry.link_name()?.context("OCI hard link has no target")?;
+        Ok(ResolvedNode::HardLink(normalize_layer_path(&target)?))
     } else {
         Ok(ResolvedNode::Unsupported("special"))
     }
@@ -351,11 +667,56 @@ fn apply_layer_to_tree(
             replace_tree_node(tree, relative.to_owned(), ResolvedNode::Directory);
         }
     }
+    let mut hard_links = Vec::new();
     for change in changes {
         match change {
+            TreeChange::Node(path, ResolvedNode::HardLink(target)) => {
+                hard_links.push((path, target));
+            }
             TreeChange::Node(path, node) => replace_tree_node(tree, path, node),
             TreeChange::BlocksTarget => tree.clear(),
         }
+    }
+    resolve_tree_hardlinks(tree, target, hard_links)?;
+    Ok(())
+}
+
+fn resolve_tree_hardlinks(
+    tree: &mut BTreeMap<PathBuf, ResolvedNode>,
+    selected_root: &Path,
+    mut pending: Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
+    while !pending.is_empty() {
+        let mut unresolved = Vec::new();
+        let mut progress = false;
+        for (path, target) in pending {
+            let relative_target = target.strip_prefix(selected_root).with_context(|| {
+                format!(
+                    "Filesystem directory hard link /{} points outside the selected directory",
+                    path.display()
+                )
+            })?;
+            match tree.get(relative_target).cloned() {
+                Some(ResolvedNode::File(bytes)) => {
+                    replace_tree_node(tree, path, ResolvedNode::File(bytes));
+                    progress = true;
+                }
+                Some(ResolvedNode::HardLink(_)) | None => unresolved.push((path, target)),
+                Some(_) => bail!(
+                    "Filesystem hard link target is not a regular file: /{}",
+                    target.display()
+                ),
+            }
+        }
+        if !progress {
+            let (path, target) = &unresolved[0];
+            bail!(
+                "Filesystem hard link cannot be resolved: /{} -> /{}",
+                path.display(),
+                target.display()
+            );
+        }
+        pending = unresolved;
     }
     Ok(())
 }
@@ -403,6 +764,9 @@ fn write_tree(output: &Path, tree: BTreeMap<PathBuf, ResolvedNode>) -> Result<()
                 ResolvedNode::File(bytes) => write_file(&destination, &bytes)?,
                 ResolvedNode::Directory => fs::create_dir(&destination)?,
                 ResolvedNode::Symlink(target) => create_symlink(&target, &destination)?,
+                ResolvedNode::HardLink(_) => {
+                    unreachable!("directory hard links are resolved before publication")
+                }
                 ResolvedNode::Unsupported(kind) => {
                     bail!("Filesystem directory contains an unsupported {kind} node")
                 }

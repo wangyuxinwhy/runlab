@@ -210,6 +210,7 @@ impl VerifiedContent {
 pub(crate) struct VerifiedLayer {
     descriptor: Descriptor,
     diff_id: Digest,
+    uncompressed_size: u64,
 }
 
 impl VerifiedLayer {
@@ -219,6 +220,107 @@ impl VerifiedLayer {
 
     pub(crate) fn diff_id(&self) -> &Digest {
         &self.diff_id
+    }
+
+    pub(crate) const fn uncompressed_size(&self) -> u64 {
+        self.uncompressed_size
+    }
+}
+
+/// Manifest and Config facts whose Layer bytes have not yet been revalidated.
+#[derive(Clone, Debug)]
+pub(crate) struct ImagePlan {
+    manifest: VerifiedContent,
+    manifest_value: Value,
+    config: VerifiedContent,
+    config_value: Value,
+    platform: Platform,
+    layers: Vec<(Descriptor, Digest)>,
+    total_compressed_layer_bytes: u64,
+}
+
+impl ImagePlan {
+    pub(crate) fn layers(&self) -> impl ExactSizeIterator<Item = (&Descriptor, &Digest)> {
+        self.layers
+            .iter()
+            .map(|(descriptor, diff_id)| (descriptor, diff_id))
+    }
+
+    pub(crate) fn verified_from_snapshot(
+        self,
+        uncompressed_sizes: Vec<u64>,
+    ) -> Result<VerifiedImage, OciError> {
+        if uncompressed_sizes.len() != self.layers.len() {
+            return Err(image_error(
+                "snapshot.layers",
+                "cached validation does not match the Image Layer count",
+            ));
+        }
+        let total_uncompressed_layer_bytes = uncompressed_sizes
+            .iter()
+            .try_fold(0_u64, |total, size| total.checked_add(*size))
+            .ok_or_else(|| image_error("snapshot.layers", "uncompressed size overflow"))?;
+        if total_uncompressed_layer_bytes > IMAGE_LIMITS.uncompressed_layer_bytes {
+            return Err(OciError::LayerLimit {
+                path: "snapshot.layers".to_owned(),
+                limit: IMAGE_LIMITS.uncompressed_layer_bytes,
+                actual: total_uncompressed_layer_bytes,
+            });
+        }
+        Ok(self.finish(uncompressed_sizes, total_uncompressed_layer_bytes))
+    }
+
+    fn verify(
+        self,
+        store: &dyn OciContentStore,
+        limits: ImageLimits,
+    ) -> Result<VerifiedImage, OciError> {
+        let mut sizes = Vec::with_capacity(self.layers.len());
+        let mut total_uncompressed = 0_u64;
+        for (index, (descriptor, expected_diff_id)) in self.layers.iter().enumerate() {
+            let path = format!("manifest.layers[{index}]");
+            let remaining = limits
+                .uncompressed_layer_bytes
+                .checked_sub(total_uncompressed)
+                .expect("accounted Layer bytes never exceed the limit");
+            let uncompressed = verify_layer(store, descriptor, expected_diff_id, &path, remaining)?;
+            total_uncompressed = total_uncompressed
+                .checked_add(uncompressed)
+                .ok_or_else(|| image_error("manifest.layers", "uncompressed size overflow"))?;
+            sizes.push(uncompressed);
+        }
+        Ok(self.finish(sizes, total_uncompressed))
+    }
+
+    fn finish(self, sizes: Vec<u64>, total_uncompressed_layer_bytes: u64) -> VerifiedImage {
+        #[cfg(test)]
+        let diff_ids = self
+            .layers
+            .iter()
+            .map(|(_, diff_id)| diff_id.clone())
+            .collect();
+        let layers = self
+            .layers
+            .into_iter()
+            .zip(sizes)
+            .map(|((descriptor, diff_id), uncompressed_size)| VerifiedLayer {
+                descriptor,
+                diff_id,
+                uncompressed_size,
+            })
+            .collect();
+        VerifiedImage {
+            manifest: self.manifest,
+            manifest_value: self.manifest_value,
+            config: self.config,
+            config_value: self.config_value,
+            platform: self.platform,
+            layers,
+            #[cfg(test)]
+            diff_ids,
+            total_compressed_layer_bytes: self.total_compressed_layer_bytes,
+            total_uncompressed_layer_bytes,
+        }
     }
 }
 
@@ -274,6 +376,21 @@ fn inspect_image_with_limits(
     image: &ImageDescriptor,
     limits: ImageLimits,
 ) -> Result<VerifiedImage, OciError> {
+    inspect_image_plan_with_limits(store, image, limits)?.verify(store, limits)
+}
+
+pub(crate) fn inspect_image_plan(
+    store: &dyn OciContentStore,
+    image: &ImageDescriptor,
+) -> Result<ImagePlan, OciError> {
+    inspect_image_plan_with_limits(store, image, IMAGE_LIMITS)
+}
+
+fn inspect_image_plan_with_limits(
+    store: &dyn OciContentStore,
+    image: &ImageDescriptor,
+    limits: ImageLimits,
+) -> Result<ImagePlan, OciError> {
     let manifest = read_small_verified(
         store,
         image.as_oci(),
@@ -309,37 +426,20 @@ fn inspect_image_with_limits(
 
     let total_compressed = preflight_layers(manifest_view.layers(), limits)?;
 
-    let mut layers = Vec::with_capacity(manifest_view.layers().len());
-    let mut total_uncompressed = 0_u64;
-    for (index, (descriptor, expected_diff_id)) in
-        manifest_view.layers().iter().zip(&diff_ids).enumerate()
-    {
-        let path = format!("manifest.layers[{index}]");
-        let remaining = limits
-            .uncompressed_layer_bytes
-            .checked_sub(total_uncompressed)
-            .expect("accounted Layer bytes never exceed the limit");
-        let uncompressed = verify_layer(store, descriptor, expected_diff_id, &path, remaining)?;
-        total_uncompressed = total_uncompressed
-            .checked_add(uncompressed)
-            .ok_or_else(|| image_error("manifest.layers", "uncompressed size overflow"))?;
-        layers.push(VerifiedLayer {
-            descriptor: descriptor.clone(),
-            diff_id: expected_diff_id.clone(),
-        });
-    }
-
-    Ok(VerifiedImage {
+    let layers = manifest_view
+        .layers()
+        .iter()
+        .cloned()
+        .zip(diff_ids.iter().cloned())
+        .collect();
+    Ok(ImagePlan {
         manifest,
         manifest_value,
         config,
         config_value,
         platform,
         layers,
-        #[cfg(test)]
-        diff_ids,
         total_compressed_layer_bytes: total_compressed,
-        total_uncompressed_layer_bytes: total_uncompressed,
     })
 }
 
@@ -355,9 +455,19 @@ pub(crate) fn publish_final_image(
     parent: &ImageDescriptor,
     added_layer: Option<(Descriptor, Digest)>,
 ) -> Result<ImageDescriptor, OciError> {
-    publish_final_image_with_limits(store, parent, added_layer, IMAGE_LIMITS)
+    let parent = inspect_image_with_limits(store, parent, IMAGE_LIMITS)?;
+    publish_final_image_from_verified(store, &parent, added_layer)
 }
 
+pub(crate) fn publish_final_image_from_verified(
+    store: &dyn OciContentStore,
+    parent: &VerifiedImage,
+    added_layer: Option<(Descriptor, Digest)>,
+) -> Result<ImageDescriptor, OciError> {
+    publish_final_image_from_verified_with_limits(store, parent, added_layer, IMAGE_LIMITS)
+}
+
+#[cfg(test)]
 fn publish_final_image_with_limits(
     store: &dyn OciContentStore,
     parent: &ImageDescriptor,
@@ -365,6 +475,15 @@ fn publish_final_image_with_limits(
     limits: ImageLimits,
 ) -> Result<ImageDescriptor, OciError> {
     let parent = inspect_image_with_limits(store, parent, limits)?;
+    publish_final_image_from_verified_with_limits(store, &parent, added_layer, limits)
+}
+
+fn publish_final_image_from_verified_with_limits(
+    store: &dyn OciContentStore,
+    parent: &VerifiedImage,
+    added_layer: Option<(Descriptor, Digest)>,
+    limits: ImageLimits,
+) -> Result<ImageDescriptor, OciError> {
     let Some((layer_descriptor, diff_id)) = added_layer else {
         return ImageDescriptor::new(parent.manifest.descriptor.clone())
             .map_err(|source| OciError::ImageDescriptor { source });
@@ -422,27 +541,27 @@ fn publish_final_image_with_limits(
         "final.config",
     )?;
 
-    // Re-establish availability immediately before the commit point. No
-    // Manifest publication is attempted if any referenced content disappeared.
-    verify_content(
-        store,
-        &config,
-        &[MediaType::ImageConfig],
-        "final.manifest.config",
-    )?;
-    for (index, descriptor) in parent
-        .layers
-        .iter()
-        .map(VerifiedLayer::descriptor)
-        .chain(std::iter::once(&layer_descriptor))
-        .enumerate()
-    {
+    if !store.published_content_is_immutable() {
         verify_content(
             store,
-            descriptor,
-            supported_layer_media_types(),
-            format!("final.manifest.layers[{index}]"),
+            &config,
+            &[MediaType::ImageConfig],
+            "final.manifest.config",
         )?;
+        for (index, descriptor) in parent
+            .layers
+            .iter()
+            .map(VerifiedLayer::descriptor)
+            .chain(std::iter::once(&layer_descriptor))
+            .enumerate()
+        {
+            verify_content(
+                store,
+                descriptor,
+                supported_layer_media_types(),
+                format!("final.manifest.layers[{index}]"),
+            )?;
+        }
     }
 
     publish_expected(

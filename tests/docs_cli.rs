@@ -8,7 +8,9 @@ const TOPIC: &str = "how-to/build-images";
 fn docs_are_discoverable_without_state_or_managed_vm() {
     let top = run(&["--help"]);
     assert_success(&top);
-    assert!(text(&top.stdout).contains("\n  docs "));
+    let top = text(&top.stdout);
+    assert!(top.contains("\n  docs "));
+    assert!(top.contains("runlab docs get start-here"));
 
     let help = run(&["docs", "--help"]);
     assert_success(&help);
@@ -24,6 +26,11 @@ fn docs_are_discoverable_without_state_or_managed_vm() {
         json!({
             "schema_version": 1,
             "topics": [
+                {
+                    "name": "start-here",
+                    "title": "Start Here",
+                    "summary": "Run one complete Image-to-Final-Environment workflow."
+                },
                 {
                     "name": TOPIC,
                     "title": "Build OCI Images for RunLab",
@@ -41,6 +48,13 @@ fn docs_are_discoverable_without_state_or_managed_vm() {
 
 #[test]
 fn docs_get_returns_markdown_or_compact_json() {
+    let start = run(&["docs", "get", "start-here"]);
+    assert_success(&start);
+    let start = text(&start.stdout);
+    assert!(start.starts_with("# Start Here\n"));
+    assert!(start.contains("runlab filesystem get"));
+    assert!(start.contains("runlab.error"));
+
     let markdown = run(&["docs", "get", TOPIC]);
     assert_success(&markdown);
     let markdown = text(&markdown.stdout);
@@ -70,9 +84,12 @@ fn docs_get_rejects_unknown_topic_without_success_output() {
     let output = run(&["docs", "get", "missing"]);
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    let stderr = text(&output.stderr);
-    assert!(stderr.contains("documentation topic not found: \"missing\""));
-    assert!(stderr.contains("run `runlab docs list`"));
+    let error = serde_json::from_slice::<Value>(&output.stderr).expect("structured error");
+    assert_eq!(error["kind"], "runlab.error");
+    assert!(error["message"].as_str().is_some_and(|message| {
+        message.contains("documentation topic not found: \"missing\"")
+            && message.contains("run `runlab docs list`")
+    }));
 }
 
 fn run(arguments: &[&str]) -> Output {

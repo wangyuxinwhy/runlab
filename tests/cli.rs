@@ -20,7 +20,7 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(top_stdout.contains("image"));
     assert!(top_stdout.contains("run"));
     assert!(top_stdout.contains("filesystem"));
-    for command in ["exec", "schema", "query"] {
+    for command in ["exec", "schema", "query", "storage"] {
         assert!(top_stdout.contains(command), "missing command: {command}");
     }
     for removed in ["docker", "managed-service", "runtime-config"] {
@@ -37,7 +37,7 @@ fn help_exposes_only_the_minimal_product_surface() {
     let image = run(&["image", "--help"]);
     assert_success(&image);
     let stdout = text(&image.stdout);
-    for command in ["import", "list", "get"] {
+    for command in ["import", "list", "get", "export"] {
         assert!(stdout.contains(command), "missing image command: {command}");
     }
     assert!(!stdout.contains("file"));
@@ -107,6 +107,183 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("are not execution facts"));
     assert!(stdout.contains("Keys are not interpreted"));
     assert!(stdout.contains("Examples:"));
+}
+
+#[test]
+fn image_export_round_trips_catalog_and_final_images_without_overwrite() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "base"],
+    );
+    assert_success(&imported);
+    let manifest = json_output(&imported)["manifest"].clone();
+
+    let catalog_archive = temporary.path().join("base.oci.tar");
+    let exported = run_with_state(
+        &state,
+        &[
+            "image",
+            "export",
+            "--image",
+            "base",
+            "--output",
+            path(&catalog_archive),
+        ],
+    );
+    assert_success(&exported);
+    assert_eq!(json_output(&exported)["manifest"], manifest);
+    assert!(catalog_archive.is_file());
+    let second_state = temporary.path().join("second-state");
+    assert_success(&run_with_state(
+        &second_state,
+        &[
+            "image",
+            "import",
+            path(&catalog_archive),
+            "--name",
+            "roundtrip",
+        ],
+    ));
+    assert_eq!(
+        json_output(&run_with_state(
+            &second_state,
+            &["image", "get", "roundtrip"]
+        ))["manifest"],
+        manifest
+    );
+
+    let run_id = "550e8400-e29b-41d4-a716-446655440001";
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    connection
+        .execute(
+            "INSERT INTO runs(
+                run_id, accepted_at, initial_image_name, metadata_json, input_json,
+                input_identity_json, terminal_at, completion_json
+             ) VALUES (?1, '2026-08-28T00:00:00Z', 'base',
+                       '{\"description\":null,\"labels\":{}}', '{}', '{}',
+                       '2026-08-28T00:00:01Z', ?2)",
+            rusqlite::params![
+                run_id,
+                serde_json::to_string(&json!({
+                    "result": {
+                        "kind": "output",
+                        "output": {
+                            "programs": {
+                                "primary": {
+                                    "final_environment": {
+                                        "availability": "available",
+                                        "value": manifest,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }))
+                .expect("completion JSON")
+            ],
+        )
+        .expect("terminal Run");
+    let final_archive = temporary.path().join("final.oci.tar");
+    assert_success(&run_with_state(
+        &state,
+        &[
+            "image",
+            "export",
+            "--run",
+            run_id,
+            "--output",
+            path(&final_archive),
+        ],
+    ));
+    assert!(final_archive.is_file());
+    let overwrite = run_with_state(
+        &state,
+        &[
+            "image",
+            "export",
+            "--image",
+            "base",
+            "--output",
+            path(&catalog_archive),
+        ],
+    );
+    assert!(!overwrite.status.success());
+    let error: Value = serde_json::from_slice(&overwrite.stderr).expect("structured error");
+    assert_eq!(error["kind"], "runlab.error");
+}
+
+#[test]
+fn storage_prune_removes_only_rebuildable_and_unreferenced_content() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    assert_success(&run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "base"],
+    ));
+
+    let unreferenced = state
+        .join("oci/blobs/sha256")
+        .join("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    fs::write(&unreferenced, b"unreferenced").expect("unreferenced blob");
+    let snapshot = state.join("engine/snapshots-v3/chains/stale/upper");
+    fs::create_dir_all(&snapshot).expect("snapshot cache");
+    fs::write(snapshot.join("cache"), b"cache").expect("snapshot content");
+    let invocation = state.join("engine/invocations/stale");
+    fs::create_dir_all(&invocation).expect("invocation staging");
+    fs::write(invocation.join("work"), b"work").expect("invocation content");
+
+    let status = run_with_state(&state, &["storage", "status"]);
+    assert_success(&status);
+    let status = json_output(&status);
+    assert_eq!(status["assets"]["catalog_images"], 1);
+    assert_eq!(status["assets"]["referenced_oci_blobs"], 3);
+    assert_eq!(status["reclaimable"]["unreferenced_oci_blobs"], 1);
+    assert!(status["reclaimable"]["snapshot_cache_bytes"].as_u64() > Some(0));
+    assert!(status["reclaimable"]["invocation_staging_bytes"].as_u64() > Some(0));
+
+    let check = run_with_state(&state, &["storage", "prune", "check"]);
+    assert_success(&check);
+    assert_eq!(json_output(&check)["mode"], "check");
+    assert!(unreferenced.exists());
+    assert!(snapshot.exists());
+    assert!(invocation.exists());
+
+    let apply = run_with_state(&state, &["storage", "prune", "apply"]);
+    assert_success(&apply);
+    let apply = json_output(&apply);
+    assert_eq!(apply["mode"], "apply");
+    assert_eq!(apply["exclusive"], true);
+    assert_eq!(apply["remaining_reclaimable"]["unreferenced_oci_blobs"], 0);
+    assert!(!unreferenced.exists());
+    assert!(!snapshot.exists());
+    assert!(!invocation.exists());
+    assert_success(&run_with_state(&state, &["image", "get", "base"]));
+}
+
+#[test]
+fn storage_prune_apply_refuses_concurrent_state_use() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    assert_success(&run_with_state(&state, &["image", "list"]));
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.join("maintenance.lock"))
+        .expect("State maintenance lock");
+    rustix::fs::flock(&lease, rustix::fs::FlockOperation::LockShared).expect("shared State lease");
+
+    let apply = run_with_state(&state, &["storage", "prune", "apply"]);
+    assert!(!apply.status.success());
+    assert!(apply.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&apply.stderr).expect("structured error");
+    assert_eq!(error["kind"], "runlab.error");
+    assert_eq!(error["category"], "conflict");
+    assert_eq!(error["stage"], "storage_prune");
+    assert_eq!(error["retryable"], true);
 }
 
 #[test]
@@ -471,6 +648,25 @@ fn schema_and_query_expose_only_bounded_public_run_facts() {
     );
     assert_eq!(query["rows"][0]["task"], "example");
 
+    let performance = run_with_state(
+        &state,
+        &[
+            "query",
+            "run",
+            "SELECT primary_started_at, primary_ended_at, primary_duration_ms, accepted_to_primary_start_ms, primary_end_to_terminal_ms, primary_stdout_bytes, primary_stderr_bytes, primary_final_image_digest FROM runs",
+        ],
+    );
+    assert_success(&performance);
+    let row = json_output(&performance)["rows"][0].clone();
+    assert_eq!(row["primary_started_at"], "2026-08-27T00:00:00.373456789Z");
+    assert_eq!(row["primary_ended_at"], "2026-08-27T00:00:00.873456789Z");
+    assert_eq!(row["primary_duration_ms"], 500.0);
+    assert_eq!(row["accepted_to_primary_start_ms"], 250.0);
+    assert_eq!(row["primary_end_to_terminal_ms"], 250.0);
+    assert_eq!(row["primary_stdout_bytes"], 5);
+    assert_eq!(row["primary_stderr_bytes"], 0);
+    assert_eq!(row["primary_final_image_digest"], manifest["digest"]);
+
     for sql in [
         "SELECT * FROM main.runs",
         "SELECT * FROM sqlite_schema",
@@ -484,6 +680,10 @@ fn schema_and_query_expose_only_bounded_public_run_facts() {
 
 #[cfg(unix)]
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one filesystem contract fixture keeps ordered Layer semantics visible together"
+)]
 fn filesystem_directory_get_applies_layers_whiteouts_and_symlinks() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let state = temporary.path().join("state");
@@ -491,13 +691,20 @@ fn filesystem_directory_get_applies_layers_whiteouts_and_symlinks() {
         append_file(builder, "workspace/keep.txt", b"keep");
         append_file(builder, "workspace/remove.txt", b"remove");
         append_file(builder, "workspace/sub/old.txt", b"old");
+        append_file(builder, "workspace/versioned.txt", b"lower");
         append_symlink(builder, "workspace/latest", "keep.txt");
+        append_hard_link(
+            builder,
+            "workspace/versioned-link.txt",
+            "workspace/versioned.txt",
+        );
     });
     let upper = filesystem_layer(|builder| {
         append_file(builder, "workspace/.wh.remove.txt", b"");
         append_file(builder, "workspace/sub/.wh..wh..opq", b"");
         append_file(builder, "workspace/sub/new.txt", b"new");
         append_file(builder, "workspace/added.txt", b"added");
+        append_file(builder, "workspace/versioned.txt", b"upper");
     });
     let layout = create_layout_with_layers(temporary.path(), &[lower, upper]);
     let imported = run_with_state(
@@ -523,6 +730,14 @@ fn filesystem_directory_get_applies_layers_whiteouts_and_symlinks() {
     assert_eq!(fs::read(output.join("keep.txt")).expect("keep"), b"keep");
     assert_eq!(fs::read(output.join("added.txt")).expect("added"), b"added");
     assert_eq!(fs::read(output.join("sub/new.txt")).expect("new"), b"new");
+    assert_eq!(
+        fs::read(output.join("versioned-link.txt")).expect("hard link"),
+        b"lower"
+    );
+    assert_eq!(
+        fs::read(output.join("versioned.txt")).expect("overwritten file"),
+        b"upper"
+    );
     assert!(!output.join("remove.txt").exists());
     assert!(!output.join("sub/old.txt").exists());
     assert_eq!(
@@ -550,6 +765,26 @@ fn filesystem_directory_get_applies_layers_whiteouts_and_symlinks() {
         Path::new("keep.txt")
     );
 
+    let hard_link_output = temporary.path().join("versioned-link");
+    let hard_link = run_with_state(
+        &state,
+        &[
+            "filesystem",
+            "get",
+            "--image",
+            "layered",
+            "/workspace/versioned-link.txt",
+            "--output",
+            path(&hard_link_output),
+        ],
+    );
+    assert_success(&hard_link);
+    assert_eq!(json_output(&hard_link)["kind"], "file");
+    assert_eq!(
+        fs::read(hard_link_output).expect("direct hard link"),
+        b"lower"
+    );
+
     let removed_output = temporary.path().join("removed");
     let removed = run_with_state(
         &state,
@@ -568,7 +803,109 @@ fn filesystem_directory_get_applies_layers_whiteouts_and_symlinks() {
     assert!(text(&removed.stderr).contains("does not exist"));
 }
 
+#[test]
+fn filesystem_changes_reports_sorted_paginated_final_differences() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let lower = filesystem_layer(|builder| {
+        append_file(builder, "workspace/unchanged.txt", b"same");
+        append_file(builder, "workspace/modified.txt", b"before");
+        append_file(builder, "workspace/deleted.txt", b"deleted");
+        append_file(builder, "workspace/sub/old.txt", b"old");
+    });
+    let upper = filesystem_layer(|builder| {
+        append_file(builder, "workspace/modified.txt", b"after");
+        append_file(builder, "workspace/added.txt", b"added");
+        append_file(builder, "workspace/.wh.deleted.txt", b"");
+        append_file(builder, "workspace/sub/.wh..wh..opq", b"");
+        append_file(builder, "workspace/sub/new.txt", b"new");
+    });
+    let initial_layout = create_layout_with_layers(
+        &temporary.path().join("initial"),
+        std::slice::from_ref(&lower),
+    );
+    let final_layout = create_layout_with_layers(&temporary.path().join("final"), &[lower, upper]);
+    let initial_import = run_with_state(
+        &state,
+        &[
+            "image",
+            "import",
+            path(&initial_layout),
+            "--name",
+            "initial",
+        ],
+    );
+    assert_success(&initial_import);
+    let initial_manifest = json_output(&initial_import)["manifest"].clone();
+    let final_import = run_with_state(
+        &state,
+        &["image", "import", path(&final_layout), "--name", "final"],
+    );
+    assert_success(&final_import);
+    let final_manifest = json_output(&final_import)["manifest"].clone();
+    let run_id = "d11ce004-0000-4000-8000-000000000004";
+    insert_terminal_run_with_final(&state, run_id, &initial_manifest, &final_manifest);
+
+    let first = run_with_state(
+        &state,
+        &["filesystem", "changes", "--run", run_id, "--limit", "2"],
+    );
+    assert_success(&first);
+    let first = json_output(&first);
+    assert_eq!(first["changes"][0]["path"], "/workspace/added.txt");
+    assert_eq!(first["changes"][0]["change"], "added");
+    assert_eq!(first["changes"][0]["node_type"], "file");
+    assert_eq!(first["changes"][0]["size"], 5);
+    assert_eq!(first["changes"][1]["path"], "/workspace/deleted.txt");
+    assert_eq!(first["changes"][1]["change"], "deleted");
+    assert_eq!(first["next_after"], "/workspace/deleted.txt");
+
+    let second = run_with_state(
+        &state,
+        &[
+            "filesystem",
+            "changes",
+            "--run",
+            run_id,
+            "--limit",
+            "10",
+            "--after",
+            first["next_after"].as_str().expect("next path"),
+        ],
+    );
+    assert_success(&second);
+    let second = json_output(&second);
+    assert_eq!(
+        second["changes"]
+            .as_array()
+            .expect("changes")
+            .iter()
+            .map(|change| change["path"].as_str().expect("path"))
+            .collect::<Vec<_>>(),
+        [
+            "/workspace/modified.txt",
+            "/workspace/sub",
+            "/workspace/sub/new.txt"
+        ]
+    );
+    assert_eq!(second["changes"][0]["change"], "modified");
+    assert_eq!(second["changes"][1]["change"], "modified");
+    assert_eq!(second["changes"][1]["node_type"], "directory");
+    assert_eq!(second["changes"][1]["subtree"], true);
+    assert_eq!(second["changes"][2]["change"], "added");
+    assert!(second["next_after"].is_null());
+}
+
 fn insert_terminal_run(state: &Path, run_id: &str, manifest: &Value) {
+    insert_terminal_run_with_final(state, run_id, manifest, manifest);
+}
+
+fn insert_terminal_run_with_final(
+    state: &Path,
+    run_id: &str,
+    initial_manifest: &Value,
+    final_manifest: &Value,
+) {
     let connection =
         rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("Run database");
     let completion = json!({
@@ -576,11 +913,32 @@ fn insert_terminal_run(state: &Path, run_id: &str, manifest: &Value) {
         "result": {
             "kind": "output",
             "output": {
+                "execution": {
+                    "timed_out": false,
+                    "cancelled": false
+                },
                 "programs": {
                     "primary": {
+                        "start": {
+                            "status": "succeeded",
+                            "facts": {"started_at": "2026-08-27T00:00:00.373456789Z"}
+                        },
+                        "process": {
+                            "kind": "exited",
+                            "code": 0,
+                            "ended_at": "2026-08-27T00:00:00.873456789Z"
+                        },
+                        "stdout": {
+                            "status": "succeeded",
+                            "facts": {"bytes": {"encoding": "base64", "value": "aGVsbG8="}}
+                        },
+                        "stderr": {
+                            "status": "succeeded",
+                            "facts": {"bytes": {"encoding": "base64", "value": ""}}
+                        },
                         "final_environment": {
                             "availability": "available",
-                            "value": manifest,
+                            "value": final_manifest,
                         }
                     }
                 }
@@ -603,7 +961,7 @@ fn insert_terminal_run(state: &Path, run_id: &str, manifest: &Value) {
                 }))
                 .expect("metadata JSON"),
                 serde_json::to_string(&json!({
-                    "programs": {"primary": {"initial_environment": manifest}}
+                    "programs": {"primary": {"initial_environment": initial_manifest}}
                 }))
                 .expect("input JSON"),
                 "{}",
@@ -706,12 +1064,30 @@ fn invalid_requests_do_not_emit_success_json() {
     );
     assert!(!missing.status.success());
     assert!(missing.stdout.is_empty());
-    assert!(text(&missing.stderr).contains("Run does not exist"));
+    let missing_error: Value = serde_json::from_slice(&missing.stderr).expect("structured error");
+    assert_eq!(missing_error["kind"], "runlab.error");
+    assert_eq!(missing_error["category"], "not_found");
+    assert_eq!(missing_error["stage"], "run_lookup");
+    assert_eq!(missing_error["accepted"], false);
+    assert_eq!(missing_error["run_created"], false);
+    assert_eq!(missing_error["retryable"], false);
+    assert!(
+        missing_error["message"]
+            .as_str()
+            .is_some_and(|value| value.contains("Run does not exist"))
+    );
 
     let bad_id = run_with_state(&state, &["run", "get", "not-a-run-id"]);
     assert!(!bad_id.status.success());
     assert!(bad_id.stdout.is_empty());
-    assert!(text(&bad_id.stderr).contains("UUID v4"));
+    let bad_id_error: Value = serde_json::from_slice(&bad_id.stderr).expect("argument error");
+    assert_eq!(bad_id_error["category"], "invalid_input");
+    assert_eq!(bad_id_error["stage"], "arguments");
+    assert!(
+        bad_id_error["message"]
+            .as_str()
+            .is_some_and(|value| value.contains("UUID v4"))
+    );
 
     let malformed_label = run_with_state(
         &state,
@@ -727,7 +1103,15 @@ fn invalid_requests_do_not_emit_success_json() {
     );
     assert!(!malformed_label.status.success());
     assert!(malformed_label.stdout.is_empty());
-    assert!(text(&malformed_label.stderr).contains("KEY=VALUE"));
+    let label_error: Value =
+        serde_json::from_slice(&malformed_label.stderr).expect("argument error");
+    assert_eq!(label_error["category"], "invalid_input");
+    assert_eq!(label_error["stage"], "arguments");
+    assert!(
+        label_error["message"]
+            .as_str()
+            .is_some_and(|value| value.contains("KEY=VALUE"))
+    );
 }
 
 fn create_layout(root: &Path) -> PathBuf {
@@ -830,6 +1214,21 @@ fn append_symlink(builder: &mut tar::Builder<&mut Vec<u8>>, path: &str, target: 
     builder
         .append_data(&mut header, path, Cursor::new([]))
         .expect("append symlink");
+}
+
+fn append_hard_link(builder: &mut tar::Builder<&mut Vec<u8>>, path: &str, target: &str) {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_entry_type(tar::EntryType::Link);
+    header.set_link_name(target).expect("hard link target");
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, Cursor::new([]))
+        .expect("append hard link");
 }
 
 fn layer_bytes() -> Vec<u8> {

@@ -8,7 +8,7 @@ use run_protocol::ImageDescriptor;
 use super::budget::{BudgetedStore, OperationBudget};
 use super::prepare::PreparedProgram;
 use crate::OciContentStore;
-use crate::oci::{publish_expected, publish_final_image};
+use crate::oci::{publish_expected, publish_final_image, publish_final_image_from_verified};
 use crate::rootfs::CapturedLayer;
 
 pub(super) enum CaptureFailure {
@@ -50,8 +50,7 @@ pub(super) fn capture(
         budget.check()?;
         let captured = program.rootfs.capture()?;
         budget.check()?;
-        let image =
-            publish_capture(&store, &program.parent, &captured).map_err(anyhow::Error::from)?;
+        let image = publish_capture(&store, program, &captured).map_err(anyhow::Error::from)?;
         budget.check()?;
         Ok(image)
     })();
@@ -62,7 +61,7 @@ pub(super) fn capture(
 
 fn publish_capture(
     store: &dyn OciContentStore,
-    parent: &ImageDescriptor,
+    program: &PreparedProgram,
     captured: &CapturedLayer,
 ) -> Result<ImageDescriptor, crate::oci::OciError> {
     let descriptor = Descriptor::new(
@@ -81,5 +80,16 @@ fn publish_capture(
         &[MediaType::ImageLayer],
         "final.layer",
     )?;
-    publish_final_image(store, parent, Some((descriptor, captured.diff_id.clone())))
+    match &program.verified_parent {
+        Some(parent) => publish_final_image_from_verified(
+            store,
+            parent,
+            Some((descriptor, captured.diff_id.clone())),
+        ),
+        None => publish_final_image(
+            store,
+            &program.parent,
+            Some((descriptor, captured.diff_id.clone())),
+        ),
+    }
 }

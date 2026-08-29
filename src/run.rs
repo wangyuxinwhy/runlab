@@ -147,12 +147,38 @@ impl<'a> Runs<'a> {
     }
 
     pub(crate) fn generate_runtime_config(&self, image: &ImageSelector) -> Result<Vec<u8>> {
-        let image = self.images.resolve(image)?;
+        let image = self.images.resolve_input(image)?;
         crate::runtime_config::generate(&image.image_configuration)
     }
 
     pub(crate) fn start(&self, state: &State, request: &RunRequest) -> Result<RunStartResult> {
-        let prepared = self.prepare(&request.execution, true)?;
+        self.start_with_observation(state, request, true, false)
+    }
+
+    pub(crate) fn start_detached_worker(
+        &self,
+        state: &State,
+        request: &RunRequest,
+    ) -> Result<RunStartResult> {
+        self.start_with_observation(state, request, false, true)
+    }
+
+    fn start_with_observation(
+        &self,
+        state: &State,
+        request: &RunRequest,
+        observe: bool,
+        signal_detached_ready: bool,
+    ) -> Result<RunStartResult> {
+        let prepared = self.prepare(&request.execution, true).map_err(|error| {
+            crate::error::classify(
+                error,
+                crate::error::ErrorFacts::before_run(
+                    crate::error::ErrorCategory::InvalidInput,
+                    "input_preparation",
+                ),
+            )
+        })?;
         let run_id = request.run_id.to_string();
         let engine = native_engine(state)?;
         let accepted_at = Utc::now().to_rfc3339();
@@ -175,49 +201,86 @@ impl<'a> Runs<'a> {
                 request.execution.image.catalog_name(),
                 &request.metadata,
             ) {
-                bail!("Run identity is already bound to a different request: {run_id}");
+                return Err(crate::error::classify(
+                    anyhow::anyhow!(
+                        "Run identity is already bound to a different request: {run_id}"
+                    ),
+                    crate::error::ErrorFacts {
+                        category: crate::error::ErrorCategory::Conflict,
+                        stage: "acceptance",
+                        run_id: Some(run_id),
+                        accepted: Some(false),
+                        run_created: Some(false),
+                        retryable: false,
+                        recovery: None,
+                    },
+                ));
             }
-            let observation = RunObservation::stderr(&run_id);
+            let observation = persistent_observation(&run_id, observe, false);
             observation.finish();
             return start_result(&existing, false);
         }
 
-        let observation = RunObservation::stderr(&run_id);
-        observation.stage("accepted");
-        observation.stage("preparing");
-        let cancellation = CancellationToken::new();
-        let signal = SignalCancellation::install(&cancellation)?;
-        let input = prepared.input;
-        let (result, cancellation_monitor) = run_persistent_observed(
-            &engine,
-            &input,
-            &cancellation,
-            observation.engine_observer(),
-            self.database,
-            &run_id,
-        );
-        signal.close()?;
-        observation.report_dropped_observation();
-        observation.stage("publishing");
-        let completion = json!({
-            "kind": "engine_returned",
-            "result": engine_result_json(result),
-        });
-        let terminal_at = Utc::now().to_rfc3339();
-        self.database
-            .run_complete(&run_id, &terminal_at, &completion)?;
-        observation.stage("terminal");
-        observation.finish();
-        cancellation_monitor?;
-        let record = self
-            .database
-            .run_get(&run_id)?
-            .context("completed Run disappeared")?;
-        start_result(&record, true)
+        let accepted = (|| {
+            let observation = persistent_observation(&run_id, observe, signal_detached_ready);
+            observation.stage("accepted");
+            observation.stage("preparing");
+            let cancellation = CancellationToken::new();
+            let signal = SignalCancellation::install(&cancellation)?;
+            let input = prepared.input;
+            let (result, cancellation_monitor) = run_persistent_observed(
+                &engine,
+                &input,
+                &cancellation,
+                observation.engine_observer(),
+                self.database,
+                &run_id,
+            );
+            signal.close()?;
+            observation.report_dropped_observation();
+            observation.stage("publishing");
+            let completion = json!({
+                "kind": "engine_returned",
+                "result": engine_result_json(result),
+            });
+            let terminal_at = Utc::now().to_rfc3339();
+            self.database
+                .run_complete(&run_id, &terminal_at, &completion)?;
+            observation.stage("terminal");
+            observation.finish();
+            cancellation_monitor?;
+            let record = self
+                .database
+                .run_get(&run_id)?
+                .context("completed Run disappeared")?;
+            start_result(&record, true)
+        })();
+        accepted.map_err(|error| {
+            crate::error::classify(
+                error,
+                crate::error::ErrorFacts {
+                    category: crate::error::ErrorCategory::Internal,
+                    stage: "accepted_run",
+                    run_id: Some(run_id.clone()),
+                    accepted: Some(true),
+                    run_created: Some(true),
+                    retryable: true,
+                    recovery: Some(format!("runlab run get {run_id}")),
+                },
+            )
+        })
     }
 
     pub(crate) fn exec(&self, state: &State, request: &ExecutionRequest) -> Result<ExecResult> {
-        let prepared = self.prepare(request, false)?;
+        let prepared = self.prepare(request, false).map_err(|error| {
+            crate::error::classify(
+                error,
+                crate::error::ErrorFacts::before_run(
+                    crate::error::ErrorCategory::InvalidInput,
+                    "input_preparation",
+                ),
+            )
+        })?;
         let engine = native_engine(state)?;
         let observation = RunObservation::exec_stderr();
         observation.stage("preparing");
@@ -243,7 +306,7 @@ impl<'a> Runs<'a> {
         request: &ExecutionRequest,
         capture_final_environment: bool,
     ) -> Result<PreparedExecution> {
-        let image = self.images.resolve(&request.image)?;
+        let image = self.images.resolve_input(&request.image)?;
         let runtime_bytes = request
             .runtime_config
             .as_ref()
@@ -307,10 +370,15 @@ impl<'a> Runs<'a> {
 
     pub(crate) fn get(&self, run_id: RunId) -> Result<Value> {
         let run_id = run_id.to_string();
-        let record = self
-            .database
-            .run_get(&run_id)?
-            .with_context(|| format!("Run does not exist: {run_id}"))?;
+        let record = self.database.run_get(&run_id)?.ok_or_else(|| {
+            crate::error::classify(
+                anyhow::anyhow!("Run does not exist: {run_id}"),
+                crate::error::ErrorFacts::before_run(
+                    crate::error::ErrorCategory::NotFound,
+                    "run_lookup",
+                ),
+            )
+        })?;
         Ok(record_json(&record))
     }
 
@@ -319,7 +387,15 @@ impl<'a> Runs<'a> {
         let cancellation = self
             .database
             .run_cancel(&run_id, &Utc::now().to_rfc3339())?
-            .with_context(|| format!("Run does not exist: {run_id}"))?;
+            .ok_or_else(|| {
+                crate::error::classify(
+                    anyhow::anyhow!("Run does not exist: {run_id}"),
+                    crate::error::ErrorFacts::before_run(
+                        crate::error::ErrorCategory::NotFound,
+                        "run_lookup",
+                    ),
+                )
+            })?;
         Ok(match cancellation {
             RunCancellation::Requested { requested_at } => RunCancelResult {
                 schema_version: 1,
@@ -361,6 +437,21 @@ impl<'a> Runs<'a> {
             runs: records.into_iter().map(run_summary).collect(),
             next_after,
         })
+    }
+}
+
+fn persistent_observation(
+    run_id: &str,
+    enabled: bool,
+    signal_detached_ready: bool,
+) -> RunObservation {
+    if signal_detached_ready {
+        RunObservation::detached_ready(run_id);
+    }
+    if enabled {
+        RunObservation::stderr(run_id)
+    } else {
+        RunObservation::discarded()
     }
 }
 

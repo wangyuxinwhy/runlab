@@ -35,6 +35,14 @@ pub(crate) enum RunCancellation {
     },
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) struct StorageDatabaseFacts {
+    pub(crate) catalog_images: u64,
+    pub(crate) runs: u64,
+    pub(crate) active_runs: u64,
+    pub(crate) descriptor_documents: Vec<Value>,
+}
+
 type RunRow = (
     String,
     String,
@@ -48,6 +56,52 @@ type RunRow = (
 );
 
 impl Database {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn storage_facts(&self) -> Result<StorageDatabaseFacts> {
+        let connection = self.lock()?;
+        let catalog_images: i64 =
+            connection.query_row("SELECT count(*) FROM main.catalog", [], |row| row.get(0))?;
+        let (runs, active_runs): (i64, i64) = connection.query_row(
+            "SELECT count(*), count(*) FILTER (WHERE terminal_at IS NULL) FROM main.runs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut descriptor_documents = Vec::new();
+        {
+            let mut statement = connection.prepare("SELECT descriptor_json FROM main.catalog")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                descriptor_documents.push(
+                    serde_json::from_str(&row?).context("stored Image descriptor is invalid")?,
+                );
+            }
+        }
+        {
+            let mut statement =
+                connection.prepare("SELECT input_json, completion_json FROM main.runs")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (input, completion) = row?;
+                descriptor_documents
+                    .push(serde_json::from_str(&input).context("stored Run input is invalid")?);
+                if let Some(completion) = completion {
+                    descriptor_documents.push(
+                        serde_json::from_str(&completion)
+                            .context("stored Run completion is invalid")?,
+                    );
+                }
+            }
+        }
+        Ok(StorageDatabaseFacts {
+            catalog_images: u64::try_from(catalog_images).context("Catalog count is negative")?,
+            runs: u64::try_from(runs).context("Run count is negative")?,
+            active_runs: u64::try_from(active_runs).context("active Run count is negative")?,
+            descriptor_documents,
+        })
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open RunLab database {}", path.display()))?;

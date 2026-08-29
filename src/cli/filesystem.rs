@@ -18,6 +18,25 @@ pub(super) enum FilesystemCommand {
         after_long_help = "Examples:\n  runlab filesystem get --run 550e8400-e29b-41d4-a716-446655440000 /artifacts/solution.patch --output ./solution.patch\n  runlab filesystem get --image agent-base /workspace --output ./workspace"
     )]
     Get(FilesystemGetArgs),
+    /// List bounded Final Environment changes relative to one Run's Initial Image.
+    #[command(
+        long_about = "List paths changed by one Program's Final Environment relative to its Initial Image. Results are sorted by absolute Image path and bounded by --limit. added and modified entries report the final node; deleted entries report the initial node. subtree:true on a directory means an OCI opaque whiteout replaced or removed its lower subtree.",
+        after_long_help = "Example:\n  runlab filesystem changes --run 550e8400-e29b-41d4-a716-446655440000 --limit 100"
+    )]
+    Changes {
+        /// Persistent Run whose Final Environment is compared.
+        #[arg(long)]
+        run: RunId,
+        /// Program to compare; defaults to primary.
+        #[arg(long, default_value = "primary")]
+        program: String,
+        /// Maximum paths returned; must be between 1 and 1000.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Continue strictly after this absolute Image path.
+        #[arg(long)]
+        after: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -54,6 +73,12 @@ pub(super) fn execute(state_path: &Path, command: FilesystemCommand) -> Result<u
             };
             emit(&filesystems.get(source, &arguments.path, &arguments.output)?)?;
         }
+        FilesystemCommand::Changes {
+            run,
+            program,
+            limit,
+            after,
+        } => emit(&filesystems.changes(run, program, limit, after.as_deref())?)?,
     }
     Ok(0)
 }
@@ -72,6 +97,16 @@ pub(super) fn execute_managed(command: FilesystemCommand) -> Result<u8> {
                 &arguments.path,
                 &arguments.output,
             )?;
+            super::emit_forwarded(&output)
+        }
+        FilesystemCommand::Changes {
+            run,
+            program,
+            limit,
+            after,
+        } => {
+            let output =
+                vm.forward_filesystem_changes(&run.to_string(), &program, limit, after.as_deref())?;
             super::emit_forwarded(&output)
         }
     }

@@ -49,6 +49,8 @@ pub(crate) struct VmStatus {
     cpus: Option<u16>,
     memory_bytes: Option<u64>,
     disk_bytes: Option<u64>,
+    disk_used_bytes: Option<u64>,
+    disk_available_bytes: Option<u64>,
     host_mounts: Option<usize>,
     image: Option<VmImage>,
     ready: bool,
@@ -161,6 +163,15 @@ impl ManagedVm {
             match self.installed_guest() {
                 Ok((guest, runtime)) => {
                     status.readiness_problems = runtime.problems();
+                    match self.disk_capacity() {
+                        Ok((used, available)) => {
+                            status.disk_used_bytes = Some(used);
+                            status.disk_available_bytes = Some(available);
+                        }
+                        Err(error) => status
+                            .readiness_problems
+                            .push(format!("failed to inspect VM disk usage: {error:#}")),
+                    }
                     status.ready = status.readiness_problems.is_empty();
                     status.guest = Some(guest);
                     status.runtime = Some(runtime);
@@ -471,6 +482,23 @@ impl ManagedVm {
         })
     }
 
+    fn disk_capacity(&self) -> Result<(u64, u64)> {
+        let output =
+            self.guest_output(["/usr/bin/df", "-B1", "--output=used,avail", STATE_PATH])?;
+        let line = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .nth(1)
+            .context("guest df returned no filesystem capacity row")?;
+        let values = line
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let [used, available] = values.as_slice() else {
+            bail!("guest df returned an invalid filesystem capacity row");
+        };
+        Ok((*used, *available))
+    }
+
     fn guest_executable(&self, candidates: &[&str]) -> bool {
         for candidate in candidates {
             if self.guest_test(["-x", candidate]) {
@@ -537,6 +565,16 @@ impl ManagedVm {
         })
     }
 
+    pub(super) fn transfer_remote_file_ownership(&self, path: &str) -> Result<()> {
+        let uid_output = self.guest_output(["/usr/bin/id", "-u"])?;
+        let gid_output = self.guest_output(["/usr/bin/id", "-g"])?;
+        let uid = guest_identity_value(&uid_output, "uid")?;
+        let gid = guest_identity_value(&gid_output, "gid")?;
+        let owner = format!("{uid}:{gid}");
+        self.guest_success(["/usr/bin/sudo", "/usr/bin/chown", "--", &owner, path])?;
+        self.guest_success(["/usr/bin/sudo", "/usr/bin/chmod", "0600", "--", path])
+    }
+
     pub(super) fn guest_success<const N: usize>(&self, arguments: [&str; N]) -> Result<()> {
         self.guest_output(arguments).map(|_| ())
     }
@@ -600,6 +638,14 @@ impl ManagedVm {
     }
 }
 
+fn guest_identity_value(output: &Output, name: &str) -> Result<u32> {
+    std::str::from_utf8(&output.stdout)
+        .with_context(|| format!("guest {name} is not UTF-8"))?
+        .trim()
+        .parse()
+        .with_context(|| format!("guest {name} is invalid"))
+}
+
 fn status_from(instance: Option<&LimaInstance>, lima_version: String) -> VmStatus {
     let Some(instance) = instance else {
         return VmStatus {
@@ -614,6 +660,8 @@ fn status_from(instance: Option<&LimaInstance>, lima_version: String) -> VmStatu
             cpus: None,
             memory_bytes: None,
             disk_bytes: None,
+            disk_used_bytes: None,
+            disk_available_bytes: None,
             host_mounts: None,
             image: None,
             ready: false,
@@ -635,6 +683,8 @@ fn status_from(instance: Option<&LimaInstance>, lima_version: String) -> VmStatu
         cpus: Some(instance.cpus),
         memory_bytes: Some(instance.memory),
         disk_bytes: Some(instance.disk),
+        disk_used_bytes: None,
+        disk_available_bytes: None,
         host_mounts: Some(instance.config.mounts.len()),
         image: instance.config.images.first().cloned(),
         ready: false,
@@ -785,12 +835,26 @@ pub(super) fn ensure_success(output: &Output, operation: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
+    if let Some(error) = crate::error::parse_remote(&output.stderr, false) {
+        return Err(error.into());
+    }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    bail!(
-        "{operation} failed with {}: {}",
-        output.status,
-        stderr.trim()
-    )
+    Err(crate::error::classify(
+        anyhow::anyhow!(
+            "{operation} failed with {}: {}",
+            output.status,
+            stderr.trim()
+        ),
+        crate::error::ErrorFacts {
+            category: crate::error::ErrorCategory::Unavailable,
+            stage: "managed_vm",
+            run_id: None,
+            accepted: None,
+            run_created: None,
+            retryable: true,
+            recovery: Some("runlab vm status".to_owned()),
+        },
+    ))
 }
 
 #[cfg(test)]

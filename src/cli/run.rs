@@ -1,19 +1,21 @@
 #[cfg(not(target_os = "macos"))]
 use std::collections::BTreeMap;
-#[cfg(not(target_os = "macos"))]
 use std::env;
-#[cfg(not(target_os = "macos"))]
 use std::fs;
 use std::num::NonZeroU64;
-#[cfg(not(target_os = "macos"))]
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 #[cfg(not(target_os = "macos"))]
 use run_protocol::{SecretValue, Secrets};
+use serde::Serialize;
 
 use crate::image::ImageSelector;
 #[cfg(not(target_os = "macos"))]
@@ -35,12 +37,12 @@ pub(super) enum RunCommand {
         #[command(subcommand)]
         command: RunConfigCommand,
     },
-    /// Start one persistent Run and wait for the Engine to return.
+    /// Start one persistent Run, optionally returning after acceptance.
     #[command(
-        long_about = "Start one persistent Run and wait for the Engine to return. The selected Catalog name and optional description and labels are stored as immutable caller-provided Run facts; they help Agents select Runs, are not execution facts, and are not passed to the Run Engine. Reusing a Run identity requires the same semantic Run input and the same accepted caller facts. stderr emits an NDJSON observation stream with Run stages and Program stdout/stderr while execution is active. Success writes one compact JSON summary to stdout containing the Run identity, Initial Image name, metadata, lifecycle, execution facts, process results, final environments, and errors. Use run get for the complete persisted Run record, including captured streams and exact input bytes.",
-        after_long_help = "Examples:\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --description 'SWE-bench django__django-11099 with pi' --label suite=swe-bench --label agent=pi\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --runtime-config config.json --network egress\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --secret-env API_KEY --secret-file ./auth.json=/run/secrets/auth.json"
+        long_about = "Start one persistent Run. By default the CLI waits for the Engine to return and streams NDJSON observations: stderr emits an NDJSON observation stream and stdout receives one compact JSON summary. Use run get for the complete persisted Run record. --detach starts the same Coordinator in an independent process group, waits until Run acceptance is observable, then returns the Run ID and recovery command without streaming Program output; use run get or query afterwards. The selected Catalog name, description, and labels are immutable caller facts and are not execution facts. Reusing a Run identity requires the same semantic input and metadata.",
+        after_long_help = "Examples:\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base\n  runlab run start --detach --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --description 'SWE-bench django__django-11099 with pi' --label suite=swe-bench --label agent=pi\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --runtime-config config.json --network egress\n  runlab run start --id 550e8400-e29b-41d4-a716-446655440000 --image agent-base --secret-env API_KEY --secret-file ./auth.json=/run/secrets/auth.json"
     )]
-    Start(RunStartArgs),
+    Start(Box<RunStartArgs>),
     /// Request cancellation of one active persistent Run.
     #[command(
         long_about = "Persist an idempotent cancellation request for one Run. If the Run is active, its Coordinator delivers the request to the current Engine invocation. Success confirms the request was stored, not that execution has already stopped; use run get for the final RunOutput cancellation and stop facts. A terminal Run is returned unchanged.",
@@ -85,6 +87,12 @@ pub(super) struct RunStartArgs {
     /// Caller-generated canonical lowercase UUID v4 used for idempotent creation.
     #[arg(long)]
     id: RunId,
+    /// Return after the Run is accepted; continue with run get or query run.
+    #[arg(long)]
+    detach: bool,
+    /// Internal child process that owns a detached Run.
+    #[arg(long, hide = true)]
+    detached_worker: bool,
     #[command(flatten)]
     execution: ExecutionArgs,
     #[command(flatten)]
@@ -102,7 +110,7 @@ struct ExecutionArgs {
     /// Initial OCI Image selected by local name or Manifest digest.
     #[arg(long)]
     image: ImageSelector,
-    /// Exact OCI Runtime Configuration 1.3.0 JSON file; generated from the Image when omitted.
+    /// Exact OCI Runtime Configuration 1.3.0 JSON file; generated from the Image when omitted. On macOS, non-scaffold bind sources are local Host paths and must be read-only regular files or directories.
     #[arg(long, value_name = "FILE")]
     runtime_config: Option<PathBuf>,
     /// Exact bytes delivered to the primary Program; omitted means empty stdin.
@@ -180,6 +188,112 @@ impl FromStr for SecretEnvFileArg {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct DetachedStartResult {
+    schema_version: u32,
+    detached: bool,
+    created: bool,
+    run_id: String,
+    lifecycle: &'static str,
+    recovery: String,
+}
+
+fn execute_detached(
+    run_id: &str,
+    mut lookup: impl FnMut() -> Result<Option<&'static str>>,
+) -> Result<u8> {
+    let preexisting = lookup()?.is_some();
+    let stdout = tempfile::NamedTempFile::new().context("failed to stage detached stdout")?;
+    let stderr = tempfile::NamedTempFile::new().context("failed to stage detached stderr")?;
+    let mut command =
+        Command::new(env::current_exe().context("current executable is unavailable")?);
+    command
+        .args(env::args_os().skip(1))
+        .arg("--detached-worker")
+        .stdin(Stdio::null())
+        .stdout(stdout.reopen()?)
+        .stderr(stderr.reopen()?)
+        .process_group(0);
+    let mut child = command
+        .spawn()
+        .context("failed to start detached Run worker")?;
+    let deadline = Instant::now() + Duration::from_mins(2);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect detached Run worker")?
+        {
+            return detached_child_result(status.success(), stdout.path(), stderr.path());
+        }
+        if !preexisting && detached_ready(stderr.path(), run_id)? {
+            super::emit(&DetachedStartResult {
+                schema_version: 1,
+                detached: true,
+                created: true,
+                run_id: run_id.to_owned(),
+                lifecycle: "accepted",
+                recovery: format!("runlab run get {run_id}"),
+            })?;
+            return Ok(0);
+        }
+        if !preexisting && let Some(lifecycle) = lookup()? {
+            super::emit(&DetachedStartResult {
+                schema_version: 1,
+                detached: true,
+                created: true,
+                run_id: run_id.to_owned(),
+                lifecycle,
+                recovery: format!("runlab run get {run_id}"),
+            })?;
+            return Ok(0);
+        }
+        if Instant::now() >= deadline {
+            return Err(crate::error::classify(
+                anyhow::anyhow!("timed out waiting for detached Run acceptance"),
+                crate::error::ErrorFacts {
+                    category: crate::error::ErrorCategory::Unavailable,
+                    stage: "acceptance_wait",
+                    run_id: Some(run_id.to_owned()),
+                    accepted: None,
+                    run_created: None,
+                    retryable: true,
+                    recovery: Some(format!("runlab run get {run_id}")),
+                },
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn detached_ready(path: &Path, run_id: &str) -> Result<bool> {
+    let bytes = fs::read(path)?;
+    Ok(bytes.split(|byte| *byte == b'\n').any(|line| {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return false;
+        };
+        value.get("kind").and_then(serde_json::Value::as_str) == Some("transport.detached_ready")
+            && value.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
+    }))
+}
+
+fn detached_child_result(success: bool, stdout: &Path, stderr: &Path) -> Result<u8> {
+    if success {
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(stdout)?)
+            .context("detached Run worker returned invalid JSON")?;
+        value["detached"] = serde_json::Value::Bool(true);
+        super::emit(&value)?;
+        return Ok(0);
+    }
+    let stderr = fs::read(stderr)?;
+    if let Some(error) = crate::error::parse_remote(&stderr, false) {
+        return Err(error.into());
+    }
+    bail!(
+        "detached Run worker failed: {}",
+        String::from_utf8_lossy(&stderr).trim()
+    )
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(super) fn execute(state_path: &Path, command: RunCommand) -> Result<u8> {
     let state = State::open(state_path)?;
@@ -190,13 +304,31 @@ pub(super) fn execute(state_path: &Path, command: RunCommand) -> Result<u8> {
             command: RunConfigCommand::Generate { image },
         } => emit_json_bytes(&runs.generate_runtime_config(&image)?)?,
         RunCommand::Start(arguments) => {
+            let arguments = *arguments;
+            if arguments.detach && !arguments.detached_worker {
+                let run_id = arguments.id.to_string();
+                return execute_detached(&run_id, || {
+                    Ok(state.database().run_get(&run_id)?.map(|record| {
+                        if record.completion.is_some() {
+                            "terminal"
+                        } else {
+                            "accepted"
+                        }
+                    }))
+                });
+            }
             let secrets = resolve_secrets(&arguments.execution)?;
             let request = RunRequest {
                 run_id: arguments.id,
                 metadata: arguments.metadata.resolve()?,
                 execution: execution_request(arguments.execution, secrets),
             };
-            emit(&runs.start(&state, &request)?)?;
+            let result = if arguments.detached_worker {
+                runs.start_detached_worker(&state, &request)?
+            } else {
+                runs.start(&state, &request)?
+            };
+            emit(&result)?;
         }
         RunCommand::Cancel { run_id } => emit(&runs.cancel(run_id)?)?,
         RunCommand::Get { run_id } => emit(&runs.get(run_id)?)?,
@@ -213,10 +345,31 @@ pub(super) fn execute_managed(command: RunCommand) -> Result<u8> {
             command: RunConfigCommand::Generate { image },
         } => vm.forward_run_config(&image.to_string())?,
         RunCommand::Start(arguments) => {
+            let arguments = *arguments;
             let id = arguments.id.to_string();
+            if arguments.detach && !arguments.detached_worker {
+                return execute_detached(&id, || match vm.forward_run_get(&id) {
+                    Ok(output) => {
+                        let record: serde_json::Value = serde_json::from_slice(&output.stdout)
+                            .context("managed VM returned invalid Run JSON")?;
+                        Ok(Some(
+                            if record.get("lifecycle").and_then(serde_json::Value::as_str)
+                                == Some("terminal")
+                            {
+                                "terminal"
+                            } else {
+                                "accepted"
+                            },
+                        ))
+                    }
+                    Err(error) if crate::error::is_not_found(&error) => Ok(None),
+                    Err(error) => Err(error),
+                });
+            }
             let image = arguments.execution.image.to_string();
             vm.forward_run_start(&crate::managed_vm::ForwardRunStart {
                 id: &id,
+                detached_worker: arguments.detached_worker,
                 image: &image,
                 metadata: &arguments.metadata.resolve()?,
                 runtime_config: arguments.execution.runtime_config.as_deref(),

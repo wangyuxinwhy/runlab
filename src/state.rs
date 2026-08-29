@@ -1,25 +1,65 @@
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use rustix::fs::{FlockOperation, flock};
 
 use crate::storage::{Database, LocalOciStore};
 
 pub(crate) struct State {
     #[cfg(target_os = "linux")]
     root: PathBuf,
+    #[cfg(target_os = "linux")]
+    _lease: File,
     oci: Arc<LocalOciStore>,
     database: Database,
 }
 
 impl State {
     pub(crate) fn open(root: &Path) -> Result<Self> {
+        Self::open_with_lease(root, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_exclusive(root: &Path) -> Result<Self> {
+        Self::open_with_lease(root, true)
+    }
+
+    fn open_with_lease(root: &Path, exclusive: bool) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = exclusive;
         fs::create_dir_all(root)
             .with_context(|| format!("failed to create State directory {}", root.display()))?;
         set_private_permissions(root)?;
+        #[cfg(target_os = "linux")]
+        let lease = {
+            let lease = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(root.join("maintenance.lock"))
+                .context("failed to open State maintenance lock")?;
+            let operation = if exclusive {
+                FlockOperation::NonBlockingLockExclusive
+            } else {
+                FlockOperation::LockShared
+            };
+            flock(&lease, operation).with_context(|| {
+                if exclusive {
+                    "State is in use; storage prune requires exclusive access"
+                } else {
+                    "failed to acquire shared State lease"
+                }
+            })?;
+            lease
+        };
         #[cfg(target_os = "linux")]
         {
             let engine = root.join("engine");
@@ -33,6 +73,8 @@ impl State {
         Ok(Self {
             #[cfg(target_os = "linux")]
             root: root.to_owned(),
+            #[cfg(target_os = "linux")]
+            _lease: lease,
             oci,
             database,
         })
@@ -49,6 +91,11 @@ impl State {
     #[cfg(target_os = "linux")]
     pub(crate) fn engine_workspace(&self) -> PathBuf {
         self.root.join("engine")
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 }
 

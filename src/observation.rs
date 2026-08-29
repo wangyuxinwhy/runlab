@@ -21,6 +21,7 @@ pub(crate) struct RunObservation {
 
 struct ObservationInner {
     sender: SyncSender<Value>,
+    enabled: bool,
     dropped_observation: AtomicBool,
     streams: Mutex<BTreeMap<(ProgramId, ProgramStream), Utf8Stream>>,
 }
@@ -32,6 +33,21 @@ struct Utf8Stream {
 }
 
 impl RunObservation {
+    pub(crate) fn detached_ready(run_id: &str) {
+        let mut stderr = std::io::stderr().lock();
+        let _ = serde_json::to_writer(
+            &mut stderr,
+            &json!({
+                "kind": "transport.detached_ready",
+                "schema_version": 1,
+                "run_id": run_id,
+                "lifecycle": "accepted",
+            }),
+        );
+        let _ = stderr.write_all(b"\n");
+        let _ = stderr.flush();
+    }
+
     pub(crate) fn stderr(run_id: &str) -> Self {
         Self::with_writer(Some(run_id), std::io::stderr())
     }
@@ -44,6 +60,7 @@ impl RunObservation {
         let (sender, receiver) = sync_channel(OBSERVATION_QUEUE_CAPACITY);
         let inner = Arc::new(ObservationInner {
             sender,
+            enabled: true,
             dropped_observation: AtomicBool::new(false),
             streams: Mutex::new(BTreeMap::new()),
         });
@@ -58,6 +75,20 @@ impl RunObservation {
             "run_id": run_id,
         }));
         observation
+    }
+
+    pub(crate) fn discarded() -> Self {
+        let (sender, receiver) = sync_channel(1);
+        drop(receiver);
+        Self {
+            inner: Arc::new(ObservationInner {
+                sender,
+                enabled: false,
+                dropped_observation: AtomicBool::new(false),
+                streams: Mutex::new(BTreeMap::new()),
+            }),
+            writer: None,
+        }
     }
 
     pub(crate) fn engine_observer(&self) -> Arc<dyn EngineObserver> {
@@ -98,6 +129,9 @@ impl RunObservation {
 
 impl ObservationInner {
     fn enqueue(&self, value: Value) {
+        if !self.enabled {
+            return;
+        }
         match self.sender.try_send(value) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(_)) => {
@@ -128,6 +162,9 @@ impl EngineObserver for ObservationInner {
         byte_offset: u64,
         bytes: &[u8],
     ) {
+        if !self.enabled {
+            return;
+        }
         let Ok(mut streams) = self.streams.lock() else {
             return;
         };
@@ -138,6 +175,9 @@ impl EngineObserver for ObservationInner {
     }
 
     fn program_stream_closed(&self, program_id: &ProgramId, stream: ProgramStream) {
+        if !self.enabled {
+            return;
+        }
         let Ok(mut streams) = self.streams.lock() else {
             return;
         };

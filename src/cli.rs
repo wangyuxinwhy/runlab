@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use serde::Serialize;
 
 use crate::metadata::{Label, Metadata};
@@ -17,6 +17,7 @@ mod query;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) mod run;
 mod schema;
+mod storage;
 #[cfg(target_os = "macos")]
 mod vm;
 
@@ -24,7 +25,8 @@ mod vm;
 #[command(
     name = "runlab",
     version,
-    about = "Execute OCI environments and preserve selected executions as immutable Runs."
+    about = "Execute OCI environments and preserve selected executions as immutable Runs.",
+    after_help = "Start with `runlab docs get start-here` for one complete Image-to-Final-Environment workflow."
 )]
 struct Cli {
     /// State Directory for filesystem, Image, Run, schema, and query commands; defaults to `RUNLAB_STATE`, `$XDG_DATA_HOME/runlab`, or `$HOME/.local/share/runlab`.
@@ -77,6 +79,11 @@ enum Command {
         #[command(subcommand)]
         command: query::QueryCommand,
     },
+    /// Inspect and reclaim local storage without deleting immutable assets.
+    Storage {
+        #[command(subcommand)]
+        command: storage::StorageCommand,
+    },
     /// Manage the local Linux execution VM.
     #[cfg(target_os = "macos")]
     Vm {
@@ -102,7 +109,27 @@ impl MetadataArgs {
 }
 
 pub(crate) fn run() -> Result<u8> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.print()?;
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(crate::error::classify(
+                error.into(),
+                crate::error::ErrorFacts::before_run(
+                    crate::error::ErrorCategory::InvalidInput,
+                    "arguments",
+                ),
+            ));
+        }
+    };
     #[cfg(not(target_os = "macos"))]
     let state = cli.state.as_ref();
     #[cfg(target_os = "macos")]
@@ -120,9 +147,20 @@ pub(crate) fn run() -> Result<u8> {
         Command::Run { command } => execute_run(state, command),
         Command::Schema { command } => execute_schema(state, command),
         Command::Query { command } => execute_query(state, command),
+        Command::Storage { command } => execute_storage(state, &command),
         #[cfg(target_os = "macos")]
         Command::Vm { command } => vm::execute(command),
     }
+}
+
+fn execute_storage(state: Option<&PathBuf>, command: &storage::StorageCommand) -> Result<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        reject_managed_state(state)?;
+        storage::execute_managed(command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    storage::execute(&resolve_state(state.cloned())?, command.clone())
 }
 
 fn execute_exec(state: Option<&PathBuf>, arguments: run::ExecArgs) -> Result<u8> {

@@ -782,6 +782,7 @@ dependencies = [
  "run_engine",
  "run_protocol",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

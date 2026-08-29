@@ -12,6 +12,18 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use super::{RootfsError, RootfsErrorKind, RootfsLimits};
+use crate::oci::{ImagePlan, VerifiedImage};
+
+pub(super) fn cached_image_validation(
+    cache_root: &Path,
+    image: &ImagePlan,
+) -> Result<Option<Vec<u64>>> {
+    snapshot::cached_image_validation(cache_root, image)
+}
+
+pub(super) fn record_image_validation(cache_root: &Path, image: &VerifiedImage) -> Result<()> {
+    snapshot::record_image_validation(cache_root, image)
+}
 
 type Xattrs = BTreeMap<Box<[u8]>, Box<[u8]>>;
 

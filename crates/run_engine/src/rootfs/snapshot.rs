@@ -23,9 +23,72 @@ use super::{
     FsPath, Inventory, Metadata, Rootfs, RootfsError, RootfsErrorKind, RootfsLimits,
     classify_materialization_error, default_directory, enforce, usize_to_u64,
 };
+use crate::oci::{ImagePlan, VerifiedImage};
 use crate::rootfs::VerifiedLayer;
 
 const CACHE_FORMAT_VERSION: u32 = 3;
+const VALIDATION_FORMAT_VERSION: u32 = 1;
+const VALIDATION_FILE: &str = "validation-v1.json";
+
+pub(super) fn cached_image_validation(
+    cache_root: &Path,
+    image: &ImagePlan,
+) -> Result<Option<Vec<u64>>> {
+    let chains_root = cache_root.join("chains");
+    let mut parent = None;
+    let mut sizes = Vec::with_capacity(image.layers().len());
+    for (descriptor, diff_id) in image.layers() {
+        let id = chain_id(parent.as_deref(), diff_id)?;
+        let chain = chains_root.join(&id);
+        if !valid_chain(&chain, &id, parent.as_deref(), diff_id) {
+            return Ok(None);
+        }
+        let validation: StoredValidation = match File::open(chain.join(VALIDATION_FILE))
+            .ok()
+            .and_then(|file| serde_json::from_reader(file).ok())
+        {
+            Some(validation) => validation,
+            None => return Ok(None),
+        };
+        if !validation.matches(&id, descriptor, diff_id) {
+            return Ok(None);
+        }
+        sizes.push(validation.uncompressed_size);
+        parent = Some(id);
+    }
+    Ok(Some(sizes))
+}
+
+pub(super) fn record_image_validation(cache_root: &Path, image: &VerifiedImage) -> Result<()> {
+    let chains_root = cache_root.join("chains");
+    let mut parent = None;
+    for layer in image.layers() {
+        let id = chain_id(parent.as_deref(), layer.diff_id())?;
+        let chain = chains_root.join(&id);
+        if !valid_chain(&chain, &id, parent.as_deref(), layer.diff_id()) {
+            bail!("cannot record validation for absent snapshot chain {id}");
+        }
+        let validation = StoredValidation::new(&id, layer);
+        let destination = chain.join(VALIDATION_FILE);
+        if File::open(&destination)
+            .ok()
+            .and_then(|file| serde_json::from_reader::<_, StoredValidation>(file).ok())
+            .is_some_and(|existing| existing == validation)
+        {
+            parent = Some(id);
+            continue;
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(&chain)?;
+        serde_json::to_writer(temporary.as_file_mut(), &validation)?;
+        temporary.as_file_mut().flush()?;
+        temporary.as_file_mut().sync_all()?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| error.error)?;
+        parent = Some(id);
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 pub(super) struct OverlayMount {
@@ -503,6 +566,40 @@ struct StoredChain {
     chain_id: String,
     parent_chain_id: Option<String>,
     diff_id: String,
+}
+
+#[derive(Eq, PartialEq, Deserialize, Serialize)]
+struct StoredValidation {
+    schema_version: u32,
+    chain_id: String,
+    descriptor_digest: String,
+    descriptor_size: u64,
+    descriptor_media_type: String,
+    diff_id: String,
+    uncompressed_size: u64,
+}
+
+impl StoredValidation {
+    fn new(id: &str, layer: &crate::oci::VerifiedLayer) -> Self {
+        Self {
+            schema_version: VALIDATION_FORMAT_VERSION,
+            chain_id: id.to_owned(),
+            descriptor_digest: layer.descriptor().digest().to_string(),
+            descriptor_size: layer.descriptor().size(),
+            descriptor_media_type: layer.descriptor().media_type().to_string(),
+            diff_id: layer.diff_id().to_string(),
+            uncompressed_size: layer.uncompressed_size(),
+        }
+    }
+
+    fn matches(&self, id: &str, descriptor: &Descriptor, diff_id: &Digest) -> bool {
+        self.schema_version == VALIDATION_FORMAT_VERSION
+            && self.chain_id == id
+            && self.descriptor_digest == descriptor.digest().to_string()
+            && self.descriptor_size == descriptor.size()
+            && self.descriptor_media_type == descriptor.media_type().to_string()
+            && self.diff_id == diff_id.to_string()
+    }
 }
 
 #[cfg(test)]

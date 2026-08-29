@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -143,6 +143,84 @@ fn real_runc_exercises_native_engine_contract() {
         b"egress-ok"
     );
     assert_eq!(egress.errors().count(), 0, "egress cleanup polluted output");
+    assert_engine_workspace_clean(workspace.path());
+
+    let listener = TcpListener::bind(("0.0.0.0", 0)).expect("concurrent egress target");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking concurrent egress target");
+    let port = listener
+        .local_addr()
+        .expect("concurrent egress target address")
+        .port();
+    let target = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut accepted = 0;
+        while accepted < 2 {
+            match listener.accept() {
+                Ok((mut connection, _)) => {
+                    connection
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nconcurrent")
+                        .expect("concurrent egress response");
+                    accepted += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "concurrent egress connections timed out"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("concurrent egress listener failed: {error}"),
+            }
+        }
+    });
+    let barrier = Arc::new(Barrier::new(2));
+    let workers = (0..2)
+        .map(|index| {
+            let engine = Arc::clone(&engine);
+            let initial = initial.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                engine.run(
+                    e2e_input_with_network(
+                        &initial,
+                        &format!("concurrent-egress-{index}"),
+                        &format!("/bin/busybox wget -qO- http://{HOST_ADDRESS}:{port}/"),
+                        Network::Egress,
+                    ),
+                    CancellationToken::new(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        let output = worker
+            .join()
+            .expect("concurrent egress worker")
+            .expect("concurrent egress RunOutput");
+        let program = &output.programs()[&ProgramId::primary()];
+        assert!(matches!(
+            program.process(),
+            ProcessResult::Exited { code: 0, .. }
+        ));
+        assert_eq!(
+            program.stdout().facts().expect("concurrent stdout").bytes(),
+            b"concurrent"
+        );
+        assert_eq!(
+            program.errors().count(),
+            0,
+            "concurrent egress polluted Program output"
+        );
+        assert_eq!(
+            output.execution().errors().count(),
+            0,
+            "concurrent egress polluted execution output"
+        );
+    }
+    target.join().expect("concurrent egress target thread");
     assert_engine_workspace_clean(workspace.path());
 
     let file_mount_source = tempfile::NamedTempFile::new().expect("file mount source");

@@ -21,6 +21,44 @@ SELECT
         AS primary_exit_code,
     json_extract(completion_json, '$.result.output.execution.timed_out') AS timed_out,
     json_extract(completion_json, '$.result.output.execution.cancelled') AS cancelled
+    ,json_extract(completion_json, '$.result.output.programs.primary.start.facts.started_at')
+        AS primary_started_at
+    ,json_extract(completion_json, '$.result.output.programs.primary.process.ended_at')
+        AS primary_ended_at
+    ,ROUND((
+        unixepoch(json_extract(completion_json, '$.result.output.programs.primary.process.ended_at'), 'subsec')
+        - unixepoch(json_extract(completion_json, '$.result.output.programs.primary.start.facts.started_at'), 'subsec')
+    ) * 1000.0, 3) AS primary_duration_ms
+    ,ROUND((
+        unixepoch(json_extract(completion_json, '$.result.output.programs.primary.start.facts.started_at'), 'subsec')
+        - unixepoch(accepted_at, 'subsec')
+    ) * 1000.0, 3) AS accepted_to_primary_start_ms
+    ,ROUND((
+        unixepoch(terminal_at, 'subsec')
+        - unixepoch(json_extract(completion_json, '$.result.output.programs.primary.process.ended_at'), 'subsec')
+    ) * 1000.0, 3) AS primary_end_to_terminal_ms
+    ,CASE
+        WHEN json_extract(completion_json, '$.result.output.programs.primary.stdout.status') = 'succeeded'
+        THEN (length(json_extract(completion_json, '$.result.output.programs.primary.stdout.facts.bytes.value')) * 3 / 4)
+            - CASE
+                WHEN json_extract(completion_json, '$.result.output.programs.primary.stdout.facts.bytes.value') LIKE '%==' THEN 2
+                WHEN json_extract(completion_json, '$.result.output.programs.primary.stdout.facts.bytes.value') LIKE '%=' THEN 1
+                ELSE 0
+              END
+        ELSE NULL
+     END AS primary_stdout_bytes
+    ,CASE
+        WHEN json_extract(completion_json, '$.result.output.programs.primary.stderr.status') = 'succeeded'
+        THEN (length(json_extract(completion_json, '$.result.output.programs.primary.stderr.facts.bytes.value')) * 3 / 4)
+            - CASE
+                WHEN json_extract(completion_json, '$.result.output.programs.primary.stderr.facts.bytes.value') LIKE '%==' THEN 2
+                WHEN json_extract(completion_json, '$.result.output.programs.primary.stderr.facts.bytes.value') LIKE '%=' THEN 1
+                ELSE 0
+              END
+        ELSE NULL
+     END AS primary_stderr_bytes
+    ,json_extract(completion_json, '$.result.output.programs.primary.final_environment.value.digest')
+        AS primary_final_image_digest
 FROM main.runs;
 ";
 
@@ -110,6 +148,54 @@ const COLUMNS: &[Column] = &[
         data_type: "INTEGER",
         nullable: true,
         description: "RunOutput cancellation fact as SQLite 0 or 1.",
+    },
+    Column {
+        name: "primary_started_at",
+        data_type: "TEXT",
+        nullable: true,
+        description: "Exact primary Program start time, when start succeeded.",
+    },
+    Column {
+        name: "primary_ended_at",
+        data_type: "TEXT",
+        nullable: true,
+        description: "Exact primary Program process-result time, when observed.",
+    },
+    Column {
+        name: "primary_duration_ms",
+        data_type: "REAL",
+        nullable: true,
+        description: "Milliseconds from primary Program start to process result.",
+    },
+    Column {
+        name: "accepted_to_primary_start_ms",
+        data_type: "REAL",
+        nullable: true,
+        description: "Milliseconds from Run acceptance to primary Program start.",
+    },
+    Column {
+        name: "primary_end_to_terminal_ms",
+        data_type: "REAL",
+        nullable: true,
+        description: "Milliseconds from primary process result to terminal publication.",
+    },
+    Column {
+        name: "primary_stdout_bytes",
+        data_type: "INTEGER",
+        nullable: true,
+        description: "Exact retained primary stdout byte count when stream capture succeeded.",
+    },
+    Column {
+        name: "primary_stderr_bytes",
+        data_type: "INTEGER",
+        nullable: true,
+        description: "Exact retained primary stderr byte count when stream capture succeeded.",
+    },
+    Column {
+        name: "primary_final_image_digest",
+        data_type: "TEXT",
+        nullable: true,
+        description: "Primary Final Environment OCI Manifest digest when available.",
     },
 ];
 

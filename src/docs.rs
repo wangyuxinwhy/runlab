@@ -28,6 +28,14 @@ struct Topic {
 const TOPICS: &[Topic] = &[
     Topic {
         summary: TopicSummary {
+            name: "start-here",
+            title: "Start Here",
+            summary: "Run one complete Image-to-Final-Environment workflow.",
+        },
+        content: include_str!("../docs/start-here.md"),
+    },
+    Topic {
+        summary: TopicSummary {
             name: "how-to/build-images",
             title: "Build OCI Images for RunLab",
             summary: "Layer, configure, verify, import, and clean up Agent Images.",
@@ -79,9 +87,16 @@ mod tests {
     #[test]
     fn lists_and_gets_bundled_topics() {
         let topics = list();
-        assert_eq!(topics.len(), 2);
-        assert_eq!(topics[0].name, "how-to/build-images");
-        assert_eq!(topics[1].name, "how-to/query-runs");
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics[0].name, "start-here");
+        assert_eq!(topics[1].name, "how-to/build-images");
+        assert_eq!(topics[2].name, "how-to/query-runs");
+        assert!(
+            get("start-here")
+                .expect("start documentation")
+                .content
+                .contains("Image + Runtime Configuration + stdin + Secrets + controls")
+        );
         assert!(
             get("how-to/build-images")
                 .expect("build Image documentation")

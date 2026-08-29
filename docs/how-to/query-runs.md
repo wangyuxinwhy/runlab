@@ -11,7 +11,7 @@ runlab schema list
 runlab schema get runs
 ```
 
-The current public SQL surface contains one Relation, `runs`. It exposes accepted caller metadata, Initial Image identity, lifecycle, and a small set of terminal outcome facts. It deliberately omits complete Run input, captured streams, errors, and Final Environments; read those with `runlab run get RUN_ID`.
+The current public SQL surface contains one Relation, `runs`. It exposes accepted caller metadata, Initial Image identity, lifecycle, primary Program timestamps and durations, retained stdout/stderr byte counts, process result, timeout/cancellation facts, and the Final Image digest. It deliberately omits complete Run input, captured stream content, errors, and complete Final Environment descriptors; read those with `runlab run get RUN_ID`.
 
 `initial_image_name` is the Catalog name used when RunLab accepted the Run. It is `NULL` when the caller selected the Image by digest or when an older record predates this accepted fact. `initial_image_digest` is the immutable content identity. `labels` is a JSON object whose keys and values are caller-defined strings.
 
@@ -35,6 +35,24 @@ Count outcomes without returning every Run:
 ```bash
 runlab query run \
   "SELECT primary_process_kind, primary_exit_code, COUNT(*) AS runs FROM runs GROUP BY primary_process_kind, primary_exit_code"
+```
+
+Compare execution and platform boundary time without loading complete Run Records:
+
+```bash
+runlab query run --stdin <<'SQL'
+SELECT
+  run_id,
+  accepted_to_primary_start_ms,
+  primary_duration_ms,
+  primary_end_to_terminal_ms,
+  primary_stdout_bytes,
+  primary_final_image_digest
+FROM runs
+WHERE lifecycle = 'terminal'
+ORDER BY accepted_at DESC
+LIMIT 20;
+SQL
 ```
 
 Use `--file QUERY.sql` for a checked-in or generated query. Inline SQL, `--file`, and `--stdin` are mutually exclusive.

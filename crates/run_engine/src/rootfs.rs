@@ -12,6 +12,8 @@ use std::fs::File;
 use anyhow::Result;
 use oci_spec::image::{Descriptor, Digest, MediaType};
 
+use crate::oci::{ImagePlan, VerifiedImage};
+
 /// Stable crate-private classification for rootfs materialization failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootfsErrorKind {
@@ -63,6 +65,20 @@ impl StdError for RootfsError {
 pub(crate) struct VerifiedLayer<'a> {
     pub(crate) descriptor: &'a Descriptor,
     pub(crate) expected_diff_id: &'a Digest,
+}
+
+pub(crate) fn cached_image_validation(
+    cache_root: &std::path::Path,
+    image: &ImagePlan,
+) -> Result<Option<Vec<u64>>> {
+    platform::cached_image_validation(cache_root, image)
+}
+
+pub(crate) fn record_image_validation(
+    cache_root: &std::path::Path,
+    image: &VerifiedImage,
+) -> Result<()> {
+    platform::record_image_validation(cache_root, image)
 }
 
 /// Explicit resource limits shared by materialization and capture.

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageIndex, ImageManifest, MediaType, Os};
@@ -97,6 +97,14 @@ pub(crate) struct ImageGetResult {
     metadata: Option<Metadata>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct ImageExportResult {
+    schema_version: u32,
+    manifest: Descriptor,
+    output: String,
+    size: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ImagePlatform {
     os: String,
@@ -182,15 +190,23 @@ impl<'a> Images<'a> {
     pub(crate) fn get(&self, selector: &ImageSelector) -> Result<ImageGetResult> {
         let (image, metadata) = match selector {
             ImageSelector::Name(name) => {
-                let (descriptor, metadata) = self
-                    .database
-                    .catalog_get(name)?
-                    .with_context(|| format!("local Image name is unknown: {name}"))?;
+                let (descriptor, metadata) = self.database.catalog_get(name)?.ok_or_else(|| {
+                    crate::error::classify(
+                        anyhow::anyhow!("local Image name is unknown: {name}"),
+                        crate::error::ErrorFacts::before_run(
+                            crate::error::ErrorCategory::NotFound,
+                            "image_resolution",
+                        ),
+                    )
+                })?;
                 let descriptor = serde_json::from_value(descriptor)
                     .context("stored Image descriptor is invalid")?;
-                (inspect_descriptor(&self.store, descriptor)?, Some(metadata))
+                (
+                    inspect_descriptor_structure(&self.store, descriptor)?,
+                    Some(metadata),
+                )
             }
-            ImageSelector::Digest(_) => (self.inspect(selector)?, None),
+            ImageSelector::Digest(_) => (self.resolve_input(selector)?, None),
         };
         Ok(ImageGetResult {
             schema_version: 1,
@@ -203,8 +219,10 @@ impl<'a> Images<'a> {
         })
     }
 
-    pub(crate) fn resolve(&self, selector: &ImageSelector) -> Result<InspectedImage> {
-        self.inspect(selector)
+    /// Resolves the small Image structure needed to form `RunInput`. `NativeEngine`
+    /// owns Layer validation and its snapshot-backed validation cache.
+    pub(crate) fn resolve_input(&self, selector: &ImageSelector) -> Result<InspectedImage> {
+        inspect_descriptor_structure(&self.store, self.resolve_descriptor(selector)?)
     }
 
     pub(crate) fn filesystem(&self, selector: &ImageSelector) -> Result<ImageFilesystem> {
@@ -222,14 +240,97 @@ impl<'a> Images<'a> {
         })
     }
 
+    pub(crate) fn export(
+        &self,
+        selector: &ImageSelector,
+        output: &Path,
+    ) -> Result<ImageExportResult> {
+        self.export_manifest(self.resolve_descriptor(selector)?, output)
+    }
+
+    pub(crate) fn export_manifest(
+        &self,
+        manifest: Descriptor,
+        output: &Path,
+    ) -> Result<ImageExportResult> {
+        let (manifest_view, _) = read_image_structure(&self.store, &manifest)?;
+        let parent = output
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = parent
+            .canonicalize()
+            .with_context(|| format!("failed to resolve output parent for {}", output.display()))?;
+        let name = output
+            .file_name()
+            .context("--output must identify a new OCI archive")?;
+        let destination = parent.join(name);
+        if destination.exists() {
+            bail!("output path already exists: {}", destination.display());
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
+        {
+            let mut archive = tar::Builder::new(temporary.as_file_mut());
+            append_archive_bytes(
+                &mut archive,
+                "oci-layout",
+                br#"{"imageLayoutVersion":"1.0.0"}"#,
+            )?;
+            let index = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "manifests": [manifest],
+            }))?;
+            append_archive_bytes(&mut archive, "index.json", &index)?;
+            let mut descriptors = vec![manifest_view.config().clone()];
+            descriptors.extend(manifest_view.layers().iter().cloned());
+            descriptors.push(manifest.clone());
+            descriptors.sort_by_key(|descriptor| descriptor.digest().to_string());
+            descriptors.dedup_by(|left, right| left.digest() == right.digest());
+            for descriptor in &descriptors {
+                append_archive_blob(&mut archive, &self.store, descriptor)?;
+            }
+            archive.finish()?;
+        }
+        temporary.as_file_mut().sync_all()?;
+        let size = temporary.as_file().metadata()?.len();
+        temporary.persist_noclobber(&destination).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot publish OCI archive {} without overwriting: {}",
+                destination.display(),
+                error.error
+            )
+        })?;
+        Ok(ImageExportResult {
+            schema_version: 1,
+            manifest,
+            output: destination.display().to_string(),
+            size,
+        })
+    }
+
     fn resolve_descriptor(&self, selector: &ImageSelector) -> Result<Descriptor> {
         match selector {
-            ImageSelector::Digest(digest) => self.store.manifest_descriptor(digest),
+            ImageSelector::Digest(digest) => {
+                self.store.manifest_descriptor(digest).map_err(|error| {
+                    crate::error::classify(
+                        error,
+                        crate::error::ErrorFacts::before_run(
+                            crate::error::ErrorCategory::NotFound,
+                            "image_resolution",
+                        ),
+                    )
+                })
+            }
             ImageSelector::Name(name) => {
-                let (value, _) = self
-                    .database
-                    .catalog_get(name)?
-                    .with_context(|| format!("local Image name is unknown: {name}"))?;
+                let (value, _) = self.database.catalog_get(name)?.ok_or_else(|| {
+                    crate::error::classify(
+                        anyhow::anyhow!("local Image name is unknown: {name}"),
+                        crate::error::ErrorFacts::before_run(
+                            crate::error::ErrorCategory::NotFound,
+                            "image_resolution",
+                        ),
+                    )
+                })?;
                 serde_json::from_value(value).context("stored Image descriptor is invalid")
             }
         }
@@ -295,9 +396,83 @@ impl<'a> Images<'a> {
             imported_blobs: blobs.len(),
         })
     }
+}
 
-    fn inspect(&self, selector: &ImageSelector) -> Result<InspectedImage> {
-        inspect_descriptor(&self.store, self.resolve_descriptor(selector)?)
+fn append_archive_bytes(
+    archive: &mut tar::Builder<&mut File>,
+    path: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(u64::try_from(bytes.len())?);
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_cksum();
+    archive.append_data(&mut header, path, Cursor::new(bytes))?;
+    Ok(())
+}
+
+fn append_archive_blob(
+    archive: &mut tar::Builder<&mut File>,
+    store: &LocalOciStore,
+    descriptor: &Descriptor,
+) -> Result<()> {
+    let digest = descriptor.digest().to_string();
+    let encoded = validate_digest(&digest)?;
+    let source = File::open(store.blob_path(&digest)?)?;
+    ensure!(
+        source.metadata()?.len() == descriptor.size(),
+        "OCI content size does not match {digest}"
+    );
+    let mut source = HashingReader {
+        inner: source,
+        hasher: Sha256::new(),
+        size: 0,
+    };
+    let mut header = tar::Header::new_gnu();
+    header.set_size(descriptor.size());
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_cksum();
+    archive.append_data(
+        &mut header,
+        format!("blobs/sha256/{encoded}"),
+        source.by_ref().take(descriptor.size()),
+    )?;
+    ensure!(
+        source.size == descriptor.size(),
+        "OCI content size does not match {digest}"
+    );
+    let mut actual = String::from("sha256:");
+    for byte in source.hasher.finalize() {
+        write!(&mut actual, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    ensure!(
+        actual == digest,
+        "OCI content digest does not match {digest}"
+    );
+    Ok(())
+}
+
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+    size: u64,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        self.size = self
+            .size
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| std::io::Error::other("OCI content size overflow"))?;
+        Ok(read)
     }
 }
 
@@ -311,6 +486,25 @@ fn inspect_descriptor(store: &LocalOciStore, manifest: Descriptor) -> Result<Ins
         let bytes = store.read(layer)?;
         verify_diff_id(layer, &bytes, diff_id)?;
     }
+    let platform = ImagePlatform {
+        os: config.os().to_string(),
+        architecture: config.architecture().to_string(),
+        variant: config.variant().clone(),
+    };
+    Ok(InspectedImage {
+        manifest,
+        config: manifest_view.config().clone(),
+        layers: manifest_view.layers().clone(),
+        platform,
+        image_configuration: config,
+    })
+}
+
+fn inspect_descriptor_structure(
+    store: &LocalOciStore,
+    manifest: Descriptor,
+) -> Result<InspectedImage> {
+    let (manifest_view, config) = read_image_structure(store, &manifest)?;
     let platform = ImagePlatform {
         os: config.os().to_string(),
         architecture: config.architecture().to_string(),

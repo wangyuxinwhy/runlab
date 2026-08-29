@@ -23,8 +23,11 @@ use super::profile::{
 };
 use super::runc::helper_message;
 use super::subprocess::{InvocationSupervisor, run_helper};
-use crate::oci::{OciSourceCategory, VerifiedImage, inspect_image};
-use crate::rootfs::{Rootfs, RootfsError, RootfsErrorKind, RootfsLimits, VerifiedLayer};
+use crate::oci::{OciSourceCategory, VerifiedImage, inspect_image, inspect_image_plan};
+use crate::rootfs::{
+    Rootfs, RootfsError, RootfsErrorKind, RootfsLimits, VerifiedLayer, cached_image_validation,
+    record_image_validation,
+};
 use crate::{ContentError, ContentErrorKind, OciContentStore};
 
 pub(super) const MAX_PROGRAMS: usize = 8;
@@ -79,7 +82,7 @@ impl Preparation<'_> {
         let workspace_root = ensure_private_directory(&engine_root.join("invocations"))?;
         let snapshot_root = ensure_private_directory(&engine_root.join("snapshots-v3"))?;
         let runc = validate_runc(self.runc_executable, self.budget, self.supervisor)?;
-        let images = self.inspect_images()?;
+        let images = self.inspect_images(&snapshot_root)?;
         let invocation = create_invocation_workspace(&workspace_root)?;
         let runtime_root = invocation.path().join("runtime");
         create_private_directory(&runtime_root).map_err(|error| {
@@ -108,11 +111,33 @@ impl Preparation<'_> {
         })
     }
 
-    fn inspect_images(&self) -> Result<BTreeMap<ProgramId, VerifiedImage>, EngineError> {
+    fn inspect_images(
+        &self,
+        snapshot_root: &Path,
+    ) -> Result<BTreeMap<ProgramId, VerifiedImage>, EngineError> {
         let mut images = BTreeMap::new();
         for (program_id, program) in self.input.programs() {
-            let image =
-                inspect_program_image(program_id, self.store, program.initial_environment());
+            let plan = inspect_image_plan(self.store, program.initial_environment())
+                .map_err(|error| map_oci_error(program_id, &error))?;
+            let cached = self
+                .store
+                .published_content_is_immutable()
+                .then(|| cached_image_validation(snapshot_root, &plan))
+                .transpose()
+                .map_err(|error| {
+                    EngineError::internal(format!(
+                        "failed to read Program {program_id:?} snapshot validation: {error:#}"
+                    ))
+                })?
+                .flatten();
+            let image = match cached {
+                Some(sizes) => plan
+                    .verified_from_snapshot(sizes)
+                    .map_err(|error| map_oci_error(program_id, &error)),
+                None => {
+                    inspect_program_image(program_id, self.store, program.initial_environment())
+                }
+            };
             self.check_budget()?;
             let image = image?;
             validate_platform(program_id, &image)?;
@@ -170,6 +195,12 @@ impl Preparation<'_> {
         );
         self.check_budget()?;
         let rootfs = rootfs?;
+        record_image_validation(program.snapshot_root, program.image).map_err(|error| {
+            EngineError::internal(format!(
+                "failed to record Program {:?} snapshot validation: {error:#}",
+                program.id
+            ))
+        })?;
         let (config_bytes, config, mut sensitive_artifacts) =
             derived_runtime_config(program.invocation.path(), program.index, program.input)
                 .map_err(|error| {
@@ -222,6 +253,7 @@ impl Preparation<'_> {
             expected_cgroup_path,
             rootfs,
             parent: program.input.initial_environment().clone(),
+            verified_parent: Some(program.image.clone()),
             artifacts,
             sensitive_artifacts,
             egress: program
@@ -330,6 +362,7 @@ pub(super) struct PreparedProgram {
     pub(super) expected_cgroup_path: PathBuf,
     pub(super) rootfs: Rootfs,
     pub(super) parent: ImageDescriptor,
+    pub(super) verified_parent: Option<VerifiedImage>,
     pub(super) artifacts: Vec<PathBuf>,
     pub(super) sensitive_artifacts: Vec<PathBuf>,
     pub(super) egress: Option<EgressPlan>,

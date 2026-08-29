@@ -73,6 +73,10 @@ impl BudgetedStore {
 }
 
 impl OciContentStore for BudgetedStore {
+    fn published_content_is_immutable(&self) -> bool {
+        self.inner.published_content_is_immutable()
+    }
+
     fn open(&self, descriptor: &Descriptor) -> Result<Box<dyn OciContent>, ContentError> {
         self.budget.check_content()?;
         let content = self.inner.open(descriptor)?;

@@ -77,6 +77,7 @@ pub(super) fn empty_prepared_invocation(
         expected_cgroup_path: Path::new("/sys/fs/cgroup").join(runtime_id),
         rootfs,
         parent: test_image(),
+        verified_parent: None,
         artifacts: Vec::new(),
         sensitive_artifacts: Vec::new(),
         egress: None,

@@ -1,18 +1,24 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 use std::time::Instant;
 
 use run_protocol::{EngineError, InputPath};
+use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+use rustix::io::Errno;
 
 use super::subprocess::{HelperOutput, InvocationSupervisor, run_helper_until};
+use super::time::POLL_INTERVAL;
 use crate::CancellationToken;
 
 pub(super) const HOST_ADDRESS: &str = "169.254.254.1";
 const GUEST_ADDRESS_POOL: &str = "10.240.0.0/12";
+const NETWORK_MUTATION_LOCK: &str = "/run/run-engine-network.lock";
 
 #[derive(Clone)]
 pub(super) struct EgressTools {
@@ -109,6 +115,7 @@ impl EgressNetwork {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), NetworkCommandError> {
+        let _mutation = HostNetworkMutation::acquire(deadline, Some(cancellation))?;
         let host = self.plan.host_interface.clone();
         let peer = self.plan.peer_interface.clone();
         let guest = self.plan.guest_address.clone();
@@ -185,6 +192,16 @@ impl EgressNetwork {
         deadline: Instant,
     ) -> Vec<NetworkCleanupIssue> {
         let mut issues = Vec::new();
+        let _mutation = match HostNetworkMutation::acquire(deadline, None) {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                issues.push(NetworkCleanupIssue {
+                    message: format!("failed to acquire egress network cleanup ownership: {error}"),
+                    supervisor_reaped: error.supervisor_reaped,
+                });
+                return issues;
+            }
+        };
         while let Some(command) = self.cleanup.pop() {
             if let Err(error) = run(&command, supervisor, deadline, None) {
                 issues.push(NetworkCleanupIssue {
@@ -218,9 +235,65 @@ impl EgressNetwork {
     }
 }
 
+struct HostNetworkMutation {
+    // iptables locks one command at a time, while one Run's policy spans many
+    // commands. This file lock makes that policy publication atomic relative
+    // to every NativeEngine process on the host without serializing execution.
+    _lock: OwnedFd,
+}
+
+impl HostNetworkMutation {
+    fn acquire(
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Self, NetworkCommandError> {
+        let lock = open(
+            NETWORK_MUTATION_LOCK,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| {
+            NetworkCommandError::local(format!(
+                "cannot open host network ownership lock {NETWORK_MUTATION_LOCK}: {error}"
+            ))
+        })?;
+        loop {
+            match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(Self { _lock: lock }),
+                Err(Errno::WOULDBLOCK) => {}
+                Err(error) => {
+                    return Err(NetworkCommandError::local(format!(
+                        "cannot acquire host network ownership lock {NETWORK_MUTATION_LOCK}: {error}"
+                    )));
+                }
+            }
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(NetworkCommandError::local(
+                    "cancelled while waiting for host network mutation ownership",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(NetworkCommandError::local(
+                    "host network mutation ownership deadline exceeded",
+                ));
+            }
+            thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+}
+
 pub(super) struct NetworkCommandError {
     message: String,
     pub(super) supervisor_reaped: bool,
+}
+
+impl NetworkCommandError {
+    fn local(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            supervisor_reaped: true,
+        }
+    }
 }
 
 impl std::fmt::Display for NetworkCommandError {

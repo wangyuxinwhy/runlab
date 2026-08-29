@@ -2,6 +2,7 @@
 
 mod cli;
 mod docs;
+mod error;
 // macOS reuses these modules' validated CLI value types while their State
 // implementation runs only in the managed Linux guest.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -23,12 +24,14 @@ mod runtime_config;
 mod state;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod storage;
+#[cfg(target_os = "linux")]
+mod storage_management;
 
 fn main() {
     let exit = match cli::run() {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("{error:#}");
+            error::emit(&error);
             1
         }
     };

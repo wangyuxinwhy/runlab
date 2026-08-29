@@ -183,6 +183,8 @@ impl ProgramStarter<'_> {
             }
         }
 
+        establish_process_result_monitor(init_pid, &mut run);
+
         let start_wall = wall_clock_now();
         let start_monotonic = Instant::now();
         run.runtime.execution_entry = Some((start_wall, start_monotonic));
@@ -584,14 +586,6 @@ fn establish_created_process_evidence(
             return None;
         }
     };
-    match ProcExitMonitor::subscribe(init_pid) {
-        Ok(monitor) => run.runtime.exit_monitor = Some(monitor),
-        Err(error) => {
-            run.runtime.exit_monitor_diagnostic = Some(format!(
-                "raw process-result monitoring is unavailable; termination will remain Unknown: {error:#}"
-            ));
-        }
-    }
     match observe_owned_cgroup(init_pid, &prepared.expected_cgroup_path) {
         Ok(path) => run.runtime.cgroup_path = Some(path),
         Err(error) => {
@@ -604,6 +598,17 @@ fn establish_created_process_evidence(
         }
     }
     Some(init_pid)
+}
+
+fn establish_process_result_monitor(init_pid: u32, run: &mut ProgramRun) {
+    match ProcExitMonitor::subscribe(init_pid) {
+        Ok(monitor) => run.runtime.exit_monitor = Some(monitor),
+        Err(error) => {
+            run.runtime.exit_monitor_diagnostic = Some(format!(
+                "raw process-result monitoring is unavailable; termination will remain Unknown: {error:#}"
+            ));
+        }
+    }
 }
 
 fn start_deadline(

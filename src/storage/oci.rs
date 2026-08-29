@@ -77,16 +77,16 @@ impl LocalOciStore {
 }
 
 impl OciContentStore for LocalOciStore {
+    fn published_content_is_immutable(&self) -> bool {
+        true
+    }
+
     fn open(&self, descriptor: &Descriptor) -> Result<Box<dyn OciContent>, ContentError> {
         let path = self
             .blob_path(descriptor.digest().as_ref())
             .map_err(|error| content_error(ContentErrorKind::Unavailable, error))?;
-        let mut file = File::open(&path)
+        let file = File::open(&path)
             .map_err(|error| content_error(ContentErrorKind::Unavailable, error))?;
-        verify_reader(descriptor, &mut file)
-            .map_err(|error| content_error(ContentErrorKind::Unavailable, error))?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| content_error(ContentErrorKind::Internal, error))?;
         Ok(Box::new(file))
     }
 

@@ -58,6 +58,14 @@ impl ContentError {
 /// kernel syscall is a host-failure boundary; this interface does not pretend a
 /// deadline argument could cancel such a syscall.
 pub trait OciContentStore: Send + Sync {
+    /// Whether content that was successfully verified can be reused without
+    /// re-reading its bytes. The default is conservative. A `true` result is a
+    /// promise that published content cannot be replaced or removed while the
+    /// store is in use.
+    fn published_content_is_immutable(&self) -> bool {
+        false
+    }
+
     /// Opens the exact bytes identified by a complete OCI Descriptor.
     ///
     /// The returned reader starts at byte zero and supports seeking so a caller
