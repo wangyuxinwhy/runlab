@@ -167,7 +167,7 @@ fn authorize(
     public_count: &AtomicBool,
 ) -> Authorization {
     match context.action {
-        AuthAction::Select if context.accessor == Some("runs") => {
+        AuthAction::Select if matches!(context.accessor, Some("runs" | "run_deletions")) => {
             public_count.store(true, Ordering::Relaxed);
             Authorization::Allow
         }
@@ -178,7 +178,7 @@ fn authorize(
             Authorization::Allow
         }
         AuthAction::Read {
-            table_name: "runs",
+            table_name: "runs" | "run_tombstones",
             column_name: "",
         } if context.database_name == Some("main")
             && context.accessor.is_none()
@@ -187,10 +187,14 @@ fn authorize(
             Authorization::Allow
         }
         AuthAction::Read { table_name, .. }
-            if (context.database_name == Some("temp") && table_name == "runs")
+            if (context.database_name == Some("temp")
+                && matches!(table_name, "runs" | "run_deletions"))
                 || (context.database_name == Some("main")
                     && table_name == "runs"
-                    && context.accessor == Some("runs")) =>
+                    && context.accessor == Some("runs"))
+                || (context.database_name == Some("main")
+                    && table_name == "run_tombstones"
+                    && context.accessor == Some("run_deletions")) =>
         {
             Authorization::Allow
         }
@@ -348,13 +352,46 @@ mod tests {
         );
         assert_eq!(report.rows[0]["suite"], "swe-bench");
         assert_eq!(report.rows[0]["completion_kind"], "engine_error");
+        let terminal = execute("SELECT terminal_at, terminal_unix_seconds FROM runs")
+            .expect("terminal range value");
+        assert_eq!(
+            terminal.rows[0]["terminal_at"],
+            "2026-08-28T01:02:04.123456789Z"
+        );
+        assert!(terminal.rows[0]["terminal_unix_seconds"].as_f64().is_some());
 
         let count = execute("SELECT COUNT(*) AS run_count FROM runs").expect("public count");
         assert_eq!(count.rows[0]["run_count"], 1);
 
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO main.run_tombstones(run_id, deleted_at, operation_id)
+                     VALUES (?1, ?2, ?3)",
+                    [
+                        "550e8400-e29b-41d4-a716-446655440001",
+                        "2026-08-29T00:00:00Z",
+                        "550e8400-e29b-41d4-a716-446655440002",
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("tombstone fixture");
+        let deletions = execute("SELECT run_id, deleted_at, operation_id FROM run_deletions")
+            .expect("public deletion query");
+        assert_eq!(deletions.returned, 1);
+        assert_eq!(
+            deletions.rows[0]["operation_id"],
+            "550e8400-e29b-41d4-a716-446655440002"
+        );
+        let deletion_count =
+            execute("SELECT COUNT(*) AS n FROM run_deletions").expect("public deletion count");
+        assert_eq!(deletion_count.rows[0]["n"], 1);
+
         for sql in [
             "SELECT * FROM main.runs",
             "SELECT COUNT(*) FROM main.runs",
+            "SELECT * FROM main.run_tombstones",
             "SELECT (SELECT COUNT(*) FROM main.runs) AS leaked FROM runs",
             "SELECT * FROM sqlite_schema",
             "DELETE FROM runs",

@@ -19,6 +19,8 @@ mod query;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod run;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
+mod run_deletion;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod run_record;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod runtime_config;

@@ -23,6 +23,7 @@ use crate::image::Images;
 use crate::run::RunId;
 #[cfg(not(target_os = "macos"))]
 use crate::run::{ExecutionRequest, RunRequest, Runs};
+use crate::run_deletion::OperationId;
 #[cfg(not(target_os = "macos"))]
 use crate::state::State;
 
@@ -57,6 +58,11 @@ pub(super) enum RunCommand {
         /// Canonical lowercase UUID v4 of the Run to reconcile.
         run_id: RunId,
     },
+    /// Permanently retire complete Run assets through a checked, idempotent plan.
+    Delete {
+        #[command(subcommand)]
+        command: RunDeleteCommand,
+    },
     /// Read one complete Run record, including caller-provided metadata, by identity.
     Get {
         /// Canonical lowercase UUID v4 assigned when the Run was started.
@@ -70,6 +76,33 @@ pub(super) enum RunCommand {
         /// Continue strictly after this canonical Run UUID.
         #[arg(long)]
         after: Option<RunId>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum RunDeleteCommand {
+    /// Validate a bounded Run ID set and write an auditable deletion plan to stdout.
+    #[command(
+        long_about = "Validate a bounded caller-selected Run ID set without deleting anything. The caller-owned operation ID identifies this deletion intent across retries; each candidate fingerprint freezes the database fact that apply will verify. Use storage prune check --without-runs first when reclaimable content matters.",
+        after_long_help = "Example:\n  runlab run delete check --operation-id 550e8400-e29b-41d4-a716-446655440000 --ids run-ids.txt >delete-plan.json"
+    )]
+    Check {
+        /// Caller-owned canonical UUID v4; reuse it for every retry of this deletion intent.
+        #[arg(long)]
+        operation_id: OperationId,
+        /// Newline-delimited canonical Run UUIDs; use - for stdin, at most 1000 entries.
+        #[arg(long, value_name = "FILE")]
+        ids: PathBuf,
+    },
+    /// Atomically delete every candidate in a checked plan; use - to read the plan from stdin.
+    #[command(
+        long_about = "Apply one checked Run deletion plan in a short SQLite write transaction. The candidate set is all-or-nothing. The operation ID makes retry after a lost success response idempotent; candidate fingerprints reject stale records. OCI blobs and snapshot cache are not removed by this command.",
+        after_long_help = "Example:\n  runlab run delete apply --plan delete-plan.json\n  runlab run delete check --operation-id 550e8400-e29b-41d4-a716-446655440000 --ids run-ids.txt | runlab run delete apply --plan -"
+    )]
+    Apply {
+        /// Exact JSON plan emitted by run delete check; use - for stdin.
+        #[arg(long, value_name = "FILE")]
+        plan: PathBuf,
     },
 }
 
@@ -301,6 +334,12 @@ fn detached_child_result(success: bool, stdout: &Path, stderr: &Path) -> Result<
 
 #[cfg(not(target_os = "macos"))]
 pub(super) fn execute(state_path: &Path, command: RunCommand) -> Result<u8> {
+    if let RunCommand::Delete {
+        command: RunDeleteCommand::Apply { plan },
+    } = &command
+    {
+        return execute_delete_apply(state_path, plan);
+    }
     let state = State::open(state_path)?;
     let images = Images::new(state.oci(), state.database());
     let runs = Runs::new(state.database(), &images);
@@ -337,9 +376,35 @@ pub(super) fn execute(state_path: &Path, command: RunCommand) -> Result<u8> {
         }
         RunCommand::Cancel { run_id } => emit(&runs.cancel(run_id)?)?,
         RunCommand::Reconcile { run_id } => emit(&runs.reconcile(run_id)?)?,
+        RunCommand::Delete { command } => match command {
+            RunDeleteCommand::Check { operation_id, ids } => {
+                let run_ids = super::input::read_required_run_ids(&ids)
+                    .map_err(|error| crate::error::invalid_input(error, "run_delete_input"))?;
+                emit(&crate::run_deletion::check(
+                    state.database(),
+                    operation_id,
+                    &run_ids,
+                )?)?;
+            }
+            RunDeleteCommand::Apply { .. } => {
+                unreachable!("Run deletion apply is handled before opening State")
+            }
+        },
         RunCommand::Get { run_id } => emit(&runs.get(run_id)?)?,
         RunCommand::List { limit, after } => emit(&runs.list(limit, after)?)?,
     }
+    Ok(0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn execute_delete_apply(state_path: &Path, plan: &Path) -> Result<u8> {
+    let bytes = super::input::read_bounded(plan, 8 * 1024 * 1024, "Run deletion plan")
+        .map_err(|error| crate::error::invalid_input(error, "run_delete_input"))?;
+    let plan = crate::run_deletion::parse_plan(&bytes)
+        .map_err(|error| crate::error::invalid_input(error, "run_delete_input"))?;
+    let state = State::open(state_path)
+        .map_err(|error| crate::run_deletion::classify_open_error(error, plan.operation_id()))?;
+    emit(&crate::run_deletion::apply(state.database(), plan)?)?;
     Ok(0)
 }
 
@@ -391,6 +456,20 @@ pub(super) fn execute_managed(command: RunCommand) -> Result<u8> {
         }
         RunCommand::Cancel { run_id } => vm.forward_run_cancel(&run_id.to_string())?,
         RunCommand::Reconcile { run_id } => vm.forward_run_reconcile(&run_id.to_string())?,
+        RunCommand::Delete { command } => match command {
+            RunDeleteCommand::Check { operation_id, ids } => {
+                let run_ids = super::input::read_required_run_ids(&ids)
+                    .map_err(|error| crate::error::invalid_input(error, "run_delete_input"))?;
+                vm.forward_run_delete_check(&operation_id.to_string(), &run_ids)?
+            }
+            RunDeleteCommand::Apply { plan } => {
+                let bytes = super::input::read_bounded(&plan, 8 * 1024 * 1024, "Run deletion plan")
+                    .map_err(|error| crate::error::invalid_input(error, "run_delete_input"))?;
+                crate::run_deletion::parse_plan(&bytes)
+                    .map_err(|error| crate::error::invalid_input(error, "run_delete_input"))?;
+                vm.forward_run_delete_apply(&bytes)?
+            }
+        },
         RunCommand::Get { run_id } => vm.forward_run_get(&run_id.to_string())?,
         RunCommand::List { limit, after } => {
             let after = after.map(|value| value.to_string());

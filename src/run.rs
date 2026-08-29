@@ -33,7 +33,7 @@ use crate::observation::RunObservation;
 use crate::run_record::{CompletionRecord, EngineResultRecord, InputIdentityRecord, InputRecord};
 use crate::state::State;
 use crate::storage::{
-    Database, ExecutionOwner, ExecutionPhase, NewRun, RunCancellation, StoredRun,
+    Database, ExecutionOwner, ExecutionPhase, NewRun, RunCancellation, RunInsertion, StoredRun,
 };
 
 const MAX_PAGE_SIZE: usize = 100;
@@ -191,7 +191,7 @@ impl<'a> Runs<'a> {
         let engine = native_engine(state)?;
         let accepted_at = Utc::now().to_rfc3339();
         let owner = current_execution_owner()?;
-        let created = self.database.run_insert(&NewRun {
+        let insertion = self.database.run_insert(&NewRun {
             run_id: &run_id,
             accepted_at: &accepted_at,
             initial_image_name: request.execution.image.catalog_name(),
@@ -200,7 +200,10 @@ impl<'a> Runs<'a> {
             input_identity: &prepared.identity,
             owner: &owner,
         })?;
-        if !created {
+        if let RunInsertion::Deleted(ref tombstone) = insertion {
+            return Err(deleted_identity_error(&run_id, tombstone));
+        }
+        if matches!(insertion, RunInsertion::Existing) {
             let existing = self
                 .database
                 .run_get(&run_id)?
@@ -211,25 +214,13 @@ impl<'a> Runs<'a> {
                 request.execution.image.catalog_name(),
                 &request.metadata,
             ) {
-                return Err(crate::error::classify(
-                    anyhow::anyhow!(
-                        "Run identity is already bound to a different request: {run_id}"
-                    ),
-                    crate::error::ErrorFacts {
-                        category: crate::error::ErrorCategory::Conflict,
-                        stage: "acceptance",
-                        run_id: Some(run_id),
-                        accepted: Some(false),
-                        run_created: Some(false),
-                        retryable: false,
-                        recovery: None,
-                    },
-                ));
+                return Err(identity_conflict_error(&run_id));
             }
             let observation = persistent_observation(&run_id, observe, false);
             observation.finish();
             return start_result(&existing, false);
         }
+        debug_assert!(matches!(insertion, RunInsertion::Created));
 
         let accepted = (|| {
             let observation = persistent_observation(&run_id, observe, signal_detached_ready);
@@ -380,15 +371,24 @@ impl<'a> Runs<'a> {
 
     pub(crate) fn get(&self, run_id: RunId) -> Result<Value> {
         let run_id = run_id.to_string();
-        let record = self.database.run_get(&run_id)?.ok_or_else(|| {
-            crate::error::classify(
-                anyhow::anyhow!("Run does not exist: {run_id}"),
+        let Some(record) = self.database.run_get(&run_id)? else {
+            let message = self.database.run_tombstone(&run_id)?.map_or_else(
+                || format!("Run does not exist: {run_id}"),
+                |tombstone| {
+                    format!(
+                        "Run was deleted at {} by operation {}: {run_id}",
+                        tombstone.deleted_at, tombstone.operation_id
+                    )
+                },
+            );
+            return Err(crate::error::classify(
+                anyhow::anyhow!(message),
                 crate::error::ErrorFacts::before_run(
                     crate::error::ErrorCategory::NotFound,
                     "run_lookup",
                 ),
-            )
-        })?;
+            ));
+        };
         Ok(record_json(&record))
     }
 
@@ -544,6 +544,43 @@ impl<'a> Runs<'a> {
             }
         }
     }
+}
+
+fn identity_conflict_error(run_id: &str) -> anyhow::Error {
+    crate::error::classify(
+        anyhow::anyhow!("Run identity is already bound to a different request: {run_id}"),
+        crate::error::ErrorFacts {
+            category: crate::error::ErrorCategory::Conflict,
+            stage: "acceptance",
+            run_id: Some(run_id.to_owned()),
+            accepted: Some(false),
+            run_created: Some(false),
+            retryable: false,
+            recovery: None,
+        },
+    )
+}
+
+fn deleted_identity_error(run_id: &str, tombstone: &crate::storage::RunTombstone) -> anyhow::Error {
+    crate::error::classify(
+        anyhow::anyhow!(
+            "Run identity was permanently retired at {} by deletion operation {}: {run_id}",
+            tombstone.deleted_at,
+            tombstone.operation_id
+        ),
+        crate::error::ErrorFacts {
+            category: crate::error::ErrorCategory::Conflict,
+            stage: "acceptance",
+            run_id: Some(run_id.to_owned()),
+            accepted: Some(false),
+            run_created: Some(false),
+            retryable: false,
+            recovery: Some(format!(
+                "choose a new Run UUID; query `run_deletions` for the retired identity {}",
+                tombstone.run_id
+            )),
+        },
+    )
 }
 
 enum ExecutionOwnerState {

@@ -31,6 +31,7 @@ runlab exec
 runlab run config generate
 runlab run start
 runlab run cancel
+runlab run delete check|apply
 runlab run get
 runlab run list
 runlab schema list|get
@@ -45,6 +46,7 @@ Version-matched operational guidance is bundled with the binary and does not ope
 runlab docs list
 runlab docs get how-to/build-images
 runlab docs get how-to/query-runs
+runlab docs get how-to/delete-runs
 ```
 
 `docs get` writes Markdown by default; `--output json` returns the same document in a compact JSON envelope. The bundled guides cover standard OCI Image authoring and bounded read-only Run queries.
@@ -159,7 +161,9 @@ While `run start` is active, stderr emits an NDJSON observation stream beginning
 
 For a foreground `exec`, `SIGINT` and `SIGTERM` cancel the current synchronous Engine invocation; no temporary public identity or follow-up command is created. `--state` can be replaced by `RUNLAB_STATE`. Otherwise RunLab uses `$XDG_DATA_HOME/runlab` or `$HOME/.local/share/runlab`.
 
-`storage status` reports filesystem capacity, State component allocation, immutable asset references, missing referenced content, and safely reclaimable bytes. `storage prune check` returns the same bounded deletion plan without mutation. `storage prune apply` requires exclusive State access and removes only unreferenced OCI blobs, unreachable snapshot cache entries, and stale invocation staging; it never deletes Catalog entries, Run records, or their referenced OCI content.
+`storage status` reports filesystem capacity, State component allocation, immutable asset references, missing referenced content, and safely reclaimable bytes. `storage prune check` reports the same facts without mutation and supports `--without-runs FILE` for a hypothetical terminal-Run root set. `storage prune apply` requires exclusive State access, fails closed when the reference graph is incomplete, and removes only unreferenced OCI blobs, unreachable snapshot cache entries, and stale invocation staging. Snapshot removal turns subsequent execution timing into cold-cache evidence.
+
+Terminal Run assets are deleted separately with `run delete check --operation-id UUID --ids FILE` followed by `run delete apply --plan FILE`. The plan freezes a bounded database selection; apply is atomic and retryable by operation identity. Tombstones permanently prevent reuse of deleted Run UUIDs and remain queryable through `run_deletions`. Run deletion does not delete OCI content, does not VACUUM SQLite, and is storage lifecycle deletion rather than secure erasure. See `runlab docs get how-to/delete-runs`.
 
 `assets.active_runs` counts Runs for which no terminal completion has been published. It is a persistent lifecycle count, not proof that a Coordinator or Program process is currently alive. `run reconcile RUN_ID` consults the private execution journal: it can publish a durably staged Engine result, or publish `interrupted` when the recorded owner is dead and the journal proves the Engine was never started. Once the Engine has started, the Run remains accepted with `evidence_incomplete` unless safe resource cleanup or an Engine result has been proved.
 

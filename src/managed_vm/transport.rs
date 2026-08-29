@@ -73,6 +73,31 @@ impl ManagedVm {
             .map(Into::into)
     }
 
+    pub(crate) fn forward_storage_prune_check(
+        &self,
+        without_runs: &BTreeSet<String>,
+    ) -> Result<ForwardedOutput> {
+        if without_runs.is_empty() {
+            return self.forward_storage(&["storage", "prune", "check"]);
+        }
+        let mut input =
+            tempfile::NamedTempFile::new().context("failed to stage hypothetical Run IDs")?;
+        for run_id in without_runs {
+            writeln!(input, "{run_id}")?;
+        }
+        input.flush()?;
+        let staged = self.stage_input(input.path(), "without-runs")?;
+        let output = self.state_command([
+            OsString::from("storage"),
+            OsString::from("prune"),
+            OsString::from("check"),
+            OsString::from("--without-runs"),
+            OsString::from(&staged),
+        ]);
+        self.cleanup_inputs(&[&staged]);
+        output.map(Into::into)
+    }
+
     pub(crate) fn forward_image_import(
         &self,
         source: &Path,
@@ -306,6 +331,46 @@ impl ManagedVm {
 
     pub(crate) fn forward_run_get(&self, id: &str) -> Result<ForwardedOutput> {
         self.state_command(["run", "get", id]).map(Into::into)
+    }
+
+    pub(crate) fn forward_run_delete_check(
+        &self,
+        operation_id: &str,
+        run_ids: &BTreeSet<String>,
+    ) -> Result<ForwardedOutput> {
+        let mut input = tempfile::NamedTempFile::new().context("failed to stage Run IDs")?;
+        for run_id in run_ids {
+            writeln!(input, "{run_id}")?;
+        }
+        input.flush()?;
+        let staged = self.stage_input(input.path(), "run-delete-ids")?;
+        let output = self.state_command([
+            OsString::from("run"),
+            OsString::from("delete"),
+            OsString::from("check"),
+            OsString::from("--operation-id"),
+            OsString::from(operation_id),
+            OsString::from("--ids"),
+            OsString::from(&staged),
+        ]);
+        self.cleanup_inputs(&[&staged]);
+        output.map(Into::into)
+    }
+
+    pub(crate) fn forward_run_delete_apply(&self, plan: &[u8]) -> Result<ForwardedOutput> {
+        let mut input = tempfile::NamedTempFile::new().context("failed to stage deletion plan")?;
+        input.write_all(plan)?;
+        input.flush()?;
+        let staged = self.stage_input(input.path(), "run-delete-plan")?;
+        let output = self.state_command([
+            OsString::from("run"),
+            OsString::from("delete"),
+            OsString::from("apply"),
+            OsString::from("--plan"),
+            OsString::from(&staged),
+        ]);
+        self.cleanup_inputs(&[&staged]);
+        output.map(Into::into)
     }
 
     pub(crate) fn forward_run_cancel(&self, id: &str) -> Result<ForwardedOutput> {

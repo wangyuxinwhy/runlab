@@ -50,6 +50,14 @@ const TOPICS: &[Topic] = &[
         },
         content: include_str!("../docs/how-to/query-runs.md"),
     },
+    Topic {
+        summary: TopicSummary {
+            name: "how-to/delete-runs",
+            title: "Delete Terminal Runs",
+            summary: "Select, preview, and permanently delete bounded terminal Run assets.",
+        },
+        content: include_str!("../docs/how-to/delete-runs.md"),
+    },
 ];
 
 #[must_use]
@@ -87,15 +95,22 @@ mod tests {
     #[test]
     fn lists_and_gets_bundled_topics() {
         let topics = list();
-        assert_eq!(topics.len(), 3);
+        assert_eq!(topics.len(), 4);
         assert_eq!(topics[0].name, "start-here");
         assert_eq!(topics[1].name, "how-to/build-images");
         assert_eq!(topics[2].name, "how-to/query-runs");
+        assert_eq!(topics[3].name, "how-to/delete-runs");
         assert!(
             get("start-here")
                 .expect("start documentation")
                 .content
                 .contains("Image + Runtime Configuration + stdin + Secrets + controls")
+        );
+        assert!(
+            get("how-to/delete-runs")
+                .expect("Run deletion documentation")
+                .content
+                .contains("storage prune check --without-runs")
         );
         assert!(
             get("how-to/build-images")

@@ -502,6 +502,20 @@ impl CompletionRecord {
             .get(program)
             .map(|program| &program.final_environment)
     }
+
+    pub(crate) fn available_final_environments(&self) -> Vec<(&str, &Descriptor)> {
+        self.output()
+            .into_iter()
+            .flat_map(|output| &output.programs)
+            .filter_map(|(program, output)| match &output.final_environment {
+                FinalEnvironmentRecord::Available { value } => {
+                    Some((program.as_str(), value.as_ref()))
+                }
+                FinalEnvironmentRecord::NotRequested
+                | FinalEnvironmentRecord::Unavailable { .. } => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Serialize)]

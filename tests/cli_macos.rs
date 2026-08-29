@@ -160,6 +160,54 @@ fn state_query_is_forwarded_to_the_fixed_guest_state() {
 }
 
 #[test]
+fn run_deletion_inputs_are_validated_and_staged_to_the_guest() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (limactl, log) = fake_limactl(temporary.path());
+    let run_id = "550e8400-e29b-41d4-a716-446655440091";
+    let operation_id = "550e8400-e29b-41d4-a716-446655440092";
+    let ids = temporary.path().join("ids.txt");
+    fs::write(&ids, format!("{run_id}\n")).expect("Run IDs");
+    let checked = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .args([
+            "run",
+            "delete",
+            "check",
+            "--operation-id",
+            operation_id,
+            "--ids",
+            path(&ids),
+        ])
+        .output()
+        .expect("runlab process");
+    assert_success(&checked);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&checked.stdout).expect("plan")["operation_id"],
+        operation_id
+    );
+
+    let plan = temporary.path().join("plan.json");
+    fs::write(&plan, &checked.stdout).expect("plan");
+    let applied = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .args(["run", "delete", "apply", "--plan", path(&plan)])
+        .output()
+        .expect("runlab process");
+    assert_success(&applied);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&applied.stdout).expect("apply result")["mode"],
+        "no_change"
+    );
+    let calls = fs::read_to_string(log).expect("fake limactl log");
+    assert!(calls.contains(&format!(
+        "run delete check --operation-id {operation_id} --ids /var/tmp/runlab-run-delete-ids-"
+    )));
+    assert!(calls.contains("run delete apply --plan /var/tmp/runlab-run-delete-plan-"));
+}
+
+#[test]
 fn image_export_transfers_one_private_checked_archive() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let (limactl, log) = fake_limactl(temporary.path());
@@ -690,6 +738,12 @@ case "$*" in
     : > "$RUNLAB_FAKE_CANCEL"
     ;;
   *"run cancel 550e8400-e29b-41d4-a716-446655440000"*) printf '%s\n' '{{"schema_version":1,"run_id":"550e8400-e29b-41d4-a716-446655440000","lifecycle":"accepted","cancellation_requested":true,"cancellation_requested_at":"2026-08-28T00:00:00Z","terminal_at":null}}' ;;
+  *"run delete check --operation-id 550e8400-e29b-41d4-a716-446655440092 --ids /var/tmp/runlab-run-delete-ids-"*)
+    printf '%s\n' '{{"schema_version":1,"kind":"run_delete_plan","operation_id":"550e8400-e29b-41d4-a716-446655440092","requested_runs":1,"eligible":true,"candidate_record_bytes":0,"candidates":[],"already_deleted":[{{"run_id":"550e8400-e29b-41d4-a716-446655440091","deleted_at":"2026-08-29T00:00:00Z","operation_id":"550e8400-e29b-41d4-a716-446655440090"}}],"blocked":[]}}'
+    ;;
+  *"run delete apply --plan /var/tmp/runlab-run-delete-plan-"*)
+    printf '%s\n' '{{"schema_version":1,"mode":"no_change","operation_id":"550e8400-e29b-41d4-a716-446655440092","deleted_at":null,"deleted_runs":[],"already_deleted":[],"recovery":"runlab storage prune check"}}'
+    ;;
   *"run get e11ce005-0000-4000-8000-000000000005"*)
     if test -e "$RUNLAB_FAKE_ACCEPTED"; then
       printf '%s\n' '{{"schema_version":1,"run_id":"e11ce005-0000-4000-8000-000000000005","lifecycle":"accepted"}}'

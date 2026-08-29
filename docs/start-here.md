@@ -149,7 +149,9 @@ runlab storage status
 runlab storage prune check
 ```
 
-`storage prune check` is read-only. If its exact plan is acceptable, apply it with `runlab storage prune apply`. Apply requires exclusive State access and removes only unreferenced OCI blobs, unreachable Engine snapshot cache, and stale invocation staging. It does not delete Catalog entries, Run records, or OCI content referenced by them.
+`storage prune check` is read-only. If its exact plan is acceptable, apply it with `runlab storage prune apply`. Apply requires exclusive State access and removes only unreferenced OCI blobs, unreachable Engine snapshot cache, and stale invocation staging. It does not delete Catalog entries or Run records. Apply refuses to remove any content when the retained OCI reference graph cannot be completely validated. Removing snapshot entries makes later execution timing cold-cache evidence.
+
+Terminal Run assets can be permanently retired through a separate checked workflow. Start with `runlab docs get how-to/delete-runs`. Use `storage prune check --without-runs FILE` before deletion when the hypothetical content benefit matters; Run deletion itself does not traverse or remove OCI content.
 
 ## Handle failures as data
 

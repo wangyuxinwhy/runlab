@@ -32,6 +32,19 @@ impl LocalOciStore {
         Ok(bytes)
     }
 
+    pub(crate) fn check_available(&self, descriptor: &Descriptor) -> Result<()> {
+        let path = self.blob_path(descriptor.digest().as_ref())?;
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect OCI content {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("OCI content is not a regular file: {}", path.display());
+        }
+        if metadata.len() != descriptor.size() {
+            bail!("OCI content size does not match {}", descriptor.digest());
+        }
+        Ok(())
+    }
+
     pub(crate) fn manifest_descriptor(&self, digest: &str) -> Result<Descriptor> {
         let path = self.blob_path(digest)?;
         let size = fs::metadata(&path)

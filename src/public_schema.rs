@@ -14,6 +14,7 @@ SELECT
     json_extract(metadata_json, '$.labels') AS labels,
     CASE WHEN completion_json IS NULL THEN 'accepted' ELSE 'terminal' END AS lifecycle,
     terminal_at,
+    unixepoch(terminal_at, 'subsec') AS terminal_unix_seconds,
     CASE json_extract(completion_json, '$.kind')
         WHEN 'interrupted' THEN 'interrupted'
         ELSE json_extract(completion_json, '$.result.kind')
@@ -49,6 +50,12 @@ SELECT
 FROM main.runs;
 ";
 
+const RUN_DELETIONS_VIEW_SQL: &str = r"
+CREATE TEMP VIEW run_deletions AS
+SELECT run_id, deleted_at, operation_id
+FROM main.run_tombstones;
+";
+
 #[derive(Clone, Copy)]
 struct Column {
     name: &'static str,
@@ -57,7 +64,7 @@ struct Column {
     description: &'static str,
 }
 
-const COLUMNS: &[Column] = &[
+const RUNS_COLUMNS: &[Column] = &[
     Column {
         name: "run_id",
         data_type: "TEXT",
@@ -105,6 +112,12 @@ const COLUMNS: &[Column] = &[
         data_type: "TEXT",
         nullable: true,
         description: "Exact RFC 3339 terminal publication time, when present.",
+    },
+    Column {
+        name: "terminal_unix_seconds",
+        data_type: "REAL",
+        nullable: true,
+        description: "Millisecond-rounded Unix seconds for range selection only; terminal_at is the exact fact.",
     },
     Column {
         name: "completion_kind",
@@ -186,6 +199,46 @@ const COLUMNS: &[Column] = &[
     },
 ];
 
+const RUN_DELETIONS_COLUMNS: &[Column] = &[
+    Column {
+        name: "run_id",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Canonical identity of the deleted Run.",
+    },
+    Column {
+        name: "deleted_at",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Exact RFC 3339 time when the Run deletion committed.",
+    },
+    Column {
+        name: "operation_id",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Caller-owned UUID v4 identifying the deletion operation.",
+    },
+];
+
+struct Relation {
+    name: &'static str,
+    description: &'static str,
+    columns: &'static [Column],
+}
+
+const RELATIONS: &[Relation] = &[
+    Relation {
+        name: "runs",
+        description: "Immutable accepted Run metadata and bounded terminal outcome facts. Use run get for the complete Run record.",
+        columns: RUNS_COLUMNS,
+    },
+    Relation {
+        name: "run_deletions",
+        description: "Durable deletion facts for removed Run identities.",
+        columns: RUN_DELETIONS_COLUMNS,
+    },
+];
+
 #[derive(Debug, Serialize)]
 pub(crate) struct SchemaReport {
     schema_version: u32,
@@ -211,11 +264,14 @@ struct SchemaColumn {
 
 pub(crate) fn install(connection: &Connection) -> Result<()> {
     connection
-        .execute_batch("DROP VIEW IF EXISTS temp.runs;")
-        .context("failed to replace public runs Relation")?;
+        .execute_batch(
+            "DROP VIEW IF EXISTS temp.runs;
+             DROP VIEW IF EXISTS temp.run_deletions;",
+        )
+        .context("failed to replace public Relations")?;
     connection
-        .execute_batch(RUNS_VIEW_SQL)
-        .context("failed to create public runs Relation")?;
+        .execute_batch(&format!("{RUNS_VIEW_SQL}{RUN_DELETIONS_VIEW_SQL}"))
+        .context("failed to create public Relations")?;
     validate(connection)
 }
 
@@ -224,51 +280,64 @@ pub(crate) fn report(
     object: Option<&str>,
     include_descriptions: bool,
 ) -> Result<SchemaReport> {
-    if let Some(name) = object
-        && name != "runs"
-    {
-        bail!(
-            "unknown public relation {name:?}\nHint: run `runlab schema list` to discover valid public relation names"
-        );
-    }
-    validate(connection)?;
-    let columns = object.map_or_else(Vec::new, |_| {
-        COLUMNS
-            .iter()
-            .map(|column| SchemaColumn {
-                name: column.name,
-                data_type: column.data_type,
-                nullable: column.nullable,
-                description: include_descriptions.then_some(column.description),
+    let selected = object
+        .map(|name| {
+            RELATIONS.iter().find(|relation| relation.name == name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown public relation {name:?}\nHint: run `runlab schema list` to discover valid public relation names"
+                )
             })
-            .collect()
-    });
+        })
+        .transpose()?;
+    validate(connection)?;
     Ok(SchemaReport {
         schema_version: 1,
-        objects: vec![SchemaObject {
-            name: "runs",
-            description: include_descriptions.then_some(
-                "Immutable accepted Run metadata and bounded terminal outcome facts. Use run get for the complete Run record.",
-            ),
-            columns,
-        }],
+        objects: RELATIONS
+            .iter()
+            .filter(|relation| selected.is_none_or(|selected| selected.name == relation.name))
+            .map(|relation| SchemaObject {
+                name: relation.name,
+                description: include_descriptions.then_some(relation.description),
+                columns: selected.map_or_else(Vec::new, |_| {
+                    relation
+                        .columns
+                        .iter()
+                        .map(|column| SchemaColumn {
+                            name: column.name,
+                            data_type: column.data_type,
+                            nullable: column.nullable,
+                            description: include_descriptions.then_some(column.description),
+                        })
+                        .collect()
+                }),
+            })
+            .collect(),
     })
 }
 
 fn validate(connection: &Connection) -> Result<()> {
-    let actual = connection
-        .prepare("SELECT name FROM pragma_table_info('runs') ORDER BY cid")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let expected = COLUMNS
-        .iter()
-        .map(|column| column.name.to_owned())
-        .collect::<Vec<_>>();
-    if actual != expected {
-        bail!("public runs Relation does not match the compiled schema");
+    for relation in RELATIONS {
+        let actual = connection
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{}') ORDER BY cid",
+                relation.name
+            ))?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let expected = relation
+            .columns
+            .iter()
+            .map(|column| column.name.to_owned())
+            .collect::<Vec<_>>();
+        if actual != expected {
+            bail!(
+                "public {} Relation does not match the compiled schema",
+                relation.name
+            );
+        }
+        connection
+            .prepare(&format!("SELECT * FROM temp.{} LIMIT 0", relation.name))
+            .with_context(|| format!("public {} Relation cannot be queried", relation.name))?;
     }
-    connection
-        .prepare("SELECT * FROM temp.runs LIMIT 0")
-        .context("public runs Relation cannot be queried")?;
     Ok(())
 }

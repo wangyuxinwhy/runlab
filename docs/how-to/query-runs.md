@@ -11,9 +11,11 @@ runlab schema list
 runlab schema get runs
 ```
 
-The current public SQL surface contains one Relation, `runs`. It exposes accepted caller metadata, Initial Image identity, lifecycle, primary Program timestamps and durations, retained stdout/stderr byte counts, process result, timeout/cancellation facts, and the Final Image digest. It deliberately omits complete Run input, captured stream content, errors, and complete Final Environment descriptors; read those with `runlab run get RUN_ID`.
+The public SQL surface contains `runs` and `run_deletions`. `runs` exposes accepted caller metadata, Initial Image identity, lifecycle, primary Program timestamps and durations, retained stdout/stderr byte counts, process result, timeout/cancellation facts, and the Final Image digest. It deliberately omits complete Run input, captured stream content, errors, and complete Final Environment descriptors; read those with `runlab run get RUN_ID`. `run_deletions` preserves the identity, deletion time, and operation identity after a Run Record is removed.
 
 `initial_image_name` is the Catalog name used when RunLab accepted the Run. It is `NULL` when the caller selected the Image by digest or when an older record predates this accepted fact. `initial_image_digest` is the immutable content identity. `labels` is a JSON object whose keys and values are caller-defined strings.
+
+`accepted_at` and `terminal_at` are exact RFC 3339 text facts. Do not range-filter them by lexical comparison: equivalent offsets and fractional-second boundaries do not sort reliably as text. Use `terminal_unix_seconds` for range selection and keep `terminal_at` in the result for review. `terminal_unix_seconds` is millisecond-rounded by SQLite and is not an exact replacement for `terminal_at`.
 
 ## Select Runs with ordinary SQL
 
@@ -27,6 +29,18 @@ WHERE initial_image_name = 'pi'
   AND json_extract(labels, '$.suite') = 'swe-bench'
 ORDER BY accepted_at DESC
 LIMIT 10;
+SQL
+```
+
+Select terminal Runs older than one day without comparing timestamp text:
+
+```bash
+runlab query run --stdin <<'SQL'
+SELECT run_id, terminal_at
+FROM runs
+WHERE lifecycle = 'terminal'
+  AND terminal_unix_seconds < unixepoch('now', '-1 day', 'subsec')
+ORDER BY terminal_unix_seconds ASC, run_id ASC;
 SQL
 ```
 

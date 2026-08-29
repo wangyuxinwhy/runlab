@@ -1,5 +1,6 @@
 #[cfg(not(target_os = "macos"))]
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -18,7 +19,11 @@ pub(super) enum StorageCommand {
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum StoragePruneCommand {
     /// Show exactly how much rebuildable or unreferenced data would be removed.
-    Check,
+    Check {
+        /// Assume the terminal Run IDs listed in this file are not retention roots; use - for stdin.
+        #[arg(long, value_name = "FILE")]
+        without_runs: Option<PathBuf>,
+    },
     /// Remove only rebuildable Engine cache, stale invocations, and unreferenced OCI blobs.
     Apply,
 }
@@ -54,25 +59,37 @@ pub(super) fn execute(state_path: &Path, command: StorageCommand) -> Result<u8> 
     };
     match command {
         StorageCommand::Status => super::emit(&crate::storage_management::status(&state)?)?,
-        StorageCommand::Prune { command } => super::emit(&crate::storage_management::prune(
-            &state,
-            matches!(command, StoragePruneCommand::Apply),
-        )?)?,
+        StorageCommand::Prune { command } => {
+            let without_runs = match &command {
+                StoragePruneCommand::Check { without_runs } => {
+                    super::input::read_optional_run_ids(without_runs.as_deref())?
+                }
+                StoragePruneCommand::Apply => std::collections::BTreeSet::new(),
+            };
+            super::emit(&crate::storage_management::prune(
+                &state,
+                matches!(command, StoragePruneCommand::Apply),
+                &without_runs,
+            )?)?;
+        }
     }
     Ok(0)
 }
 
 #[cfg(target_os = "macos")]
 pub(super) fn execute_managed(command: &StorageCommand) -> Result<u8> {
-    let arguments = match command {
-        StorageCommand::Status => vec!["storage", "status"],
+    let output = match command {
+        StorageCommand::Status => {
+            crate::managed_vm::ManagedVm::new().forward_storage(&["storage", "status"])
+        }
         StorageCommand::Prune {
-            command: StoragePruneCommand::Check,
-        } => vec!["storage", "prune", "check"],
+            command: StoragePruneCommand::Check { without_runs },
+        } => crate::managed_vm::ManagedVm::new().forward_storage_prune_check(
+            &super::input::read_optional_run_ids(without_runs.as_deref())?,
+        ),
         StorageCommand::Prune {
             command: StoragePruneCommand::Apply,
-        } => vec!["storage", "prune", "apply"],
+        } => crate::managed_vm::ManagedVm::new().forward_storage(&["storage", "prune", "apply"]),
     };
-    let output = crate::managed_vm::ManagedVm::new().forward_storage(&arguments)?;
-    super::emit_forwarded(&output)
+    super::emit_forwarded(&output?)
 }

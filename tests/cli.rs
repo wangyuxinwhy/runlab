@@ -74,7 +74,7 @@ fn help_exposes_only_the_minimal_product_surface() {
     let run_help = run(&["run", "--help"]);
     assert_success(&run_help);
     let stdout = text(&run_help.stdout);
-    for command in ["config", "start", "cancel", "get", "list"] {
+    for command in ["config", "start", "cancel", "delete", "get", "list"] {
         assert!(stdout.contains(command), "missing run command: {command}");
     }
     assert!(stdout.contains("reconcile"));
@@ -108,6 +108,19 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("are not execution facts"));
     assert!(stdout.contains("Keys are not interpreted"));
     assert!(stdout.contains("Examples:"));
+
+    let delete_check = run(&["run", "delete", "check", "--help"]);
+    assert_success(&delete_check);
+    let stdout = text(&delete_check.stdout);
+    assert!(stdout.contains("--operation-id"));
+    assert!(stdout.contains("--ids"));
+    assert!(stdout.contains("caller-owned operation ID"));
+
+    let delete_apply = run(&["run", "delete", "apply", "--help"]);
+    assert_success(&delete_apply);
+    let stdout = text(&delete_apply.stdout);
+    assert!(stdout.contains("--plan"));
+    assert!(stdout.contains("all-or-nothing"));
 }
 
 #[test]
@@ -237,6 +250,317 @@ fn storage_prune_removes_only_rebuildable_and_unreferenced_content() {
 }
 
 #[test]
+fn storage_prune_fails_closed_before_removing_any_path() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "base"],
+    );
+    assert_success(&imported);
+    let manifest = json_output(&imported)["manifest"].clone();
+    let manifest_path = oci_blob_path(
+        &state,
+        manifest["digest"].as_str().expect("Manifest digest"),
+    );
+    let manifest_document: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("Manifest bytes"))
+            .expect("Manifest JSON");
+    let config_path = oci_blob_path(
+        &state,
+        manifest_document["config"]["digest"]
+            .as_str()
+            .expect("Config digest"),
+    );
+    let layer_path = oci_blob_path(
+        &state,
+        manifest_document["layers"][0]["digest"]
+            .as_str()
+            .expect("Layer digest"),
+    );
+    fs::remove_file(&manifest_path).expect("remove referenced Manifest");
+
+    let unreferenced = oci_blob_path(
+        &state,
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    );
+    fs::write(&unreferenced, b"unreferenced").expect("unreferenced blob");
+    let snapshot = state.join("engine/snapshots-v3/chains/stale/upper");
+    fs::create_dir_all(&snapshot).expect("snapshot cache");
+    fs::write(snapshot.join("cache"), b"cache").expect("snapshot content");
+
+    let status = run_with_state(&state, &["storage", "status"]);
+    assert_success(&status);
+    assert_eq!(
+        json_output(&status)["assets"]["missing_referenced_blobs"],
+        json!([manifest["digest"].clone()])
+    );
+
+    let check = run_with_state(&state, &["storage", "prune", "check"]);
+    assert_success(&check);
+    let check = json_output(&check);
+    assert_eq!(check["reference_graph_complete"], false);
+    assert_eq!(check["reference_issues"][0]["kind"], "manifest_unavailable");
+    assert_eq!(check["reference_issues"][0]["digest"], manifest["digest"]);
+
+    let apply = run_with_state(&state, &["storage", "prune", "apply"]);
+    assert!(!apply.status.success());
+    assert!(apply.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&apply.stderr).expect("structured error");
+    assert_eq!(error["category"], "conflict");
+    assert_eq!(error["stage"], "storage_prune");
+    assert_eq!(error["retryable"], false);
+    assert!(error["recovery"].as_str().is_some_and(|recovery| {
+        recovery.contains("runlab storage prune check") && recovery.contains("reference_issues")
+    }));
+    for retained in [&config_path, &layer_path, &unreferenced, &snapshot] {
+        assert!(
+            retained.exists(),
+            "prune removed content before rejecting an incomplete graph: {}",
+            retained.display()
+        );
+    }
+}
+
+#[test]
+fn storage_prune_fails_closed_when_snapshot_references_cannot_be_derived() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "base"],
+    );
+    assert_success(&imported);
+    let original = json_output(&imported)["manifest"].clone();
+    let original_path = oci_blob_path(
+        &state,
+        original["digest"].as_str().expect("Manifest digest"),
+    );
+    let manifest: Value = serde_json::from_slice(&fs::read(&original_path).expect("Manifest"))
+        .expect("Manifest JSON");
+    let config_path = oci_blob_path(
+        &state,
+        manifest["config"]["digest"]
+            .as_str()
+            .expect("Config digest"),
+    );
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(config_path).expect("Config")).expect("Config JSON");
+    config["rootfs"]["diff_ids"] = json!([]);
+    let config_bytes = serde_json::to_vec(&config).expect("invalid Config bytes");
+    let config_descriptor = descriptor(&MediaType::ImageConfig, &config_bytes);
+    write_state_blob(&state, &config_descriptor, &config_bytes);
+    let manifest_bytes = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": config_descriptor,
+        "layers": manifest["layers"].clone(),
+    }))
+    .expect("invalid Manifest bytes");
+    let manifest_descriptor = descriptor(&MediaType::ImageManifest, &manifest_bytes);
+    write_state_blob(&state, &manifest_descriptor, &manifest_bytes);
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    connection
+        .execute(
+            "UPDATE catalog SET descriptor_json = ?2 WHERE name = ?1",
+            rusqlite::params![
+                "base",
+                serde_json::to_string(&manifest_descriptor).expect("descriptor JSON")
+            ],
+        )
+        .expect("replace Catalog root");
+    drop(connection);
+    let snapshot = state.join("engine/snapshots-v3/chains/stale/upper");
+    fs::create_dir_all(&snapshot).expect("snapshot cache");
+    fs::write(snapshot.join("cache"), b"cache").expect("snapshot content");
+
+    let check = run_with_state(&state, &["storage", "prune", "check"]);
+    assert_success(&check);
+    let check = json_output(&check);
+    assert_eq!(check["reference_graph_complete"], false);
+    assert!(check["reference_issues"].as_array().is_some_and(|issues| {
+        issues
+            .iter()
+            .any(|issue| issue["kind"] == "layer_diffid_count_mismatch")
+    }));
+    let apply = run_with_state(&state, &["storage", "prune", "apply"]);
+    assert!(!apply.status.success());
+    let error: Value = serde_json::from_slice(&apply.stderr).expect("structured error");
+    assert_eq!(error["category"], "conflict");
+    assert_eq!(error["stage"], "storage_prune");
+    assert_eq!(error["retryable"], false);
+    assert!(original_path.exists());
+    assert!(snapshot.exists());
+}
+
+#[test]
+fn storage_reference_graph_checks_layer_presence_and_size_without_digest_scanning() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "base"],
+    );
+    assert_success(&imported);
+    let manifest = json_output(&imported)["manifest"].clone();
+    let manifest_path = oci_blob_path(
+        &state,
+        manifest["digest"].as_str().expect("Manifest digest"),
+    );
+    let manifest_document: Value =
+        serde_json::from_slice(&fs::read(manifest_path).expect("Manifest bytes"))
+            .expect("Manifest JSON");
+    let layer_path = oci_blob_path(
+        &state,
+        manifest_document["layers"][0]["digest"]
+            .as_str()
+            .expect("Layer digest"),
+    );
+    let mut layer = fs::read(&layer_path).expect("Layer bytes");
+    layer[0] ^= 0xff;
+    fs::write(&layer_path, &layer).expect("same-size corrupt Layer");
+
+    let same_size = run_with_state(&state, &["storage", "status"]);
+    assert_success(&same_size);
+    let same_size = json_output(&same_size);
+    assert_eq!(same_size["assets"]["reference_graph_complete"], true);
+    assert_eq!(same_size["assets"]["reference_issues"], json!([]));
+
+    layer.pop();
+    fs::write(&layer_path, &layer).expect("truncated Layer");
+    let truncated = run_with_state(&state, &["storage", "status"]);
+    assert_success(&truncated);
+    let truncated = json_output(&truncated);
+    assert_eq!(truncated["assets"]["reference_graph_complete"], false);
+    assert_eq!(
+        truncated["assets"]["reference_issues"][0]["kind"],
+        "layer_unavailable"
+    );
+}
+
+#[test]
+fn storage_prune_reports_orphan_inventory_removal_as_cold_cache() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    assert_success(&run_with_state(&state, &["image", "list"]));
+    let inventory = state.join(
+        "engine/snapshots-v3/inventories/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.bin",
+    );
+    fs::create_dir_all(inventory.parent().expect("inventory parent")).expect("inventory directory");
+    fs::write(&inventory, b"orphan inventory").expect("orphan inventory");
+
+    let check = run_with_state(&state, &["storage", "prune", "check"]);
+    assert_success(&check);
+    let reclaimable = &json_output(&check)["remaining_reclaimable"];
+    assert_eq!(reclaimable["unreferenced_snapshot_chains"], 0);
+    assert!(reclaimable["snapshot_cache_bytes"].as_u64() > Some(0));
+    assert_eq!(reclaimable["cold_cache_after_apply"], true);
+
+    let apply = run_with_state(&state, &["storage", "prune", "apply"]);
+    assert_success(&apply);
+    assert!(!inventory.exists());
+}
+
+#[test]
+fn run_delete_apply_reports_a_busy_writer_as_retryable_conflict() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "base"],
+    );
+    assert_success(&imported);
+    let manifest = json_output(&imported)["manifest"].clone();
+    let run_id = "550e8400-e29b-41d4-a716-446655440089";
+    let operation_id = "550e8400-e29b-41d4-a716-446655440090";
+    insert_terminal_run(&state, run_id, &manifest);
+    let ids = temporary.path().join("busy.txt");
+    fs::write(&ids, format!("{run_id}\n")).expect("Run IDs");
+    let check = run_with_state(
+        &state,
+        &[
+            "run",
+            "delete",
+            "check",
+            "--operation-id",
+            operation_id,
+            "--ids",
+            path(&ids),
+        ],
+    );
+    assert_success(&check);
+    let plan = temporary.path().join("busy-plan.json");
+    fs::write(&plan, &check.stdout).expect("plan");
+
+    let blocker = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold database writer");
+    let apply = run_with_state(&state, &["run", "delete", "apply", "--plan", path(&plan)]);
+    assert!(!apply.status.success());
+    let error: Value = serde_json::from_slice(&apply.stderr).expect("structured error");
+    assert_eq!(error["category"], "conflict");
+    assert_eq!(error["stage"], "run_delete_apply");
+    assert_eq!(error["retryable"], true);
+    assert!(
+        error["recovery"]
+            .as_str()
+            .is_some_and(|recovery| recovery.contains(operation_id))
+    );
+    blocker.execute_batch("ROLLBACK").expect("release writer");
+
+    let retry = run_with_state(&state, &["run", "delete", "apply", "--plan", path(&plan)]);
+    assert_success(&retry);
+    assert_eq!(json_output(&retry)["mode"], "applied");
+}
+
+#[test]
+fn storage_prune_check_can_exclude_terminal_run_roots_without_mutation() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "run-only"],
+    );
+    assert_success(&imported);
+    let manifest = json_output(&imported)["manifest"].clone();
+    let run_id = "550e8400-e29b-41d4-a716-446655440099";
+    insert_terminal_run(&state, run_id, &manifest);
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    connection
+        .execute("DELETE FROM catalog WHERE name = 'run-only'", [])
+        .expect("remove Catalog root");
+    drop(connection);
+
+    let ordinary = run_with_state(&state, &["storage", "prune", "check"]);
+    assert_success(&ordinary);
+    assert_eq!(
+        json_output(&ordinary)["remaining_reclaimable"]["unreferenced_oci_blobs"],
+        0
+    );
+
+    let ids = temporary.path().join("run-ids.txt");
+    fs::write(&ids, format!("{run_id}\n")).expect("Run IDs");
+    let hypothetical = run_with_state(
+        &state,
+        &["storage", "prune", "check", "--without-runs", path(&ids)],
+    );
+    assert_success(&hypothetical);
+    let hypothetical = json_output(&hypothetical);
+    assert_eq!(hypothetical["without_runs"], json!([run_id]));
+    assert_eq!(
+        hypothetical["remaining_reclaimable"]["unreferenced_oci_blobs"],
+        3
+    );
+    assert_success(&run_with_state(&state, &["run", "get", run_id]));
+}
+
+#[test]
 fn storage_prune_apply_refuses_concurrent_state_use() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let state = temporary.path().join("state");
@@ -256,6 +580,288 @@ fn storage_prune_apply_refuses_concurrent_state_use() {
     assert_eq!(error["category"], "conflict");
     assert_eq!(error["stage"], "storage_prune");
     assert_eq!(error["retryable"], true);
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the end-to-end test verifies one deletion and retry contract without hidden fixture state"
+)]
+fn run_delete_workflow_is_atomic_idempotent_and_shared_lease_compatible() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "final-name"],
+    );
+    assert_success(&imported);
+    let manifest = json_output(&imported)["manifest"].clone();
+    let run_id = "550e8400-e29b-41d4-a716-446655440080";
+    insert_terminal_run(&state, run_id, &manifest);
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    let mut completion = stored_completion(&manifest);
+    completion["result"]["output"]["programs"]["secondary"] =
+        completion["result"]["output"]["programs"]["primary"].clone();
+    connection
+        .execute(
+            "UPDATE runs SET completion_json = ?2 WHERE run_id = ?1",
+            rusqlite::params![run_id, completion.to_string()],
+        )
+        .expect("add secondary Program");
+    drop(connection);
+
+    let ids = temporary.path().join("run-ids.txt");
+    fs::write(&ids, format!("{run_id}\n")).expect("Run IDs");
+    let operation_id = "550e8400-e29b-41d4-a716-446655440081";
+    let check = run_with_state(
+        &state,
+        &[
+            "run",
+            "delete",
+            "check",
+            "--operation-id",
+            operation_id,
+            "--ids",
+            path(&ids),
+        ],
+    );
+    assert_success(&check);
+    let plan = json_output(&check);
+    assert_eq!(plan["kind"], "run_delete_plan");
+    assert_eq!(plan["eligible"], true);
+    assert!(plan.get("plan_digest").is_none());
+    assert!(plan["candidate_record_bytes"].as_u64() > Some(0));
+    let catalog_finals = plan["candidates"][0]["catalog_final_images"]
+        .as_array()
+        .expect("Catalog Final Images");
+    assert_eq!(catalog_finals.len(), 2);
+    assert_eq!(catalog_finals[0]["program"], "primary");
+    assert_eq!(catalog_finals[1]["program"], "secondary");
+    assert_eq!(catalog_finals[0]["catalog_names"], json!(["final-name"]));
+
+    let plan_path = temporary.path().join("delete-plan.json");
+    fs::write(&plan_path, &check.stdout).expect("deletion plan");
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.join("maintenance.lock"))
+        .expect("State maintenance lock");
+    rustix::fs::flock(&lease, rustix::fs::FlockOperation::LockShared)
+        .expect("simulate an active shared State command");
+    let apply = run_with_state(
+        &state,
+        &["run", "delete", "apply", "--plan", path(&plan_path)],
+    );
+    assert_success(&apply);
+    assert_eq!(json_output(&apply)["mode"], "applied");
+    drop(lease);
+
+    let get = run_with_state(&state, &["run", "get", run_id]);
+    assert!(!get.status.success());
+    let error: Value = serde_json::from_slice(&get.stderr).expect("structured error");
+    assert_eq!(error["category"], "not_found");
+    assert!(error["message"].as_str().is_some_and(|message| {
+        message.contains("was deleted") && message.contains(operation_id)
+    }));
+    assert_success(&run_with_state(&state, &["image", "get", "final-name"]));
+
+    let deletion = run_with_state(
+        &state,
+        &[
+            "query",
+            "run",
+            &format!("SELECT run_id, operation_id FROM run_deletions WHERE run_id = '{run_id}'"),
+        ],
+    );
+    assert_success(&deletion);
+    assert_eq!(
+        json_output(&deletion)["rows"][0]["operation_id"],
+        operation_id
+    );
+
+    let retry = run_with_state(
+        &state,
+        &["run", "delete", "apply", "--plan", path(&plan_path)],
+    );
+    assert_success(&retry);
+    assert_eq!(json_output(&retry)["mode"], "already_applied");
+
+    let same_operation_check = run_with_state(
+        &state,
+        &[
+            "run",
+            "delete",
+            "check",
+            "--operation-id",
+            operation_id,
+            "--ids",
+            path(&ids),
+        ],
+    );
+    assert_success(&same_operation_check);
+    let same_operation_plan = temporary.path().join("same-operation-plan.json");
+    fs::write(&same_operation_plan, &same_operation_check.stdout).expect("rechecked plan");
+    let same_operation_apply = run_with_state(
+        &state,
+        &[
+            "run",
+            "delete",
+            "apply",
+            "--plan",
+            path(&same_operation_plan),
+        ],
+    );
+    assert_success(&same_operation_apply);
+    assert_eq!(
+        json_output(&same_operation_apply)["mode"],
+        "already_applied"
+    );
+
+    let recheck = run_with_state(
+        &state,
+        &[
+            "run",
+            "delete",
+            "check",
+            "--operation-id",
+            "550e8400-e29b-41d4-a716-446655440082",
+            "--ids",
+            path(&ids),
+        ],
+    );
+    assert_success(&recheck);
+    let recheck = json_output(&recheck);
+    assert_eq!(recheck["eligible"], true);
+    assert_eq!(recheck["candidates"], json!([]));
+    assert_eq!(recheck["already_deleted"][0]["run_id"], run_id);
+
+    let reuse = run_with_state(
+        &state,
+        &["run", "start", "--id", run_id, "--image", "final-name"],
+    );
+    assert!(!reuse.status.success());
+    let error: Value = serde_json::from_slice(&reuse.stderr).expect("structured error");
+    assert_eq!(error["category"], "conflict");
+    assert_eq!(error["retryable"], false);
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("permanently retired"))
+    );
+}
+
+#[test]
+fn run_delete_check_blocks_unknown_and_non_terminal_runs_with_recovery() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    assert_success(&run_with_state(&state, &["image", "list"]));
+    let active_id = "550e8400-e29b-41d4-a716-446655440083";
+    let missing_id = "550e8400-e29b-41d4-a716-446655440084";
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    connection
+        .execute(
+            "INSERT INTO runs(
+                run_id, accepted_at, metadata_json, input_json, input_identity_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                active_id,
+                "2026-08-27T00:00:00Z",
+                r#"{"description":null,"labels":{}}"#,
+                stored_input(&json!({
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 1
+                }))
+                .to_string(),
+                stored_identity(&json!({
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 1
+                }))
+                .to_string(),
+            ],
+        )
+        .expect("active Run");
+    drop(connection);
+    let ids = temporary.path().join("blocked.txt");
+    fs::write(&ids, format!("{active_id}\n{missing_id}\n")).expect("Run IDs");
+    let check = run_with_state(
+        &state,
+        &[
+            "run",
+            "delete",
+            "check",
+            "--operation-id",
+            "550e8400-e29b-41d4-a716-446655440085",
+            "--ids",
+            path(&ids),
+        ],
+    );
+    assert_success(&check);
+    let check = json_output(&check);
+    assert_eq!(check["eligible"], false);
+    assert_eq!(check["blocked"][0]["reason"], "not_terminal");
+    assert_eq!(
+        check["blocked"][0]["recovery"],
+        format!("runlab run reconcile {active_id}")
+    );
+    assert_eq!(check["blocked"][1]["reason"], "not_found");
+}
+
+#[test]
+fn run_delete_apply_rejects_a_stale_batch_without_partial_deletion() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "base"],
+    );
+    assert_success(&imported);
+    let manifest = json_output(&imported)["manifest"].clone();
+    let first = "550e8400-e29b-41d4-a716-446655440086";
+    let second = "550e8400-e29b-41d4-a716-446655440087";
+    insert_terminal_run(&state, first, &manifest);
+    insert_terminal_run(&state, second, &manifest);
+    let ids = temporary.path().join("batch.txt");
+    fs::write(&ids, format!("{first}\n{second}\n")).expect("Run IDs");
+    let check = run_with_state(
+        &state,
+        &[
+            "run",
+            "delete",
+            "check",
+            "--operation-id",
+            "550e8400-e29b-41d4-a716-446655440088",
+            "--ids",
+            path(&ids),
+        ],
+    );
+    assert_success(&check);
+    let plan = temporary.path().join("stale-plan.json");
+    fs::write(&plan, &check.stdout).expect("plan");
+    let connection = rusqlite::Connection::open(state.join("runlab.sqlite3")).expect("database");
+    connection
+        .execute(
+            "UPDATE runs SET cancellation_requested_at = ?2 WHERE run_id = ?1",
+            [second, "2026-08-29T00:00:00Z"],
+        )
+        .expect("change one candidate");
+    drop(connection);
+
+    let apply = run_with_state(&state, &["run", "delete", "apply", "--plan", path(&plan)]);
+    assert!(!apply.status.success());
+    let error: Value = serde_json::from_slice(&apply.stderr).expect("structured error");
+    assert_eq!(error["category"], "conflict");
+    assert_success(&run_with_state(&state, &["run", "get", first]));
+    assert_success(&run_with_state(&state, &["run", "get", second]));
+    let tombstones = run_with_state(
+        &state,
+        &["query", "run", "SELECT count(*) AS n FROM run_deletions"],
+    );
+    assert_success(&tombstones);
+    assert_eq!(json_output(&tombstones)["rows"][0]["n"], 0);
 }
 
 #[test]
@@ -1009,6 +1615,14 @@ fn insert_terminal_run(state: &Path, run_id: &str, manifest: &Value) {
     insert_terminal_run_with_final(state, run_id, manifest, manifest);
 }
 
+fn oci_blob_path(state: &Path, digest: &str) -> PathBuf {
+    state.join("oci/blobs/sha256").join(
+        digest
+            .strip_prefix("sha256:")
+            .expect("test digest uses sha256"),
+    )
+}
+
 fn insert_terminal_run_with_final(
     state: &Path,
     run_id: &str,
@@ -1499,6 +2113,10 @@ fn write_blob(layout: &Path, descriptor: &Descriptor, bytes: &[u8]) {
     let digest = descriptor.digest().to_string();
     let encoded = digest.strip_prefix("sha256:").expect("sha256 digest");
     fs::write(layout.join("blobs/sha256").join(encoded), bytes).expect("write blob");
+}
+
+fn write_state_blob(state: &Path, descriptor: &Descriptor, bytes: &[u8]) {
+    fs::write(oci_blob_path(state, descriptor.digest().as_ref()), bytes).expect("write State blob");
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {

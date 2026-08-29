@@ -40,6 +40,11 @@ fn docs_are_discoverable_without_state_or_managed_vm() {
                     "name": "how-to/query-runs",
                     "title": "Query Runs",
                     "summary": "Discover and query bounded Run selection facts with read-only SQL."
+                },
+                {
+                    "name": "how-to/delete-runs",
+                    "title": "Delete Terminal Runs",
+                    "summary": "Select, preview, and permanently delete bounded terminal Run assets."
                 }
             ]
         })

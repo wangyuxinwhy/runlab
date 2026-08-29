@@ -13,6 +13,7 @@ mod docs;
 mod filesystem;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod image;
+mod input;
 mod query;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) mod run;
