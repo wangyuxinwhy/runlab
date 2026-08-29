@@ -6,8 +6,9 @@ use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use run_protocol::{
@@ -18,7 +19,10 @@ use rustix::process::geteuid;
 
 use super::fixtures::*;
 use crate::native::network::HOST_ADDRESS;
-use crate::{CancellationToken, NativeEngine, OperationTimeouts, RunEngine, STOP_GRACE_PERIOD};
+use crate::{
+    CancellationToken, EngineObserver, NativeEngine, OperationTimeouts, ProgramStream, RunEngine,
+    STOP_GRACE_PERIOD,
+};
 
 #[test]
 #[ignore = "set RUNLAB_NATIVE_E2E_OCI_LAYOUT and run as root on the runlab Linux VM"]
@@ -60,7 +64,7 @@ fn real_runc_exercises_native_engine_contract() {
         OperationTimeouts::default(),
     ));
 
-    let cgroups_before = engine_cgroups();
+    let cgroups_before = current_process_engine_cgroups();
     let first = engine
             .run(
                 e2e_input(
@@ -110,85 +114,67 @@ fn real_runc_exercises_native_engine_contract() {
     });
     assert_final_delta(store.as_ref(), final_image);
     assert_engine_workspace_clean(&workspace);
-    assert_eq!(engine_cgroups(), cgroups_before, "owned cgroup leaked");
+    assert_eq!(
+        current_process_engine_cgroups(),
+        cgroups_before,
+        "owned cgroup leaked"
+    );
 
-    let listener = TcpListener::bind(("0.0.0.0", 0)).expect("egress target");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking egress target");
-    let port = listener.local_addr().expect("egress target address").port();
-    let target = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match listener.accept() {
-                Ok((mut connection, _)) => {
-                    connection
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\negress-ok")
-                        .expect("egress response");
-                    return;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "egress connection timed out");
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("egress listener failed: {error}"),
-            }
-        }
-    });
-    let egress = engine
-        .run(
-            e2e_input_with_network(
-                &initial,
-                "egress",
-                &format!("/bin/busybox wget -qO- http://{HOST_ADDRESS}:{port}/"),
-                Network::Egress,
+    let target = EgressTarget::start(
+        1,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\negress-ok",
+    );
+    let egress_output = engine.run(
+        e2e_input_with_network(
+            &initial,
+            "egress",
+            &format!(
+                "command -v wget >/dev/null || {{ printf 'fixture lacks wget\\n' >&2; exit 127; }}; wget -qO- http://{HOST_ADDRESS}:{}/",
+                target.port()
             ),
-            CancellationToken::new(),
-        )
-        .expect("egress output");
-    target.join().expect("egress target thread");
-    let egress = &egress.programs()[&ProgramId::primary()];
-    assert!(matches!(
+            Network::Egress,
+        ),
+        CancellationToken::new(),
+    );
+    let connections = target.finish();
+    let egress_output = egress_output.expect("egress output");
+    let egress = &egress_output.programs()[&ProgramId::primary()];
+    assert_eq!(
+        egress.create().status(),
+        OperationStatus::Succeeded,
+        "egress create failed: {:?}",
+        egress.errors().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        egress.start().status(),
+        OperationStatus::Succeeded,
+        "egress start failed: {:?}",
+        egress.errors().collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(egress.process(), ProcessResult::Exited { code: 0, .. }),
+        "egress process failed: {:?}; errors: {:?}",
         egress.process(),
-        ProcessResult::Exited { code: 0, .. }
-    ));
+        egress.errors().collect::<Vec<_>>()
+    );
     assert_eq!(
         egress.stdout().facts().expect("egress stdout").bytes(),
         b"egress-ok"
     );
     assert_eq!(egress.errors().count(), 0, "egress cleanup polluted output");
+    assert_eq!(
+        egress_output.execution().errors().count(),
+        0,
+        "egress polluted execution output"
+    );
+    assert_eq!(connections, 1, "egress target accepted no connection");
     assert_engine_workspace_clean(&workspace);
 
-    let listener = TcpListener::bind(("0.0.0.0", 0)).expect("concurrent egress target");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking concurrent egress target");
-    let port = listener
-        .local_addr()
-        .expect("concurrent egress target address")
-        .port();
-    let target = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut accepted = 0;
-        while accepted < 2 {
-            match listener.accept() {
-                Ok((mut connection, _)) => {
-                    connection
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nconcurrent")
-                        .expect("concurrent egress response");
-                    accepted += 1;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "concurrent egress connections timed out"
-                    );
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("concurrent egress listener failed: {error}"),
-            }
-        }
-    });
+    let target = EgressTarget::start(
+        2,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nconcurrent",
+    );
+    let port = target.port();
     let barrier = Arc::new(Barrier::new(2));
     let workers = (0..2)
         .map(|index| {
@@ -201,7 +187,9 @@ fn real_runc_exercises_native_engine_contract() {
                     e2e_input_with_network(
                         &initial,
                         &format!("concurrent-egress-{index}"),
-                        &format!("/bin/busybox wget -qO- http://{HOST_ADDRESS}:{port}/"),
+                        &format!(
+                            "command -v wget >/dev/null || {{ printf 'fixture lacks wget\\n' >&2; exit 127; }}; wget -qO- http://{HOST_ADDRESS}:{port}/"
+                        ),
                         Network::Egress,
                     ),
                     CancellationToken::new(),
@@ -209,9 +197,13 @@ fn real_runc_exercises_native_engine_contract() {
             })
         })
         .collect::<Vec<_>>();
-    for worker in workers {
-        let output = worker
-            .join()
+    let outputs = workers
+        .into_iter()
+        .map(JoinHandle::join)
+        .collect::<Vec<_>>();
+    let connections = target.finish();
+    for output in outputs {
+        let output = output
             .expect("concurrent egress worker")
             .expect("concurrent egress RunOutput");
         let program = &output.programs()[&ProgramId::primary()];
@@ -234,7 +226,10 @@ fn real_runc_exercises_native_engine_contract() {
             "concurrent egress polluted execution output"
         );
     }
-    target.join().expect("concurrent egress target thread");
+    assert_eq!(
+        connections, 2,
+        "concurrent egress target accepted {connections} connections"
+    );
     assert_engine_workspace_clean(&workspace);
 
     let file_mount_source = tempfile::NamedTempFile::new().expect("file mount source");
@@ -334,18 +329,22 @@ fn real_runc_exercises_native_engine_contract() {
     assert_eq!(timed_out_stdin.close().status(), OperationStatus::Succeeded);
 
     let cancellation = CancellationToken::new();
-    let request = cancellation.clone();
-    let cancellation_worker = thread::spawn(move || {
-        thread::sleep(Duration::from_secs(2));
-        request.cancel();
-    });
+    let cancellation_input = e2e_input(
+        &initial,
+        "cancel",
+        "printf cancel-ready; sleep 30",
+        &blocked_stdin,
+        None,
+    );
     let cancellation_output = engine
-        .run(
-            e2e_input(&initial, "cancel", "sleep 30", &blocked_stdin, None),
-            cancellation,
+        .run_observed(
+            &cancellation_input,
+            &cancellation,
+            Arc::new(CancelOnPrimaryOutput {
+                cancellation: cancellation.clone(),
+            }),
         )
         .expect("cancelled output");
-    cancellation_worker.join().expect("cancellation worker");
     assert!(cancellation_output.execution().cancelled());
     assert!(
         !cancellation_output.programs()[&ProgramId::primary()]
@@ -649,5 +648,77 @@ fn real_runc_exercises_native_engine_contract() {
         create_failure.create().errors().collect::<Vec<_>>()
     );
     assert_engine_workspace_clean(&workspace);
-    assert_eq!(engine_cgroups(), cgroups_before, "owned cgroup leaked");
+    assert_eq!(
+        current_process_engine_cgroups(),
+        cgroups_before,
+        "owned cgroup leaked"
+    );
+}
+
+struct EgressTarget {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    worker: JoinHandle<std::io::Result<usize>>,
+}
+
+struct CancelOnPrimaryOutput {
+    cancellation: CancellationToken,
+}
+
+impl EngineObserver for CancelOnPrimaryOutput {
+    fn program_output(
+        &self,
+        program_id: &ProgramId,
+        stream: ProgramStream,
+        _byte_offset: u64,
+        _bytes: &[u8],
+    ) {
+        if program_id == &ProgramId::primary() && stream == ProgramStream::Stdout {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+impl EgressTarget {
+    fn start(expected_connections: usize, response: &'static [u8]) -> Self {
+        let listener = TcpListener::bind(("0.0.0.0", 0)).expect("egress target");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking egress target");
+        let port = listener.local_addr().expect("egress target address").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            let mut accepted = 0;
+            while accepted < expected_connections {
+                match listener.accept() {
+                    Ok((mut connection, _)) => {
+                        connection.write_all(response)?;
+                        accepted += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if worker_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(accepted)
+        });
+        Self { port, stop, worker }
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn finish(self) -> usize {
+        self.stop.store(true, Ordering::Release);
+        self.worker
+            .join()
+            .expect("egress target thread")
+            .expect("egress target listener")
+    }
 }

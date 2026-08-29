@@ -251,7 +251,7 @@ pub(super) fn e2e_input_with_network(
             ProgramId::primary(),
             e2e_program(image, name, script, b"", false),
         )]),
-        RunControls::new(None, network, true),
+        RunControls::new(NonZeroU64::new(10_000), network, true),
     )
     .expect("RunInput")
 }
@@ -509,8 +509,9 @@ pub(super) fn assert_engine_workspace_clean(path: &Path) {
     );
 }
 
-pub(super) fn engine_cgroups() -> BTreeSet<PathBuf> {
+pub(super) fn current_process_engine_cgroups() -> BTreeSet<PathBuf> {
     let root = Path::new("/sys/fs/cgroup");
+    let owned_prefix = format!("run-engine-{}-", std::process::id());
     let mut pending = vec![root.to_path_buf()];
     let mut matches = BTreeSet::new();
     let mut visited = 0_usize;
@@ -523,7 +524,11 @@ pub(super) fn engine_cgroups() -> BTreeSet<PathBuf> {
             visited += 1;
             assert!(visited <= 100_000, "cgroup tree exceeds test bound");
             let path = entry.path();
-            if entry.file_name().as_bytes().starts_with(b"run-engine-") {
+            if entry
+                .file_name()
+                .as_bytes()
+                .starts_with(owned_prefix.as_bytes())
+            {
                 matches.insert(path.clone());
             }
             pending.push(path);
