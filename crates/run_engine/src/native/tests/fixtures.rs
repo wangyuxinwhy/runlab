@@ -82,9 +82,19 @@ pub(super) fn empty_prepared_invocation(
         sensitive_artifacts: Vec::new(),
         egress: None,
     };
+    let runtime_root_fd = rustix::fs::open(
+        &runtime_root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("pinned runtime fixture root");
     PreparedInvocation {
         workspace: Some(workspace.keep()),
         runtime_root,
+        _runtime_root_fd: runtime_root_fd,
         runc,
         programs: BTreeMap::from([(ProgramId::primary(), program)]),
         supervisor,

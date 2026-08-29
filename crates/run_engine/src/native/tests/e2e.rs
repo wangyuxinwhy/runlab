@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Write as _;
 use std::net::TcpListener;
 use std::num::NonZeroU64;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
@@ -36,12 +37,25 @@ fn real_runc_exercises_native_engine_contract() {
     );
     let store = Arc::new(MemoryStore::default());
     let initial = import_oci_layout(store.as_ref(), &layout);
-    let workspace = tempfile::tempdir().expect("workspace");
-    fs::set_permissions(workspace.path(), fs::Permissions::from_mode(0o700))
-        .expect("private workspace");
+    let workspace_owner = tempfile::tempdir().expect("workspace owner");
+    let workspace = workspace_owner
+        .path()
+        .join("state-path-long-enough-to-exceed-the-filesystem-unix-socket-address-limit")
+        .join("engine");
+    fs::create_dir_all(&workspace).expect("long Engine workspace");
+    fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).expect("private workspace");
+    assert!(
+        workspace
+            .join("invocations/run-engine-native-XXXXXX/runtime/run-engine-1234567-0-0.pidfd.sock")
+            .as_os_str()
+            .as_bytes()
+            .len()
+            >= 108,
+        "fixture must exceed the Linux pathname Unix socket address limit"
+    );
     let engine = Arc::new(NativeEngine::new(
         store.clone(),
-        workspace.path(),
+        &workspace,
         runc,
         OperationTimeouts::default(),
     ));
@@ -95,7 +109,7 @@ fn real_runc_exercises_native_engine_contract() {
         )
     });
     assert_final_delta(store.as_ref(), final_image);
-    assert_engine_workspace_clean(workspace.path());
+    assert_engine_workspace_clean(&workspace);
     assert_eq!(engine_cgroups(), cgroups_before, "owned cgroup leaked");
 
     let listener = TcpListener::bind(("0.0.0.0", 0)).expect("egress target");
@@ -143,7 +157,7 @@ fn real_runc_exercises_native_engine_contract() {
         b"egress-ok"
     );
     assert_eq!(egress.errors().count(), 0, "egress cleanup polluted output");
-    assert_engine_workspace_clean(workspace.path());
+    assert_engine_workspace_clean(&workspace);
 
     let listener = TcpListener::bind(("0.0.0.0", 0)).expect("concurrent egress target");
     listener
@@ -221,7 +235,7 @@ fn real_runc_exercises_native_engine_contract() {
         );
     }
     target.join().expect("concurrent egress target thread");
-    assert_engine_workspace_clean(workspace.path());
+    assert_engine_workspace_clean(&workspace);
 
     let file_mount_source = tempfile::NamedTempFile::new().expect("file mount source");
     fs::write(file_mount_source.path(), b"task").expect("file mount contents");
@@ -238,7 +252,7 @@ fn real_runc_exercises_native_engine_contract() {
             .is_some(),
         "file bind mount artifact prevented final environment capture"
     );
-    assert_engine_workspace_clean(workspace.path());
+    assert_engine_workspace_clean(&workspace);
 
     let secrets = engine
         .run(e2e_input_with_secrets(&initial), CancellationToken::new())
@@ -253,7 +267,7 @@ fn real_runc_exercises_native_engine_contract() {
         .value()
         .expect("final image after Secret delivery");
     assert_final_delta(store.as_ref(), secret_final);
-    assert_engine_workspace_clean(workspace.path());
+    assert_engine_workspace_clean(&workspace);
 
     let exit_zero = engine
         .run(
@@ -526,7 +540,7 @@ fn real_runc_exercises_native_engine_contract() {
         delayed_runc_wrapper(&engine.runc_executable, "create");
     let create_deadline_engine = NativeEngine::new(
         store.clone(),
-        workspace.path(),
+        &workspace,
         create_wrapper,
         OperationTimeouts::default()
             .with_create(Duration::from_millis(10))
@@ -554,7 +568,7 @@ fn real_runc_exercises_native_engine_contract() {
     let (_noisy_wrapper_workspace, noisy_wrapper) = noisy_runc_wrapper(&engine.runc_executable);
     let noisy_engine = NativeEngine::new(
         store.clone(),
-        workspace.path(),
+        &workspace,
         noisy_wrapper,
         OperationTimeouts::default(),
     );
@@ -577,7 +591,7 @@ fn real_runc_exercises_native_engine_contract() {
         delayed_runc_wrapper(&engine.runc_executable, "start");
     let start_deadline_engine = NativeEngine::new(
         store.clone(),
-        workspace.path(),
+        &workspace,
         start_wrapper,
         OperationTimeouts::default()
             .with_start(Duration::from_millis(10))
@@ -634,6 +648,6 @@ fn real_runc_exercises_native_engine_contract() {
         "create failure did not retain the target rlimit diagnostic: {:?}",
         create_failure.create().errors().collect::<Vec<_>>()
     );
-    assert_engine_workspace_clean(workspace.path());
+    assert_engine_workspace_clean(&workspace);
     assert_eq!(engine_cgroups(), cgroups_before, "owned cgroup leaked");
 }

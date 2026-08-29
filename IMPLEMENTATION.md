@@ -33,6 +33,8 @@ runlab ----------------> run_protocol
 | `storage_management` | State 容量、资产引用与安全回收计划 |
 | `error` | 稳定的结构化 CLI 错误封装与跨 VM 保真 |
 
+`NativeEngine` 的 runc pidfd socket 文件仍创建在每次调用的私有 `runtime` 目录中，但传给内核和 runc 的地址使用 `/proc/<runlab-pid>/fd/<runtime-dir-fd>/p<program-index>.sock`。Engine 持有该目录 fd 直到调用清理完成，因此公开 State 路径长度不再消耗 Linux pathname Unix socket 的 108-byte 地址预算，也没有引入 State 外的临时资源或放宽目录权限边界。
+
 仓库中的 `images/` 保存外部 Docker Buildx 使用的 Agent Image 构建源，不属于 Rust package 或 RunLab Image Builder。当前 `base` target 以 digest-pinned Ubuntu 24.04 为共同前缀，分层加入系统/native build 工具、Python 3.12、Node.js 24.20.0、uv 0.12.7 和固定的 `agent:1000:1000` 用户目录契约。`pi`、`claude` 与 `codex` 从同一 base 派生；`all` 继续复用完整 Pi Layer，再加入 Claude Code 与 Codex CLI。五个 target 都有从标准输入交给 bash 的真实 Run smoke 程序。
 
 State-dependent CLI 当前包含：
@@ -130,6 +132,8 @@ Image 与 Run metadata 已在 Managed Linux VM 中通过独立进程 CLI 测试�
 Run Query Plane 已在真实 Managed VM State 上验证：Run `fae36f03-6c87-4298-aac9-87121ad209a5` 在 accepted 时保存 `initial_image_name: "base"` 与 label `validation=query-plane`，后续 query 可按这两个事实选中该 Run，并返回 terminal、exited 和 exit code 0。旧 Run 的 Initial Image name 为 `null`，迁移不会从当前可变 Catalog 倒推历史事实。读取 `main.runs`、`sqlite_schema` 与执行 `DELETE` 均以非零状态被拒绝；`--limit 1` 显式返回 `complete: false` 和 `incomplete_reason: "row_limit"`。macOS 只将经解析的 query 参数与经 size/digest 复验的 SQL 文件传入 Guest，没有任意 argv 通道。
 
 当前 Linux release binary digest 为 `sha256:61a70ab2bc08e74ba6bdfb03e0bd049025f369e81cdec9b8ff6e41f71fc90548`，已安装到 Managed VM 并通过真实 `base` Image 与 `runc` 验证 `exec`。确定性 Program 分别写入 `exec-stdout`、`exec-stderr` 和私有 rootfs 文件后 exit 0；stdout 返回完整的两路 Base64 bytes，Final Environment 为 `not_requested`，stderr 流头为 `run_id: null`，阶段只有 `preparing` 与 `executing`。一次无并发写入的前后比较中，Run 总数保持 49，OCI blob 文件集合逐项保持 235 个，invocation workspace 为空，证明该调用既未建立 Run，也未发布 Final Image。第一次 blob 计数观测为 232→235，但同期早先接受的 Run `e5d5cdfd-90f2-4efa-b182-fef4fe6adca6` 恰在比较窗口内 terminal 并发布三个 OCI 对象，因此该次比较受并发写入污染，不作为 `exec` 结论。
+
+pidfd socket 的 State 路径解耦已在 Linux 上单独验证：非特权回归测试通过短 procfd 地址在超过 108 bytes 的私有 runtime 路径中完成 bind、connect 和 unlink；独立进程 `runlab exec` 又以 111-byte State 路径和 197-byte 旧式完整 socket 路径预算运行真实 runc，Program 输出 `long-state-ok`、exit 0，调用后 invocation、cgroup 和 runc 进程残留均为零。包含全部 NativeEngine 场景的 opt-in E2E 在同一长 workspace 中通过首个 isolated Run 后，于既有 egress 场景等待宿主连接 30 秒超时，因此这次结果不能支持完整 E2E 已通过；该失败与 pidfd 地址阶段分离并被保留为当前验证事实。
 
 `exec` 中断也由前台 systemd unit 独立验证：在 Program 输出 `interrupt-started` 后向 Guest CLI MainPID 发送 SIGINT，最终 `cancelled: true`、`timed_out: false`，Program 在共享停止宽限期后以 signal 9 结束，观察流出现 `stopping` 而没有 `capturing`，调用后 workspace 为空。更早一次把 CLI 作为非交互 shell 后台 job 的探针没有触发取消；后台 job 的 SIGINT 处置改变了测量路径，因此该结果只证明探针无效，不用于评价 CLI 中断行为。
 

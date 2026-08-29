@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -9,8 +9,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result as AnyResult, bail};
+use anyhow::{Context as _, Result as AnyResult};
 use run_protocol::{EngineError, ImageDescriptor, InputPath, Network, ProgramId, RunInput};
+use rustix::fs::{Mode, OFlags, open};
 use rustix::process::geteuid;
 use tempfile::TempDir;
 
@@ -88,6 +89,14 @@ impl Preparation<'_> {
         create_private_directory(&runtime_root).map_err(|error| {
             EngineError::internal(format!("failed to create private runc root: {error:#}"))
         })?;
+        let runtime_root_fd = open(
+            &runtime_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            EngineError::internal(format!("failed to pin the private runc root: {error}"))
+        })?;
         let cgroup_base = current_cgroup_base().map_err(|error| {
             EngineError::internal(format!(
                 "failed to establish the Engine-owned default cgroup base: {error:#}"
@@ -95,7 +104,10 @@ impl Preparation<'_> {
         })?;
         let programs = self.prepare_programs(
             &invocation,
-            &runtime_root,
+            PinnedRuntimeRoot {
+                path: &runtime_root,
+                fd: &runtime_root_fd,
+            },
             &cgroup_base,
             &images,
             egress.as_ref(),
@@ -105,6 +117,7 @@ impl Preparation<'_> {
         Ok(PreparedInvocation {
             workspace: Some(invocation.keep()),
             runtime_root,
+            _runtime_root_fd: runtime_root_fd,
             runc,
             programs,
             supervisor: self.supervisor.clone(),
@@ -150,7 +163,7 @@ impl Preparation<'_> {
     fn prepare_programs(
         &self,
         invocation: &TempDir,
-        runtime_root: &Path,
+        runtime_root: PinnedRuntimeRoot<'_>,
         cgroup_base: &Path,
         images: &BTreeMap<ProgramId, VerifiedImage>,
         egress: Option<&EgressTools>,
@@ -230,11 +243,10 @@ impl Preparation<'_> {
             std::process::id(),
             program.index
         );
-        let pidfd_path = program
-            .runtime_root
-            .join(format!("{runtime_id}.pidfd.sock"));
+        let pidfd_path = pidfd_socket_path(program.runtime_root.fd, program.index);
         let runc_log_path = program
             .runtime_root
+            .path
             .join(format!("{runtime_id}.create.log"));
         let expected_cgroup_path = program.cgroup_base.join(&runtime_id);
         ensure_cgroup_absent(&expected_cgroup_path)?;
@@ -270,13 +282,19 @@ impl Preparation<'_> {
 }
 
 #[derive(Clone, Copy)]
+struct PinnedRuntimeRoot<'a> {
+    path: &'a Path,
+    fd: &'a OwnedFd,
+}
+
+#[derive(Clone, Copy)]
 struct ProgramPreparation<'a> {
     index: usize,
     id: &'a ProgramId,
     input: &'a run_protocol::ProgramInput,
     image: &'a VerifiedImage,
     invocation: &'a TempDir,
-    runtime_root: &'a Path,
+    runtime_root: PinnedRuntimeRoot<'a>,
     cgroup_base: &'a Path,
     egress: Option<&'a EgressTools>,
     snapshot_root: &'a Path,
@@ -349,6 +367,9 @@ fn ensure_cgroup_absent(path: &Path) -> Result<(), EngineError> {
 pub(super) struct PreparedInvocation {
     pub(super) workspace: Option<PathBuf>,
     pub(super) runtime_root: PathBuf,
+    // The procfd pidfd-socket aliases remain valid until every Program has
+    // finished and invocation cleanup has removed their private directory.
+    pub(super) _runtime_root_fd: OwnedFd,
     pub(super) runc: PathBuf,
     pub(super) programs: BTreeMap<ProgramId, PreparedProgram>,
     pub(super) supervisor: InvocationSupervisor,
@@ -368,10 +389,18 @@ pub(super) struct PreparedProgram {
     pub(super) egress: Option<EgressPlan>,
 }
 
+pub(super) fn pidfd_socket_path(runtime_root_fd: &OwnedFd, program_index: usize) -> PathBuf {
+    // A pathname Unix socket has a 108-byte address limit on Linux. Resolving
+    // this short procfd alias creates the socket inside the invocation's 0700
+    // runtime root without coupling the address length to the public State path.
+    PathBuf::from(format!(
+        "/proc/{}/fd/{}/p{program_index}.sock",
+        std::process::id(),
+        runtime_root_fd.as_raw_fd()
+    ))
+}
+
 fn preflight_pidfd_socket(path: &Path) -> AnyResult<()> {
-    if path.as_os_str().as_bytes().len() >= 108 {
-        bail!("Unix socket path is too long: {}", path.display());
-    }
     let listener = UnixListener::bind(path)?;
     drop(listener);
     fs::remove_file(path)?;

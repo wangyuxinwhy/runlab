@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::num::NonZeroU64;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use run_protocol::{
     Network, ProgramId, ProgramInput, RunControls, RunInput, RuntimeConfig, SecretValue, Secrets,
@@ -7,12 +11,43 @@ use run_protocol::{
 use serde_json::json;
 
 use super::fixtures::*;
-use crate::native::prepare::{MAX_EXECUTION_TIMEOUT, MAX_PROGRAMS};
+use crate::native::prepare::{MAX_EXECUTION_TIMEOUT, MAX_PROGRAMS, pidfd_socket_path};
 use crate::native::profile::{
     validate_host_resources, validate_platform, validate_runtime, validate_secrets,
 };
 use crate::oci::inspect_image;
 use crate::{CancellationToken, RunEngine};
+
+#[test]
+fn pidfd_socket_address_is_independent_of_workspace_path_length() {
+    let owner = tempfile::tempdir().expect("socket workspace owner");
+    let runtime_root = owner.path().join("x".repeat(160)).join("runtime");
+    fs::create_dir_all(&runtime_root).expect("long runtime root");
+    let runtime_root_fd: OwnedFd = rustix::fs::open(
+        &runtime_root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("pinned long runtime root");
+    let actual_path = runtime_root.join("p7.sock");
+    let socket_path = pidfd_socket_path(&runtime_root_fd, 7);
+    assert!(actual_path.as_os_str().as_bytes().len() >= 108);
+    assert!(socket_path.as_os_str().as_bytes().len() < 108);
+
+    let listener = UnixListener::bind(&socket_path).expect("bind through short procfd alias");
+    let connection = UnixStream::connect(&socket_path).expect("connect through short procfd alias");
+    assert!(
+        actual_path.exists(),
+        "socket must remain inside the invocation"
+    );
+    drop(connection);
+    drop(listener);
+    fs::remove_file(&socket_path).expect("unlink through short procfd alias");
+    assert!(!actual_path.exists());
+}
 
 #[test]
 fn capability_limits_fail_before_host_or_content_probe() {
