@@ -78,11 +78,17 @@ pub(super) fn execute(
     let supervisor_deadline = cleanup_budget.deadline();
     establish_cleanup_safety(prepared, &mut lifecycle.runs, supervisor_deadline)?;
     cleanup_program_runtimes(context, prepared, &mut lifecycle.runs, supervisor_deadline);
-    finalize_supervisor(prepared, &mut lifecycle.runs, supervisor_deadline)?;
+    let capture_ready = finalize_supervisor(prepared, &mut lifecycle.runs, supervisor_deadline)?;
     if input.controls().capture_final_environment() {
         context.observer.stage(EngineStage::Capturing);
     }
-    let outputs = capture_outputs(context, input, prepared, &mut lifecycle.runs)?;
+    let outputs = capture_outputs(
+        context,
+        input,
+        prepared,
+        &mut lifecycle.runs,
+        &capture_ready,
+    )?;
 
     let all_writers_stopped = lifecycle
         .runs
@@ -309,7 +315,7 @@ fn finalize_supervisor(
     prepared: &mut PreparedInvocation,
     runs: &mut BTreeMap<ProgramId, ProgramRun>,
     deadline: Instant,
-) -> Result<(), EngineError> {
+) -> Result<FinalCaptureReady, EngineError> {
     if let Err(error) = prepared.supervisor.finalize(deadline) {
         mark_writers_unstopped(runs);
         if let Some(workspace) = prepared.workspace.take() {
@@ -324,8 +330,13 @@ fn finalize_supervisor(
     for run in runs.values_mut() {
         run.supervision.unreaped = false;
     }
-    Ok(())
+    Ok(FinalCaptureReady(()))
 }
+
+/// Proof that helper supervision reached `Reaped` after runtime cleanup.
+/// Only this module can construct the value, so final capture cannot be moved
+/// before the cleanup sequence without changing the type-checked call graph.
+struct FinalCaptureReady(());
 
 fn mark_writers_unstopped(runs: &mut BTreeMap<ProgramId, ProgramRun>) {
     for run in runs.values_mut() {
@@ -338,12 +349,13 @@ fn capture_outputs(
     input: &RunInput,
     prepared: &mut PreparedInvocation,
     runs: &mut BTreeMap<ProgramId, ProgramRun>,
+    capture_ready: &FinalCaptureReady,
 ) -> Result<BTreeMap<ProgramId, run_protocol::ProgramOutput>, EngineError> {
     let mut outputs = BTreeMap::new();
     for (program_id, program) in &mut prepared.programs {
         let run = runs.get_mut(program_id).expect("output slot exists");
         let final_environment = if input.controls().capture_final_environment() {
-            capture_final(context, program, run)
+            capture_final(context, program, run, capture_ready)
         } else {
             FinalEnvironment::not_requested()
         };
@@ -415,6 +427,7 @@ fn capture_final(
     context: &ExecutionContext,
     program: &PreparedProgram,
     run: &mut ProgramRun,
+    _capture_ready: &FinalCaptureReady,
 ) -> FinalEnvironment {
     if !run.runtime.writer_stopped {
         return FinalEnvironment::unavailable(

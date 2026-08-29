@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
@@ -98,9 +97,8 @@ fn helper_deadline_kills_and_reaps_the_process_group() {
 
 #[test]
 fn stopped_state_waits_for_queued_raw_exit_evidence() {
-    let (socket, _peer) = UnixStream::pair().expect("socket pair");
     let mut run = ProgramRun::unattempted();
-    run.runtime.exit_monitor = Some(ProcExitMonitor::from_test_socket(socket.into(), 42));
+    run.runtime.exit_monitor = Some(ProcExitMonitor::inert_for_test());
 
     run.observe_runtime_stopped(Duration::from_secs(1));
     assert!(run.runtime.writer_stopped);

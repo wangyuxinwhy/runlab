@@ -36,7 +36,6 @@ pub(super) struct SupervisionState {
 pub(super) struct RuntimeState {
     pub(super) coordinates: Option<(PathBuf, PathBuf, String, Duration)>,
     pub(super) exit_monitor: Option<ProcExitMonitor>,
-    pub(super) exit_monitor_diagnostic: Option<String>,
     pub(super) stopped_observation: Option<(DateTime<FixedOffset>, Instant)>,
     pub(super) pidfd: Option<OwnedFd>,
     pub(super) cgroup_path: Option<PathBuf>,
@@ -91,7 +90,6 @@ impl ProgramRun {
             runtime: RuntimeState {
                 coordinates: None,
                 exit_monitor: None,
-                exit_monitor_diagnostic: None,
                 stopped_observation: None,
                 pidfd: None,
                 cgroup_path: None,

@@ -183,7 +183,9 @@ impl ProgramStarter<'_> {
             }
         }
 
-        establish_process_result_monitor(init_pid, &mut run);
+        if !establish_process_result_monitor(init_pid, &mut run) {
+            return run;
+        }
 
         let start_wall = wall_clock_now();
         let start_monotonic = Instant::now();
@@ -204,13 +206,6 @@ impl ProgramStarter<'_> {
             other_runs,
         );
         run.facts.start = start_report(start_result);
-        if run.facts.start.status() != OperationStatus::Failed
-            && let Some(message) = run.runtime.exit_monitor_diagnostic.take()
-        {
-            run.facts
-                .errors
-                .push(operation_error(OperationStage::Wait, message, None));
-        }
         if run.facts.start.status() == OperationStatus::Failed {
             run.runtime.exit_monitor = None;
             return run;
@@ -600,13 +595,21 @@ fn establish_created_process_evidence(
     Some(init_pid)
 }
 
-fn establish_process_result_monitor(init_pid: u32, run: &mut ProgramRun) {
+fn establish_process_result_monitor(init_pid: u32, run: &mut ProgramRun) -> bool {
     match ProcExitMonitor::subscribe(init_pid) {
-        Ok(monitor) => run.runtime.exit_monitor = Some(monitor),
+        Ok(monitor) => {
+            run.runtime.exit_monitor = Some(monitor);
+            true
+        }
         Err(error) => {
-            run.runtime.exit_monitor_diagnostic = Some(format!(
-                "raw process-result monitoring is unavailable; termination will remain Unknown: {error:#}"
+            run.facts.errors.push(operation_error(
+                OperationStage::ProcessSupervision,
+                format!(
+                    "could not establish reliable process-result monitoring before OCI start: {error:#}"
+                ),
+                None,
             ));
+            false
         }
     }
 }

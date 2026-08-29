@@ -5,15 +5,15 @@ use std::net::TcpListener;
 use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use run_protocol::{
-    ExecutionInterval, Network, OperationStatus, ProcessResult, ProgramId, RunControls, RunInput,
-    StopSignal,
+    ExecutionInterval, ImageDescriptor, Network, OperationStatus, ProcessResult, ProgramId,
+    RunControls, RunInput, StopSignal,
 };
 use rustix::process::geteuid;
 
@@ -24,13 +24,19 @@ use crate::{
     STOP_GRACE_PERIOD,
 };
 
-#[test]
-#[ignore = "set RUNLAB_NATIVE_E2E_OCI_LAYOUT and run as root on the runlab Linux VM"]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one opt-in real-runtime lifecycle shares one imported image while asserting cross-phase evidence"
-)]
-fn real_runc_exercises_native_engine_contract() {
+static REAL_RUNC_E2E_LOCK: Mutex<()> = Mutex::new(());
+const CONCURRENT_INVOCATIONS: usize = 8;
+const CONCURRENT_CHILDREN_PER_PROGRAM: usize = 256;
+
+struct RealRuncFixture {
+    _workspace_owner: tempfile::TempDir,
+    workspace: PathBuf,
+    store: Arc<MemoryStore>,
+    initial: ImageDescriptor,
+    engine: Arc<NativeEngine>,
+}
+
+fn real_runc_fixture() -> RealRuncFixture {
     assert_eq!(geteuid().as_raw(), 0, "real NativeEngine E2E requires root");
     let layout = PathBuf::from(
         std::env::var_os("RUNLAB_NATIVE_E2E_OCI_LAYOUT")
@@ -63,6 +69,32 @@ fn real_runc_exercises_native_engine_contract() {
         runc,
         OperationTimeouts::default(),
     ));
+    RealRuncFixture {
+        _workspace_owner: workspace_owner,
+        workspace,
+        store,
+        initial,
+        engine,
+    }
+}
+
+fn serial_real_runc() -> MutexGuard<'static, ()> {
+    REAL_RUNC_E2E_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[test]
+#[ignore = "set RUNLAB_NATIVE_E2E_OCI_LAYOUT and run as root on the runlab Linux VM"]
+fn real_runc_lifecycle_capture_mounts_and_secrets() {
+    let _serial = serial_real_runc();
+    let RealRuncFixture {
+        _workspace_owner,
+        workspace,
+        store,
+        initial,
+        engine,
+    } = real_runc_fixture();
 
     let cgroups_before = current_process_engine_cgroups();
     let first = engine
@@ -120,13 +152,63 @@ fn real_runc_exercises_native_engine_contract() {
         "owned cgroup leaked"
     );
 
+    let file_mount_source = tempfile::NamedTempFile::new().expect("file mount source");
+    fs::write(file_mount_source.path(), b"task").expect("file mount contents");
+    let file_bind = engine
+        .run(
+            e2e_input_with_file_bind(&initial, file_mount_source.path()),
+            CancellationToken::new(),
+        )
+        .expect("file bind mount output");
+    assert!(
+        file_bind.programs()[&ProgramId::primary()]
+            .final_environment()
+            .value()
+            .is_some(),
+        "file bind mount artifact prevented final environment capture"
+    );
+    assert_engine_workspace_clean(&workspace);
+
+    let secrets = engine
+        .run(e2e_input_with_secrets(&initial), CancellationToken::new())
+        .expect("Secret delivery output");
+    let secret_program = &secrets.programs()[&ProgramId::primary()];
+    assert!(matches!(
+        secret_program.process(),
+        ProcessResult::Exited { code: 0, .. }
+    ));
+    let secret_final = secret_program
+        .final_environment()
+        .value()
+        .expect("final image after Secret delivery");
+    assert_final_delta(store.as_ref(), secret_final);
+    assert_engine_workspace_clean(&workspace);
+}
+
+#[test]
+#[ignore = "set RUNLAB_NATIVE_E2E_OCI_LAYOUT and run as root on the runlab Linux VM"]
+fn real_runc_egress_network() {
+    let _serial = serial_real_runc();
+    let RealRuncFixture {
+        _workspace_owner,
+        workspace,
+        store: _,
+        initial,
+        engine,
+    } = real_runc_fixture();
+
+    exercise_single_egress(&engine, &initial, &workspace);
+    exercise_concurrent_egress(&engine, &initial, &workspace);
+}
+
+fn exercise_single_egress(engine: &NativeEngine, initial: &ImageDescriptor, workspace: &Path) {
     let target = EgressTarget::start(
         1,
         b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\negress-ok",
     );
     let egress_output = engine.run(
         e2e_input_with_network(
-            &initial,
+            initial,
             "egress",
             &format!(
                 "command -v wget >/dev/null || {{ printf 'fixture lacks wget\\n' >&2; exit 127; }}; wget -qO- http://{HOST_ADDRESS}:{}/",
@@ -168,8 +250,14 @@ fn real_runc_exercises_native_engine_contract() {
         "egress polluted execution output"
     );
     assert_eq!(connections, 1, "egress target accepted no connection");
-    assert_engine_workspace_clean(&workspace);
+    assert_engine_workspace_clean(workspace);
+}
 
+fn exercise_concurrent_egress(
+    engine: &Arc<NativeEngine>,
+    initial: &ImageDescriptor,
+    workspace: &Path,
+) {
     let target = EgressTarget::start(
         2,
         b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nconcurrent",
@@ -178,7 +266,7 @@ fn real_runc_exercises_native_engine_contract() {
     let barrier = Arc::new(Barrier::new(2));
     let workers = (0..2)
         .map(|index| {
-            let engine = Arc::clone(&engine);
+            let engine = Arc::clone(engine);
             let initial = initial.clone();
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
@@ -230,39 +318,20 @@ fn real_runc_exercises_native_engine_contract() {
         connections, 2,
         "concurrent egress target accepted {connections} connections"
     );
-    assert_engine_workspace_clean(&workspace);
+    assert_engine_workspace_clean(workspace);
+}
 
-    let file_mount_source = tempfile::NamedTempFile::new().expect("file mount source");
-    fs::write(file_mount_source.path(), b"task").expect("file mount contents");
-    let file_bind = engine
-        .run(
-            e2e_input_with_file_bind(&initial, file_mount_source.path()),
-            CancellationToken::new(),
-        )
-        .expect("file bind mount output");
-    assert!(
-        file_bind.programs()[&ProgramId::primary()]
-            .final_environment()
-            .value()
-            .is_some(),
-        "file bind mount artifact prevented final environment capture"
-    );
-    assert_engine_workspace_clean(&workspace);
-
-    let secrets = engine
-        .run(e2e_input_with_secrets(&initial), CancellationToken::new())
-        .expect("Secret delivery output");
-    let secret_program = &secrets.programs()[&ProgramId::primary()];
-    assert!(matches!(
-        secret_program.process(),
-        ProcessResult::Exited { code: 0, .. }
-    ));
-    let secret_final = secret_program
-        .final_environment()
-        .value()
-        .expect("final image after Secret delivery");
-    assert_final_delta(store.as_ref(), secret_final);
-    assert_engine_workspace_clean(&workspace);
+#[test]
+#[ignore = "set RUNLAB_NATIVE_E2E_OCI_LAYOUT and run as root on the runlab Linux VM"]
+fn real_runc_termination_timeout_and_cancellation() {
+    let _serial = serial_real_runc();
+    let RealRuncFixture {
+        _workspace_owner,
+        workspace,
+        store: _,
+        initial,
+        engine,
+    } = real_runc_fixture();
 
     let exit_zero = engine
         .run(
@@ -358,13 +427,34 @@ fn real_runc_exercises_native_engine_contract() {
             .status(),
         OperationStatus::Failed
     );
+    assert_engine_workspace_clean(&workspace);
+}
 
+#[test]
+#[ignore = "set RUNLAB_NATIVE_E2E_OCI_LAYOUT and run as root on the runlab Linux VM"]
+fn real_runc_multi_program_coordination() {
+    let _serial = serial_real_runc();
+    let RealRuncFixture {
+        _workspace_owner,
+        workspace,
+        store: _,
+        initial,
+        engine,
+    } = real_runc_fixture();
+
+    exercise_shared_stop_grace(&engine, &initial);
+    exercise_dependency_create_failure(&engine, &initial);
+    exercise_large_dependency_output(&engine, &initial);
+    assert_engine_workspace_clean(&workspace);
+}
+
+fn exercise_shared_stop_grace(engine: &NativeEngine, initial: &ImageDescriptor) {
     let shared_grace = RunInput::new(
         BTreeMap::from([
             (
                 ProgramId::new("dependency"),
                 e2e_program(
-                    &initial,
+                    initial,
                     "shared-grace-dependency",
                     "trap '' TERM; while :; do sleep 1; done",
                     b"",
@@ -374,7 +464,7 @@ fn real_runc_exercises_native_engine_contract() {
             (
                 ProgramId::primary(),
                 e2e_program(
-                    &initial,
+                    initial,
                     "shared-grace-primary",
                     "trap '' TERM; while :; do sleep 1; done",
                     b"",
@@ -385,11 +475,9 @@ fn real_runc_exercises_native_engine_contract() {
         RunControls::new(NonZeroU64::new(100), Network::Isolated, true),
     )
     .expect("multi-Program input");
-    let shared_grace_started = Instant::now();
     let shared_grace = engine
         .run(shared_grace, CancellationToken::new())
         .expect("multi-Program timeout output");
-    let shared_grace_elapsed = shared_grace_started.elapsed();
     let term_attempts = shared_grace
         .programs()
         .values()
@@ -401,6 +489,26 @@ fn real_runc_exercises_native_engine_contract() {
         })
         .count();
     assert_eq!(term_attempts, 2);
+    let first_term = shared_grace
+        .programs()
+        .values()
+        .flat_map(run_protocol::ProgramOutput::stop_actions)
+        .filter(|action| action.signal() == StopSignal::Term)
+        .map(run_protocol::StopAction::attempted_at)
+        .min()
+        .expect("TERM attempt");
+    let last_kill = shared_grace
+        .programs()
+        .values()
+        .flat_map(run_protocol::ProgramOutput::stop_actions)
+        .filter(|action| action.signal() == StopSignal::Kill)
+        .map(run_protocol::StopAction::attempted_at)
+        .max()
+        .expect("KILL attempt");
+    let shared_grace_elapsed = last_kill
+        .signed_duration_since(first_term)
+        .to_std()
+        .expect("KILL follows TERM");
     assert!(
         shared_grace_elapsed < STOP_GRACE_PERIOD + Duration::from_secs(5),
         "multi-Program stop exceeded one shared monotonic TERM grace: {shared_grace_elapsed:?}"
@@ -411,16 +519,18 @@ fn real_runc_exercises_native_engine_contract() {
             .iter()
             .any(|action| action.signal() == StopSignal::Kill)
     }));
+}
 
+fn exercise_dependency_create_failure(engine: &NativeEngine, initial: &ImageDescriptor) {
     let dependency_create_failure = RunInput::new(
         BTreeMap::from([
             (
                 ProgramId::new("dependency"),
-                e2e_program_with_options(&initial, "invalid-dependency", "exit 0", b"", "/", true),
+                e2e_program_with_options(initial, "invalid-dependency", "exit 0", b"", "/", true),
             ),
             (
                 ProgramId::primary(),
-                e2e_program(&initial, "blocked-primary", "exit 0", b"", true),
+                e2e_program(initial, "blocked-primary", "exit 0", b"", true),
             ),
         ]),
         RunControls::new(None, Network::Isolated, true),
@@ -440,13 +550,15 @@ fn real_runc_exercises_native_engine_contract() {
             .interval()
             .was_entered()
     );
+}
 
+fn exercise_large_dependency_output(engine: &NativeEngine, initial: &ImageDescriptor) {
     let large_output = RunInput::new(
             BTreeMap::from([
                 (
                     ProgramId::new("dependency"),
                     e2e_program(
-                        &initial,
+                        initial,
                         "large-output-dependency",
                         "dd if=/dev/zero bs=1048576 count=2 2>/dev/null; trap '' TERM; while :; do sleep 1; done",
                         b"",
@@ -456,7 +568,7 @@ fn real_runc_exercises_native_engine_contract() {
                 (
                     ProgramId::primary(),
                     e2e_program(
-                        &initial,
+                        initial,
                         "large-output-primary",
                         "trap '' TERM; while :; do sleep 1; done",
                         b"",
@@ -479,67 +591,101 @@ fn real_runc_exercises_native_engine_contract() {
             .len(),
         2 * 1024 * 1024
     );
+}
 
-    let first_input = e2e_input_uncgrouped(
-        &initial,
-        "first-concurrent",
-        "printf first; sleep .2; exit 0",
-        b"",
-        None,
-    );
-    let second_input = e2e_input_uncgrouped(
-        &initial,
-        "second-concurrent",
-        "printf second; sleep .2; exit 3",
-        b"",
-        None,
-    );
-    let first_engine = Arc::clone(&engine);
-    let first_worker =
-        thread::spawn(move || first_engine.run(first_input, CancellationToken::new()));
-    let second_engine = Arc::clone(&engine);
-    let second_worker =
-        thread::spawn(move || second_engine.run(second_input, CancellationToken::new()));
-    let first_concurrent = first_worker
-        .join()
-        .expect("first worker")
-        .expect("first concurrent Run");
-    let second_concurrent = second_worker
-        .join()
-        .expect("second worker")
-        .expect("second concurrent Run");
-    let first_program = &first_concurrent.programs()[&ProgramId::primary()];
-    let second_program = &second_concurrent.programs()[&ProgramId::primary()];
-    assert_eq!(
-        first_program
-            .stdout()
-            .facts()
-            .expect("first stdout")
-            .bytes(),
-        b"first"
-    );
-    assert!(matches!(
-        first_program.process(),
-        ProcessResult::Exited { code: 0, .. }
-    ));
-    assert_eq!(
-        second_program
-            .stdout()
-            .facts()
-            .expect("second stdout")
-            .bytes(),
-        b"second"
-    );
-    assert!(matches!(
-        second_program.process(),
-        ProcessResult::Exited { code: 3, .. }
-    ));
+#[test]
+#[ignore = "set RUNLAB_NATIVE_E2E_OCI_LAYOUT and run as root on the runlab Linux VM"]
+fn real_runc_concurrent_invocations() {
+    let _serial = serial_real_runc();
+    let RealRuncFixture {
+        _workspace_owner,
+        workspace,
+        store: _,
+        initial,
+        engine,
+    } = real_runc_fixture();
 
+    let barrier = Arc::new(Barrier::new(CONCURRENT_INVOCATIONS));
+    let workers = (0..CONCURRENT_INVOCATIONS)
+        .map(|index| {
+            let engine = Arc::clone(&engine);
+            let initial = initial.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let command = format!(
+                    "i=0; while [ \"$i\" -lt {CONCURRENT_CHILDREN_PER_PROGRAM} ]; do (:) & i=$((i + 1)); done; wait; printf concurrent-{index}; exit {index}"
+                );
+                let input = e2e_input_uncgrouped(
+                    &initial,
+                    &format!("concurrent-{index}"),
+                    &command,
+                    b"",
+                    None,
+                );
+                barrier.wait();
+                (index, engine.run(input, CancellationToken::new()))
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        let (index, output) = worker.join().expect("concurrent worker");
+        let output = output.expect("concurrent RunOutput");
+        let program = &output.programs()[&ProgramId::primary()];
+        assert_eq!(
+            program.stdout().facts().expect("concurrent stdout").bytes(),
+            format!("concurrent-{index}").as_bytes()
+        );
+        assert!(
+            matches!(program.process(), ProcessResult::Exited { code, .. } if *code == i32::try_from(index).expect("test index fits i32")),
+            "concurrent Program {index} lost its exact exit result: {:?}; errors: {:?}",
+            program.process(),
+            program.errors().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            program.errors().count(),
+            0,
+            "concurrent Program {index} reported supervision errors"
+        );
+    }
+    assert_engine_workspace_clean(&workspace);
+}
+
+#[test]
+#[ignore = "set RUNLAB_NATIVE_E2E_OCI_LAYOUT and run as root on the runlab Linux VM"]
+fn real_runc_runtime_failures() {
+    let _serial = serial_real_runc();
+    let RealRuncFixture {
+        _workspace_owner,
+        workspace,
+        store,
+        initial,
+        engine,
+    } = real_runc_fixture();
+    let cgroups_before = current_process_engine_cgroups();
+
+    exercise_create_deadline(&store, &workspace, &initial, &engine);
+    exercise_noisy_create(&store, &workspace, &initial, &engine);
+    exercise_start_deadline(&store, &workspace, &initial, &engine);
+    exercise_create_failure(&engine, &initial);
+    assert_engine_workspace_clean(&workspace);
+    assert_eq!(
+        current_process_engine_cgroups(),
+        cgroups_before,
+        "owned cgroup leaked"
+    );
+}
+
+fn exercise_create_deadline(
+    store: &Arc<MemoryStore>,
+    workspace: &Path,
+    initial: &ImageDescriptor,
+    engine: &NativeEngine,
+) {
     let (_create_wrapper_workspace, create_wrapper) =
         delayed_runc_wrapper(&engine.runc_executable, "create");
     let create_deadline_engine = NativeEngine::new(
         store.clone(),
-        &workspace,
+        workspace,
         create_wrapper,
         OperationTimeouts::default()
             .with_create(Duration::from_millis(10))
@@ -547,7 +693,7 @@ fn real_runc_exercises_native_engine_contract() {
     );
     let create_deadline = create_deadline_engine
         .run(
-            e2e_input(&initial, "create-deadline", "exit 0", b"", None),
+            e2e_input(initial, "create-deadline", "exit 0", b"", None),
             CancellationToken::new(),
         )
         .expect("create timeout is structured output");
@@ -563,17 +709,24 @@ fn real_runc_exercises_native_engine_contract() {
             .errors()
             .any(|error| error.message().contains("create deadline exceeded"))
     );
+}
 
+fn exercise_noisy_create(
+    store: &Arc<MemoryStore>,
+    workspace: &Path,
+    initial: &ImageDescriptor,
+    engine: &NativeEngine,
+) {
     let (_noisy_wrapper_workspace, noisy_wrapper) = noisy_runc_wrapper(&engine.runc_executable);
     let noisy_engine = NativeEngine::new(
         store.clone(),
-        &workspace,
+        workspace,
         noisy_wrapper,
         OperationTimeouts::default(),
     );
     let noisy_create = noisy_engine
         .run(
-            e2e_input(&initial, "noisy-create", "exit 0", b"", None),
+            e2e_input(initial, "noisy-create", "exit 0", b"", None),
             CancellationToken::new(),
         )
         .expect("bounded create diagnostics remain structured output");
@@ -585,12 +738,19 @@ fn real_runc_exercises_native_engine_contract() {
             .errors()
             .any(|error| error.message().contains("diagnostics exceeded"))
     );
+}
 
+fn exercise_start_deadline(
+    store: &Arc<MemoryStore>,
+    workspace: &Path,
+    initial: &ImageDescriptor,
+    engine: &NativeEngine,
+) {
     let (_start_wrapper_workspace, start_wrapper) =
         delayed_runc_wrapper(&engine.runc_executable, "start");
     let start_deadline_engine = NativeEngine::new(
         store.clone(),
-        &workspace,
+        workspace,
         start_wrapper,
         OperationTimeouts::default()
             .with_start(Duration::from_millis(10))
@@ -598,7 +758,7 @@ fn real_runc_exercises_native_engine_contract() {
     );
     let start_deadline = start_deadline_engine
         .run(
-            e2e_input(&initial, "start-deadline", "sleep 1", b"", None),
+            e2e_input(initial, "start-deadline", "sleep 1", b"", None),
             CancellationToken::new(),
         )
         .expect("start timeout is structured output");
@@ -612,10 +772,12 @@ fn real_runc_exercises_native_engine_contract() {
             .errors()
             .any(|error| error.message().contains("start deadline exceeded"))
     );
+}
 
+fn exercise_create_failure(engine: &NativeEngine, initial: &ImageDescriptor) {
     let create_failure = engine
         .run(
-            e2e_input_with_invalid_rlimit(&initial, "create-failure", "exit 0"),
+            e2e_input_with_invalid_rlimit(initial, "create-failure", "exit 0"),
             CancellationToken::new(),
         )
         .expect("create failure is structured output");
@@ -646,12 +808,6 @@ fn real_runc_exercises_native_engine_contract() {
         }),
         "create failure did not retain the target rlimit diagnostic: {:?}",
         create_failure.create().errors().collect::<Vec<_>>()
-    );
-    assert_engine_workspace_clean(&workspace);
-    assert_eq!(
-        current_process_engine_cgroups(),
-        cgroups_before,
-        "owned cgroup leaked"
     );
 }
 

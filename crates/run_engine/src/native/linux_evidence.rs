@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{IoSliceMut, Read};
 use std::mem::MaybeUninit;
@@ -6,9 +5,17 @@ use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result as AnyResult, bail};
 use rustix::net::netlink::{CONNECTOR as NETLINK_CONNECTOR, SocketAddrNetlink};
+use rustix::net::sockopt::{
+    set_socket_recv_buffer_size, set_socket_recv_buffer_size_force, socket_recv_buffer_size,
+};
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendFlags,
     SocketFlags, SocketType, bind, getsockname, recvfrom, recvmsg, sendto, socket_with,
@@ -98,7 +105,12 @@ const NETLINK_HEADER_LEN: usize = 16;
 const CONNECTOR_HEADER_LEN: usize = 20;
 const PROC_EVENT_EXIT_LEN: usize = 40;
 const PROC_EVENT_BUFFER: usize = 64 * 1024;
-const PROC_EVENT_POLL_LIMIT: usize = 64;
+// The connector is host-wide, so lifecycle polling cannot be its backpressure
+// mechanism. The reader drains continuously; this buffer covers scheduler
+// stalls while sequence gaps remain fatal evidence loss.
+const PROC_EVENT_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+const PROC_EVENT_REPORTED_SOCKET_BUFFER: usize = 2 * PROC_EVENT_SOCKET_BUFFER;
+const PROC_EVENT_IDLE_POLL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy)]
 pub(super) enum RawProcessResult {
@@ -123,22 +135,19 @@ impl RawProcessResult {
 }
 
 pub(super) struct ProcExitMonitor {
-    socket: OwnedFd,
-    port_id: u32,
-    target_pid: u32,
-    sequences: BTreeMap<u32, u32>,
-    subscribed: bool,
+    receiver: Receiver<Result<RawProcessResult, String>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<AnyResult<()>>>,
 }
 
 impl ProcExitMonitor {
     #[cfg(test)]
-    pub(super) fn from_test_socket(socket: OwnedFd, target_pid: u32) -> Self {
+    pub(super) fn inert_for_test() -> Self {
+        let (_sender, receiver) = mpsc::channel();
         Self {
-            socket,
-            port_id: 0,
-            target_pid,
-            sequences: BTreeMap::new(),
-            subscribed: false,
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
         }
     }
 
@@ -149,54 +158,64 @@ impl ProcExitMonitor {
             SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
             Some(NETLINK_CONNECTOR),
         )?;
+        configure_proc_event_buffer(&socket)?;
         bind(&socket, &SocketAddrNetlink::new(0, CN_IDX_PROC))?;
         let address = SocketAddrNetlink::try_from(getsockname(&socket)?)?;
-        let mut monitor = Self {
-            socket,
-            port_id: address.pid(),
-            target_pid,
-            sequences: BTreeMap::new(),
-            subscribed: false,
-        };
-        monitor.send_control(PROC_CN_MCAST_LISTEN)?;
-        monitor.subscribed = true;
-        monitor.drain_stale()?;
-        Ok(monitor)
+        send_control(&socket, address.pid(), PROC_CN_MCAST_LISTEN)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name(format!("runlab-proc-exit-{target_pid}"))
+            .spawn(move || {
+                monitor_proc_events(&socket, address.pid(), target_pid, &worker_stop, &sender)
+            })?;
+        Ok(Self {
+            receiver,
+            stop,
+            worker: Some(worker),
+        })
     }
 
     pub(super) fn try_result(&mut self) -> AnyResult<Option<RawProcessResult>> {
-        let mut buffer = vec![0_u8; PROC_EVENT_BUFFER].into_boxed_slice();
-        for _ in 0..PROC_EVENT_POLL_LIMIT {
-            let (received, full_length, address) =
-                match recvfrom(&self.socket, &mut buffer[..], RecvFlags::DONTWAIT) {
-                    Ok(value) => value,
-                    Err(error) if error == rustix::io::Errno::AGAIN => return Ok(None),
-                    Err(error) => return Err(error.into()),
-                };
-            if full_length > received {
-                bail!("proc connector datagram was truncated");
-            }
-            if address
-                .map(SocketAddrNetlink::try_from)
-                .transpose()?
-                .is_some_and(|address| address.pid() != 0)
-            {
-                bail!("proc connector event did not originate from the kernel");
-            }
-            if let Some(status) = self.parse_datagram(&buffer[..received])? {
-                return Ok(Some(RawProcessResult::from_wait_status(status)));
+        match self.receiver.try_recv() {
+            Ok(Ok(result)) => Ok(Some(result)),
+            Ok(Err(error)) => Err(anyhow::anyhow!(error)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                bail!("proc connector reader stopped without a process result")
             }
         }
-        // The proc connector is host-wide. Yield to the lifecycle loop so an
-        // unrelated event flood cannot postpone cancellation or deadlines.
-        Ok(None)
     }
 
-    fn drain_stale(&mut self) -> AnyResult<()> {
-        if self.try_result()?.is_some() {
-            bail!("target process exited before its OCI start attempt");
+    pub(super) fn unsubscribe(&mut self) -> AnyResult<()> {
+        self.stop.store(true, Ordering::Release);
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("proc connector reader thread panicked"))?
+    }
+}
+
+impl Drop for ProcExitMonitor {
+    fn drop(&mut self) {
+        let _ = self.unsubscribe();
+    }
+}
+
+struct ProcEventDecoder {
+    target_pid: u32,
+    sequences: std::collections::BTreeMap<u32, u32>,
+}
+
+impl ProcEventDecoder {
+    fn new(target_pid: u32) -> Self {
+        Self {
+            target_pid,
+            sequences: std::collections::BTreeMap::new(),
         }
-        Ok(())
     }
 
     fn parse_datagram(&mut self, bytes: &[u8]) -> AnyResult<Option<u32>> {
@@ -263,36 +282,100 @@ impl ProcExitMonitor {
         }
         Ok(None)
     }
-
-    fn send_control(&self, operation: u32) -> AnyResult<()> {
-        let message = proc_connector_control_message(self.port_id, operation);
-        let sent = sendto(
-            &self.socket,
-            &message,
-            SendFlags::empty(),
-            &SocketAddrNetlink::new(0, 0),
-        )?;
-        if sent != message.len() {
-            bail!("short proc connector control send");
-        }
-        Ok(())
-    }
-
-    pub(super) fn unsubscribe(&mut self) -> AnyResult<()> {
-        if self.subscribed {
-            self.send_control(PROC_CN_MCAST_IGNORE)?;
-            self.subscribed = false;
-        }
-        Ok(())
-    }
 }
 
-impl Drop for ProcExitMonitor {
-    fn drop(&mut self) {
-        if self.subscribed {
-            let _ = self.unsubscribe();
+fn configure_proc_event_buffer(socket: &OwnedFd) -> AnyResult<()> {
+    match set_socket_recv_buffer_size_force(socket, PROC_EVENT_SOCKET_BUFFER) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::PERM | rustix::io::Errno::ACCESS) => {
+            set_socket_recv_buffer_size(socket, PROC_EVENT_SOCKET_BUFFER)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let actual = socket_recv_buffer_size(socket)?;
+    // Linux reports twice the requested SO_RCVBUF to include bookkeeping.
+    if actual < PROC_EVENT_REPORTED_SOCKET_BUFFER {
+        bail!(
+            "proc connector receive buffer is {actual} accounted bytes, below the required {PROC_EVENT_REPORTED_SOCKET_BUFFER} accounted bytes for {PROC_EVENT_SOCKET_BUFFER} usable bytes"
+        );
+    }
+    Ok(())
+}
+
+fn monitor_proc_events(
+    socket: &OwnedFd,
+    port_id: u32,
+    target_pid: u32,
+    stop: &AtomicBool,
+    sender: &mpsc::Sender<Result<RawProcessResult, String>>,
+) -> AnyResult<()> {
+    let observation = read_proc_events(socket, target_pid, stop);
+    let unsubscribe = send_control(socket, port_id, PROC_CN_MCAST_IGNORE);
+    match observation {
+        Ok(Some(result)) => {
+            let _ = sender.send(Ok(result));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = sender.send(Err(format!("{error:#}")));
         }
     }
+    unsubscribe
+}
+
+fn read_proc_events(
+    socket: &OwnedFd,
+    target_pid: u32,
+    stop: &AtomicBool,
+) -> AnyResult<Option<RawProcessResult>> {
+    let mut decoder = ProcEventDecoder::new(target_pid);
+    let mut buffer = vec![0_u8; PROC_EVENT_BUFFER].into_boxed_slice();
+    while !stop.load(Ordering::Acquire) {
+        let mut drained = false;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let (received, full_length, address) =
+                match recvfrom(socket, &mut buffer[..], RecvFlags::DONTWAIT) {
+                    Ok(value) => value,
+                    Err(error) if error == rustix::io::Errno::AGAIN => break,
+                    Err(error) => return Err(error.into()),
+                };
+            drained = true;
+            if full_length > received {
+                bail!("proc connector datagram was truncated");
+            }
+            if address
+                .map(SocketAddrNetlink::try_from)
+                .transpose()?
+                .is_some_and(|address| address.pid() != 0)
+            {
+                bail!("proc connector event did not originate from the kernel");
+            }
+            if let Some(status) = decoder.parse_datagram(&buffer[..received])? {
+                return Ok(Some(RawProcessResult::from_wait_status(status)));
+            }
+        }
+        if !drained {
+            thread::sleep(PROC_EVENT_IDLE_POLL);
+        }
+    }
+    Ok(None)
+}
+
+fn send_control(socket: &OwnedFd, port_id: u32, operation: u32) -> AnyResult<()> {
+    let message = proc_connector_control_message(port_id, operation);
+    let sent = sendto(
+        socket,
+        &message,
+        SendFlags::empty(),
+        &SocketAddrNetlink::new(0, 0),
+    )?;
+    if sent != message.len() {
+        bail!("short proc connector control send");
+    }
+    Ok(())
 }
 
 fn proc_connector_control_message(port_id: u32, operation: u32) -> [u8; 40] {
@@ -353,6 +436,7 @@ pub(super) fn pidfd_process_id(pidfd: &OwnedFd) -> AnyResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn raw_wait_status_stays_mechanism_only() {
@@ -380,5 +464,90 @@ mod tests {
             CN_IDX_PROC
         );
         assert_eq!(read_u32(&control, 36).expect("listen operation"), 1);
+    }
+
+    #[test]
+    #[ignore = "requires root and the host PID namespace with proc connector enabled"]
+    fn real_proc_exit_monitor_survives_eight_way_process_churn() {
+        const CONCURRENCY: usize = 8;
+        const CHILDREN_PER_WORKER: usize = 128;
+        let mut targets = (0..CONCURRENCY)
+            .map(|index| {
+                Command::new("/bin/sh")
+                    .args(["-c", &format!("sleep 3; exit {index}")])
+                    .spawn()
+                    .expect("target process")
+            })
+            .collect::<Vec<_>>();
+        let monitors = targets
+            .iter()
+            .map(|target| ProcExitMonitor::subscribe(target.id()))
+            .collect::<AnyResult<Vec<_>>>();
+        let mut monitors = match monitors {
+            Ok(monitors) => monitors,
+            Err(error) => {
+                for target in &mut targets {
+                    let _ = target.kill();
+                    let _ = target.wait();
+                }
+                panic!("proc exit monitor: {error:#}");
+            }
+        };
+        let workers = (0..CONCURRENCY)
+            .map(|_| {
+                thread::spawn(|| {
+                    let status = Command::new("/bin/sh")
+                        .args([
+                            "-c",
+                            &format!(
+                                "i=0; while [ \"$i\" -lt {CHILDREN_PER_WORKER} ]; do (:) & i=$((i + 1)); done; wait"
+                            ),
+                        ])
+                        .status()
+                        .expect("process churn worker");
+                    assert!(status.success(), "process churn worker failed: {status}");
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("process churn worker");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let results = monitors
+            .iter_mut()
+            .map(|monitor| {
+                loop {
+                    match monitor.try_result()? {
+                        Some(result) => return Ok(result),
+                        None if std::time::Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        None => bail!("target exit was not observed before the deadline"),
+                    }
+                }
+            })
+            .collect::<AnyResult<Vec<_>>>();
+        let results = match results {
+            Ok(results) => results,
+            Err(error) => {
+                for target in &mut targets {
+                    let _ = target.kill();
+                    let _ = target.wait();
+                }
+                panic!("proc exit observation: {error:#}");
+            }
+        };
+        for (index, ((target, monitor), result)) in targets
+            .iter_mut()
+            .zip(&mut monitors)
+            .zip(results)
+            .enumerate()
+        {
+            let target_status = target.wait().expect("target reap");
+            monitor.unsubscribe().expect("proc monitor unsubscribe");
+            let expected = i32::try_from(index).expect("test index fits i32");
+            assert_eq!(target_status.code(), Some(expected));
+            assert!(matches!(result, RawProcessResult::Exited(code) if code == expected));
+        }
     }
 }

@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use run_protocol::{FinalEnvironment, OperationStage, ProgramId};
 use rustix::process::geteuid;
 
-use super::super::{ExecutionContext, apply_runtime_cleanup_report, capture_final};
+use super::super::{
+    ExecutionContext, FinalCaptureReady, apply_runtime_cleanup_report, capture_final,
+};
 use super::fixtures::*;
 use crate::OperationTimeouts;
 use crate::native::cleanup::{RuntimeCleanup, cleanup_runtime};
@@ -25,6 +27,9 @@ fn unattempted_output_is_structurally_valid_and_timeouts_are_stable() {
 
 #[test]
 fn final_environment_unavailability_preserves_the_failed_capture_evidence() {
+    if !geteuid().is_root() {
+        return;
+    }
     let workspace = tempfile::tempdir().expect("capture workspace");
     let supervisor = InvocationSupervisor::new();
     let prepared =
@@ -35,10 +40,11 @@ fn final_environment_unavailability_preserves_the_failed_capture_evidence() {
         OperationTimeouts::default(),
         Arc::new(crate::observer::IgnoreObserver),
     );
+    let capture_ready = FinalCaptureReady(());
 
     let mut active_writer = ProgramRun::unattempted();
     active_writer.runtime.writer_stopped = false;
-    let unavailable = capture_final(&context, program, &mut active_writer);
+    let unavailable = capture_final(&context, program, &mut active_writer, &capture_ready);
     assert_eq!(
         unavailable.unavailable_reason().expect("writer reason"),
         "a process that could still write the rootfs was not proved stopped"
@@ -47,7 +53,7 @@ fn final_environment_unavailability_preserves_the_failed_capture_evidence() {
 
     let mut residual_mount = ProgramRun::unattempted();
     residual_mount.runtime.writer_stopped = true;
-    let unavailable = capture_final(&context, program, &mut residual_mount);
+    let unavailable = capture_final(&context, program, &mut residual_mount, &capture_ready);
     assert_eq!(
         unavailable.unavailable_reason().expect("mount reason"),
         "the underlying rootfs was not proved stable after mount and artifact cleanup"
@@ -61,7 +67,7 @@ fn final_environment_unavailability_preserves_the_failed_capture_evidence() {
         "proved-empty cgroup could not be removed",
         None,
     ));
-    let unavailable = capture_final(&context, program, &mut failed_capture);
+    let unavailable = capture_final(&context, program, &mut failed_capture, &capture_ready);
     assert!(
         unavailable
             .unavailable_reason()
@@ -132,10 +138,12 @@ fn runtime_cleanup_reports_nonempty_mount_artifact_as_rootfs_instability() {
         OperationTimeouts::default(),
         Arc::new(crate::observer::IgnoreObserver),
     );
+    let capture_ready = FinalCaptureReady(());
     let unavailable = capture_final(
         &context,
         &prepared.programs[&ProgramId::primary()],
         &mut run,
+        &capture_ready,
     );
     assert_eq!(
         unavailable.unavailable_reason().expect("rootfs reason"),

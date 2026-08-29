@@ -11,9 +11,9 @@ runlab -> run_engine -> run_protocol
 runlab ----------------> run_protocol
 ```
 
-`run_protocol` 以 `ProgramInput.secrets` 表达精确的敏感环境变量和文件字节；`run_engine::NativeEngine` 在调用内交付它们，不拥有 Secret 来源或持久化。根 `runlab` package 已从 legacy 实现重写，不保留 Docker、managed service、recovery、reconcile、GC、RunLab-specific runtime-config DSL、registry transport 或旧 Base/Overlay/Task 模型。
+`run_protocol` 以 `ProgramInput.secrets` 表达精确的敏感环境变量和文件字节；`run_engine::NativeEngine` 在调用内交付它们，不拥有 Secret 来源或持久化。根 `runlab` package 已从 legacy 实现重写，不保留 Docker、GC、RunLab-specific runtime-config DSL、registry transport 或旧 Base/Overlay/Task 模型。
 
-`runlab` 当前由十五个直接模块组成：
+`runlab` 当前由十六个直接模块组成：
 
 | 模块 | 责任 |
 | --- | --- |
@@ -27,6 +27,7 @@ runlab ----------------> run_protocol
 | `public_schema` | 稳定公共 `runs` SQL Relation 及可发现 schema |
 | `query` | 有行、cell、总输出和时间边界的只读 SQL 执行 |
 | `run` | 协议输入构造、NativeEngine 调用，以及持久 Run 的 identity、结果投影与持久化 |
+| `run_record` | 版本化持久 Run DTO、Protocol 结果投影与旧记录迁移 |
 | `runtime_config` | 从 OCI Image Config 与固定 Linux 执行骨架生成标准 OCI Runtime Configuration |
 | `state` | 本地 State 打开及组件装配 |
 | `storage` | exact-byte OCI content store 与 SQLite catalog/Run records |
@@ -96,7 +97,7 @@ Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调
 
 `exec` 使用同一 Request Builder 与 `NativeEngine`，但把 `RunControls.capture_final_environment` 设为 `false`。它没有 `run_id`、metadata、accepted/terminal record、Query/get 面或恢复语义，也不发布 OCI Final Image。stderr 观察流的头部为 `run_id: null`，且不会发出 `accepted`、`capturing`、`publishing` 或 `terminal` 阶段；stdout 直接返回完整的有界 `RunOutput` 或 `EngineError`，Program 的 Final Environment 明确为 `not_requested`。`exec` 会真正运行 Program 并保留外部副作用，适用于 `run start` 前的检查和 Observation，不是模拟执行。
 
-当前不实现跨进程恢复。进程在 accepted 之后、terminal 写入之前崩溃时，记录会诚实地保持 accepted 状态；没有 reconcile 或隐式重试。
+Coordinator 在接受 Run 时原子写入私有 execution journal，包括 Linux boot ID、PID、进程 start ticks 和执行阶段。Engine 返回的完整结果先持久化到 journal，再以单一事务发布 terminal completion；因此进程在这两个写入之间退出时，显式 `run reconcile RUN_ID` 可以发布已落盘结果。若 owner 已消失且 journal 仍为 `accepted`，reconcile 可以证明 Engine 从未启动并发布 `interrupted`；若 journal 已进入 `engine_running` 且既没有结果也没有资源清理证明，则返回 `evidence_incomplete` 并诚实保留 accepted。读取命令不隐式 reconcile，也不自动重试 Program。
 
 ## 已知边界
 
@@ -110,9 +111,13 @@ Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调
 - `filesystem changes --run` 只派生 Final Environment 相对 Initial Image 的变化路径。它按路径稳定排序并分页，区分 `added`、`modified`、`deleted`；Final Layer 的候选路径只触发一次 Initial Layer chain 扫描，opaque whiteout 用 `subtree: true` 的目录事实表示，不展开全部下层后代。
 - stdout/stderr 既作为协议事实保存在完整 Run record 中，也在 `run start` 期间作为实时观察事件输出；独立 stream 命令尚未因真实场景而引入。
 - `exec` 的 stdout/stderr 不持久化，只在最终 stdout JSON 与实时 stderr 观察流中返回；调用方丢失结果后没有按身份恢复的读取面。
-- 不实现恢复、验证、评分、golden comparison 或实验编排。
+- 不实现对未返回 Engine 调用的自动恢复或重试，也不在 Engine 已启动但缺少资源清理证据时推断 interrupted；显式 reconcile 只发布已经持久化的 Engine 结果，或有 journal 证据证明 Engine 从未启动的 interruption。不实现验证、评分、golden comparison 或实验编排。
 
 ## 当前验证
+
+本轮 Linux 完成门禁通过 `scripts/verify-linux.sh` 执行默认 all-target tests、Clippy（warnings denied）、all-target check、三个 package 文件清单与六个精确命名、串行运行的真实 runc 场景；独立进程 CLI 测试 17 passed，六个 NativeEngine 场景全部通过，场景耗时依次为 5.63、3.64、34.21、23.92、1.64、2.88 秒。
+
+本轮 macOS 默认并行 all-target suite 曾两次在 `detached_run_returns_after_acceptance_while_the_worker_continues` 的 5 秒 wall-clock 断言处失败，分别观测到 8.54 秒和 8.97 秒；这些失败证据保留且不算作通过。该测试现改为用 worker release marker 直接断言“父进程先返回、worker 后完成”的顺序关系，不再把并行负载下的绝对耗时当成产品契约；修改后默认并行 suite 通过。
 
 macOS 与 Linux rootful VM 已通过：
 
@@ -144,6 +149,10 @@ pidfd socket 的 State 路径解耦已在 Linux 上单独验证：非特权回�
 真实 `NativeEngine` E2E 还覆盖了 `Network::Egress`：Program 从独立 OCI network namespace 主动连接 VM 上的 TCP 服务并取得响应；调用返回后临时 veth 与对应 IPv4/IPv6 firewall rules 均无残留。
 
 Egress 的宿主网络变更由 `/run/run-engine-network.lock` 在所有 NativeEngine 进程之间协调；锁只覆盖 setup/cleanup，不串行化 Program 执行。Program 的 host-wide proc connector 订阅在网络准备结束后、OCI start 前建立，避免把 `ip`、`iptables` 和 `nsenter` 辅助进程事件积压成当前 Program 的结果监控失败。真实 Linux 验证同时覆盖同一 NativeEngine 的两个 Egress 调用，以及共享同一 VM 和 State 的两个独立 CLI 进程：两条确定性 HTTP Run 与两条 DNS+HTTPS `exec` 均得到精确 exit 0，Program 和 execution errors 为空，未出现 `ENOBUFS`，结束后 veth 和 IPv4/IPv6 规则均无残留。
+
+后续 Trace 中同一 `No buffer space available (os error 105)` 又在高进程负载下复现，当前八路并发更使八个 Program 的退出结果全部成为 `Unknown`，因此上面的两路验证只能证明网络准备事件已被隔离，不能证明进程结果监控能够承受真实并发负载。当前源码把每个订阅交给独立 reader thread 持续排空，不再由 10 ms 生命周期轮询每次最多读取 64 个 host-wide 事件；socket 显式要求至少 4 MiB 接收缓冲区，无法建立该监督条件时在 OCI start 前以 `ProcessSupervision` 失败。真实 Linux 并发门禁已扩为八路，每个 Program 产生 256 个子进程并返回不同退出码，并新增不依赖 OCI 的 proc connector 探针，以八个目标、八个独立订阅和八路进程 churn 逐一断言退出码 0–7。Linux Rust 1.97.1 编译、Clippy 和纯监督测试通过；新增 connector 探针前的完整非 E2E 测试除 Docker 嵌套 OverlayFS mount 不受支持外为 81 passed、6 ignored。privileged Docker 的真实 connector 探针无法开始订阅，内核返回 `Protocol not supported (os error 93)`，因此该环境不能为 reader 路径提供运行证据。
+
+同一源码随后在真实 Managed VM 上完成验收：八订阅 connector churn 探针 3.00 秒通过；八路 real-runc 场景让每个 Program 产生 256 个子进程，精确取得退出码 0–7，203.70 秒通过且未出现 `ENOBUFS`。其余 lifecycle/capture、egress、timeout/cancellation、multi-program 和 runtime-failure 场景也全部通过。multi-program 首次以 46.57 秒失败的 wall-clock 断言不构成产品失败证据：测试从 `engine.run` 前计时，把大型 OCI fixture 的 rootfs 准备也计入了 TERM grace；断言改为比较 RunOutput 中最早 TERM 与最晚 KILL 的实际 attempt facts 后重新执行并通过，未用重复运行掩盖原失败。一次为替换 debug 测试 artifact 而主动中止的 egress 准备留下 1.9 GiB 挂载 workspace；该精确 mount 和目录已卸载删除，复查无 test、runc 或 engine cgroup 残留，VM 根文件系统恢复为 49 GiB 可用。
 
 detached 纵切以真实 Managed VM 和 `base` Image 验证：Host 在 accepted 可查询后返回，不等待 Program terminal；同一 Run 随后由 `run get` 取得 terminal。引入不可变 Store 的 snapshot validation receipt 后，11-Layer warm Run 的 accepted→Program start 从此前 31.904 秒降为 0.775 秒，Program end→terminal 为 0.144 秒；这是同一 VM 上的单次前后观测，不表示统计分布。`image get base` 也只读取 Manifest 与 Config，真实 macOS 调用 wall time 为 0.838 秒，不再为只读 metadata 重验所有 Layer。
 
