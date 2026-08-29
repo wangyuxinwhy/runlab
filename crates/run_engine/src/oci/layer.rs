@@ -1,12 +1,11 @@
 use std::io::{self, Read, Seek as _, SeekFrom};
 
-use flate2::read::MultiGzDecoder;
 use oci_spec::image::{Descriptor, Digest, MediaType};
 use sha2::{Digest as _, Sha256};
 
 use super::content::{layer_io_error, lowercase_hex, verify_media_type, verify_reader};
 use super::{ImageLimits, OciError, image_error, unsupported_error};
-use crate::OciContentStore;
+use crate::{LayerDecodeError, OciContentStore, decode_layer, supported_layer_media_types};
 
 pub(super) fn preflight_layers(
     descriptors: &[Descriptor],
@@ -83,27 +82,18 @@ fn layer_diff_id(
     path: &str,
     uncompressed_limit: u64,
 ) -> Result<(u64, Digest), OciError> {
-    let mut reader: Box<dyn Read + '_> = match media_type {
-        MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => Box::new(content),
-        MediaType::ImageLayerGzip | MediaType::ImageLayerNonDistributableGzip => {
-            Box::new(MultiGzDecoder::new(content))
-        }
-        MediaType::ImageLayerZstd | MediaType::ImageLayerNonDistributableZstd => Box::new(
-            zstd::stream::read::Decoder::new(content)
-                .map_err(|source| layer_decode_error(path, source))?,
-        ),
-        media_type => {
-            return Err(OciError::MediaType {
-                path: path.to_owned(),
-                expected: supported_layer_media_types()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                actual: media_type.to_string(),
-            });
-        }
-    };
+    let mut reader = decode_layer(media_type, content).map_err(|error| match error {
+        LayerDecodeError::UnsupportedMediaType(actual) => OciError::MediaType {
+            path: path.to_owned(),
+            expected: supported_layer_media_types()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            actual,
+        },
+        LayerDecodeError::Initialization(source) => layer_decode_error(path, source),
+    })?;
     digest_stream_limited(&mut reader, path, uncompressed_limit)
 }
 
@@ -141,18 +131,6 @@ pub(super) fn digest_stream_limited<R: Read + ?Sized>(
     let digest = Digest::try_from(format!("sha256:{}", lowercase_hex(&hasher.finalize())))
         .expect("a SHA-256 result is always a valid OCI digest");
     Ok((size, digest))
-}
-
-pub(super) fn supported_layer_media_types() -> &'static [MediaType] {
-    const MEDIA_TYPES: &[MediaType] = &[
-        MediaType::ImageLayer,
-        MediaType::ImageLayerGzip,
-        MediaType::ImageLayerZstd,
-        MediaType::ImageLayerNonDistributable,
-        MediaType::ImageLayerNonDistributableGzip,
-        MediaType::ImageLayerNonDistributableZstd,
-    ];
-    MEDIA_TYPES
 }
 
 fn layer_decode_error(path: &str, source: io::Error) -> OciError {

@@ -5,6 +5,7 @@
 
 mod cancellation;
 mod content;
+mod layer;
 #[cfg(target_os = "linux")]
 mod native;
 mod observer;
@@ -16,6 +17,7 @@ mod timeouts;
 
 pub use cancellation::CancellationToken;
 pub use content::{ContentError, ContentErrorKind, OciContent, OciContentStore};
+pub use layer::{LayerDecodeError, decode_layer, supported_layer_media_types};
 #[cfg(target_os = "linux")]
 pub use native::NativeEngine;
 pub use observer::{EngineObserver, EngineStage, ProgramStream};

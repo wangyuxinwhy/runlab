@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
-use flate2::read::GzDecoder;
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageIndex, ImageManifest, MediaType, Os};
 use run_engine::OciContentStore;
 use serde::Serialize;
@@ -127,8 +126,13 @@ pub(crate) struct ImageFilesystem {
 }
 
 impl ImageFilesystem {
-    pub(crate) fn read_layer(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
-        self.store.read(descriptor)
+    pub(crate) fn open_layer(
+        &self,
+        descriptor: &Descriptor,
+    ) -> Result<Box<dyn run_engine::OciContent>> {
+        self.store
+            .open(descriptor)
+            .map_err(|error| anyhow::anyhow!(error))
     }
 }
 
@@ -598,7 +602,7 @@ fn verify_descriptor_bytes(descriptor: &Descriptor, bytes: &[u8]) -> Result<()> 
 }
 
 fn verify_diff_id(descriptor: &Descriptor, bytes: &[u8], expected: &str) -> Result<()> {
-    let mut reader = layer_reader(descriptor, bytes)?;
+    let mut reader = layer_reader(descriptor, Cursor::new(bytes))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -622,34 +626,34 @@ fn verify_diff_id(descriptor: &Descriptor, bytes: &[u8], expected: &str) -> Resu
 
 pub(crate) fn layer_reader<'a>(
     descriptor: &Descriptor,
-    bytes: &'a [u8],
+    content: impl Read + 'a,
 ) -> Result<Box<dyn Read + 'a>> {
-    let media_type = descriptor.media_type().to_string();
-    match media_type.as_str() {
-        "application/vnd.oci.image.layer.v1.tar" => Ok(Box::new(Cursor::new(bytes))),
-        "application/vnd.oci.image.layer.v1.tar+gzip" => {
-            Ok(Box::new(GzDecoder::new(Cursor::new(bytes))))
-        }
-        "application/vnd.oci.image.layer.v1.tar+zstd" => Ok(Box::new(
-            zstd::stream::read::Decoder::new(Cursor::new(bytes))?,
-        )),
-        _ => bail!("unsupported OCI Layer media type: {media_type}"),
-    }
+    run_engine::decode_layer(descriptor.media_type(), content)
+        .map_err(|error| crate::error::invalid_input(anyhow::Error::new(error), "image_validation"))
 }
 
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.trim() != name || name.chars().any(char::is_whitespace) {
-        bail!("Image name must be non-empty and contain no whitespace");
+        return Err(crate::error::invalid_input(
+            anyhow::anyhow!("Image name must be non-empty and contain no whitespace"),
+            "image_input",
+        ));
     }
     if name.starts_with("sha256:") {
-        bail!("Image name cannot use the sha256 digest prefix");
+        return Err(crate::error::invalid_input(
+            anyhow::anyhow!("Image name cannot use the sha256 digest prefix"),
+            "image_input",
+        ));
     }
     Ok(())
 }
 
 fn validate_page_size(limit: usize) -> Result<()> {
     if !(1..=MAX_PAGE_SIZE).contains(&limit) {
-        bail!("--limit must be between 1 and {MAX_PAGE_SIZE}");
+        return Err(crate::error::invalid_input(
+            anyhow::anyhow!("--limit must be between 1 and {MAX_PAGE_SIZE}"),
+            "image_input",
+        ));
     }
     Ok(())
 }
@@ -661,4 +665,66 @@ fn sha256_digest(bytes: &[u8]) -> String {
         write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
     }
     format!("sha256:{encoded}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+
+    use flate2::{Compression, write::GzEncoder};
+    use oci_spec::image::{Descriptor, MediaType};
+    use serde_json::json;
+
+    use super::{layer_reader, sha256_digest};
+
+    fn descriptor(media_type: &MediaType, bytes: &[u8]) -> Descriptor {
+        serde_json::from_value(json!({
+            "mediaType": media_type,
+            "digest": sha256_digest(bytes),
+            "size": bytes.len(),
+        }))
+        .expect("descriptor")
+    }
+
+    #[test]
+    fn reads_all_six_oci_layer_media_types() {
+        let raw = b"deterministic layer bytes";
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(raw).expect("gzip write");
+        let gzip = gzip.finish().expect("gzip finish");
+        let zstd = zstd::stream::encode_all(raw.as_slice(), 3).expect("zstd encode");
+        for (media_type, bytes) in [
+            (MediaType::ImageLayer, raw.to_vec()),
+            (MediaType::ImageLayerGzip, gzip.clone()),
+            (MediaType::ImageLayerZstd, zstd.clone()),
+            (MediaType::ImageLayerNonDistributable, raw.to_vec()),
+            (MediaType::ImageLayerNonDistributableGzip, gzip),
+            (MediaType::ImageLayerNonDistributableZstd, zstd),
+        ] {
+            let descriptor = descriptor(&media_type, &bytes);
+            let mut decoded = Vec::new();
+            layer_reader(&descriptor, std::io::Cursor::new(&bytes))
+                .expect("supported media type")
+                .read_to_end(&mut decoded)
+                .expect("decode layer");
+            assert_eq!(decoded, raw, "media type {media_type}");
+        }
+    }
+
+    #[test]
+    fn reads_every_member_of_a_multi_member_gzip_layer() {
+        let encode = |bytes: &[u8]| {
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+            gzip.write_all(bytes).expect("gzip write");
+            gzip.finish().expect("gzip finish")
+        };
+        let bytes = [encode(b"first"), encode(b"second")].concat();
+        let descriptor = descriptor(&MediaType::ImageLayerGzip, &bytes);
+        let mut decoded = Vec::new();
+        layer_reader(&descriptor, std::io::Cursor::new(&bytes))
+            .expect("gzip layer")
+            .read_to_end(&mut decoded)
+            .expect("decode all gzip members");
+        assert_eq!(decoded, b"firstsecond");
+    }
 }

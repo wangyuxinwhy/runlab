@@ -5,10 +5,9 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use flate2::read::MultiGzDecoder;
 #[cfg(test)]
 use oci_spec::image::Descriptor;
-use oci_spec::image::{DigestAlgorithm, MediaType};
+use oci_spec::image::DigestAlgorithm;
 use rustix::fs::{Mode, OFlags, fstat, open};
 #[cfg(test)]
 use rustix::fs::{mkdirat, openat};
@@ -256,23 +255,15 @@ pub(super) fn verify_and_stage(
         compressed.as_file_mut(),
         MaterializationFault::CompressedRead,
     );
-    let reader: Box<dyn Read + '_> = match layer.descriptor.media_type() {
-        MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => {
-            Box::new(&mut compressed_reader)
-        }
-        MediaType::ImageLayerGzip | MediaType::ImageLayerNonDistributableGzip => {
-            Box::new(MultiGzDecoder::new(&mut compressed_reader))
-        }
-        MediaType::ImageLayerZstd | MediaType::ImageLayerNonDistributableZstd => Box::new(
-            zstd::stream::read::Decoder::new(&mut compressed_reader)
-                .context("failed to initialize zstd OCI Layer decoder")?,
-        ),
-        other => {
-            return Err(unsupported_input(format!(
-                "unsupported OCI Layer mediaType: {other}"
-            )));
-        }
-    };
+    let reader = crate::decode_layer(layer.descriptor.media_type(), &mut compressed_reader)
+        .map_err(|error| match error {
+            crate::LayerDecodeError::UnsupportedMediaType(actual) => {
+                unsupported_input(format!("unsupported OCI Layer mediaType: {actual}"))
+            }
+            crate::LayerDecodeError::Initialization(source) => {
+                anyhow::Error::new(source).context("failed to initialize OCI Layer decoder")
+            }
+        })?;
     let mut decoded = tempfile::NamedTempFile::new_in(workspace).map_err(internal_error)?;
     let mut bounded = reader.take(max_uncompressed.saturating_add(1));
     let (actual_diff_id, decoded_size) = copy_and_digest(

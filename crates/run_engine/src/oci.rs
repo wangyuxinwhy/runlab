@@ -7,7 +7,7 @@ use run_protocol::{ImageDescriptor, ImageDescriptorError};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-use crate::{ContentError, ContentErrorKind, OciContentStore};
+use crate::{ContentError, ContentErrorKind, OciContentStore, supported_layer_media_types};
 
 use self::content::{descriptor_for_bytes, enforce_generated_json_limit};
 #[cfg(test)]
@@ -16,7 +16,7 @@ pub(crate) use self::content::{publish_expected, read_small_verified, verify_con
 use self::json::{json_bytes, parse_unique_json};
 #[cfg(test)]
 use self::layer::digest_stream_limited;
-use self::layer::{preflight_layers, supported_layer_media_types, verify_layer};
+use self::layer::{preflight_layers, verify_layer};
 
 const MAX_IMAGE_LAYERS: usize = 1024;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
