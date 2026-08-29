@@ -798,6 +798,29 @@ pub(crate) fn decode_completion(encoded: &str) -> Result<CompletionRecord> {
 
 pub(crate) fn migrate_input(encoded: &str) -> Result<String> {
     migrate_versioned_object(encoded, "stored RunInput", |value| {
+        add_empty_secrets(value, "stored RunInput")?;
+        if !value.contains_key("controls") {
+            let execution_timeout_ms = value
+                .get("execution_timeout_ms")
+                .cloned()
+                .context("legacy stored RunInput has no execution_timeout_ms")?;
+            let network = value
+                .get("network")
+                .cloned()
+                .context("legacy stored RunInput has no network")?;
+            value.remove("execution_timeout_ms");
+            value.remove("network");
+            value.insert(
+                "controls".to_owned(),
+                serde_json::json!({
+                    "execution_timeout_ms": execution_timeout_ms,
+                    "network": network,
+                    // Before non-persistent `exec` existed, every stored Run
+                    // requested a Final Environment.
+                    "capture_final_environment": true,
+                }),
+            );
+        }
         value.insert("record_version".to_owned(), Value::from(RECORD_VERSION));
         Ok(())
     })
@@ -809,6 +832,7 @@ pub(crate) fn migrate_input(encoded: &str) -> Result<String> {
 
 pub(crate) fn migrate_identity(encoded: &str) -> Result<String> {
     migrate_versioned_object(encoded, "stored RunInput identity", |value| {
+        add_empty_secrets(value, "stored RunInput identity")?;
         value.insert("record_version".to_owned(), Value::from(RECORD_VERSION));
         Ok(())
     })
@@ -816,6 +840,22 @@ pub(crate) fn migrate_identity(encoded: &str) -> Result<String> {
         decode_identity(&encoded)?;
         Ok(encoded)
     })
+}
+
+fn add_empty_secrets(value: &mut serde_json::Map<String, Value>, subject: &str) -> Result<()> {
+    let programs = value
+        .get_mut("programs")
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("{subject} has invalid programs"))?;
+    for (program_id, program) in programs {
+        let program = program
+            .as_object_mut()
+            .with_context(|| format!("{subject} has invalid Program {program_id}"))?;
+        program
+            .entry("secrets")
+            .or_insert_with(|| serde_json::json!({"env": {}, "files": {}}));
+    }
+    Ok(())
 }
 
 pub(crate) fn migrate_completion(encoded: &str) -> Result<String> {
@@ -907,4 +947,78 @@ fn sha256_digest(bytes: &[u8]) -> String {
         write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
     }
     format!("sha256:{encoded}")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{migrate_identity, migrate_input};
+
+    #[test]
+    fn migrates_pre_controls_and_pre_secrets_input_records() {
+        let input = json!({
+            "programs": {
+                "dependency": legacy_input_program('a'),
+                "primary": legacy_input_program('b'),
+            },
+            "execution_timeout_ms": null,
+            "network": "isolated",
+        });
+        let migrated = migrate_input(&input.to_string()).expect("migrate legacy input");
+        let migrated: Value = serde_json::from_str(&migrated).expect("migrated input JSON");
+
+        assert_eq!(migrated["record_version"], 1);
+        assert_eq!(migrated["controls"]["execution_timeout_ms"], Value::Null);
+        assert_eq!(migrated["controls"]["network"], "isolated");
+        assert_eq!(migrated["controls"]["capture_final_environment"], true);
+        assert!(migrated.get("execution_timeout_ms").is_none());
+        assert!(migrated.get("network").is_none());
+        for program in migrated["programs"].as_object().expect("programs").values() {
+            assert_eq!(program["secrets"], json!({"env": {}, "files": {}}));
+        }
+    }
+
+    #[test]
+    fn migrates_pre_secrets_identity_records() {
+        let identity = json!({
+            "programs": {
+                "dependency": legacy_identity_program('a'),
+                "primary": legacy_identity_program('b'),
+            },
+            "execution_timeout_ms": 100,
+            "network": "egress",
+        });
+        let migrated = migrate_identity(&identity.to_string()).expect("migrate legacy identity");
+        let migrated: Value = serde_json::from_str(&migrated).expect("migrated identity JSON");
+
+        assert_eq!(migrated["record_version"], 1);
+        for program in migrated["programs"].as_object().expect("programs").values() {
+            assert_eq!(program["secrets"], json!({"env": {}, "files": {}}));
+        }
+    }
+
+    fn legacy_input_program(digest_byte: char) -> Value {
+        json!({
+            "initial_environment": descriptor(digest_byte),
+            "runtime_config": {"encoding": "base64", "bytes": "e30="},
+            "stdin": {"encoding": "base64", "bytes": ""},
+        })
+    }
+
+    fn legacy_identity_program(digest_byte: char) -> Value {
+        json!({
+            "initial_environment": descriptor(digest_byte),
+            "runtime_config": {},
+            "stdin": "",
+        })
+    }
+
+    fn descriptor(digest_byte: char) -> Value {
+        json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": format!("sha256:{}", digest_byte.to_string().repeat(64)),
+            "size": 1,
+        })
+    }
 }
