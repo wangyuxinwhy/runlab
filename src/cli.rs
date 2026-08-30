@@ -14,6 +14,7 @@ mod filesystem;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod image;
 mod input;
+mod observation;
 mod query;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) mod run;
@@ -51,7 +52,7 @@ enum Command {
     },
     /// Execute once without creating a persistent Run or Final Image.
     #[command(
-        long_about = "Execute one Run Protocol invocation for immediate observation without creating a persistent Run. The command uses the same Image resolution, Runtime Configuration, stdin, Secret, timeout, and network behavior as run start, but it has no run_id, accepted record, metadata, query/get surface, recovery, or Final Image. stderr emits the NDJSON observation stream with run_id:null. Success writes the complete bounded RunOutput or EngineError JSON to stdout because there is no later run get. Program and external side effects are real; this is not a dry run.",
+        long_about = "Execute one Run Protocol invocation for immediate inspection without creating a persistent Run. The command uses the same Image resolution, Runtime Configuration, stdin, Secret, timeout, and network behavior as run start, but it has no run_id, accepted record, metadata, query/get surface, recovery, or Final Image. stderr emits the NDJSON Live Event stream with run_id:null. Success writes the complete bounded RunOutput or EngineError JSON to stdout because there is no later run get. Program and external side effects are real; this is not a dry run.",
         after_long_help = "Use exec to inspect an environment or command before a persistent Run matters. Do not present a later run start as a first attempt when earlier exec calls used the same evaluation task.\n\nExamples:\n  runlab exec --image base\n  runlab exec --image pi --stdin prompt.txt --network egress --secret-env DEEPSEEK_API_KEY\n  runlab exec --image base --runtime-config config.json >execution.json"
     )]
     Exec(run::ExecArgs),
@@ -64,6 +65,11 @@ enum Command {
     Image {
         #[command(subcommand)]
         command: image::ImageCommand,
+    },
+    /// Register Types and submit or retract Observations on terminal Runs.
+    Observation {
+        #[command(subcommand)]
+        command: observation::ObservationCommand,
     },
     /// Start, cancel, and read persistent Runs.
     Run {
@@ -145,6 +151,7 @@ pub(crate) fn run() -> Result<u8> {
         Command::Exec(arguments) => execute_exec(state, arguments),
         Command::Filesystem { command } => execute_filesystem(state, command),
         Command::Image { command } => execute_image(state, command),
+        Command::Observation { command } => execute_observation(state, &command),
         Command::Run { command } => execute_run(state, command),
         Command::Schema { command } => execute_schema(state, command),
         Command::Query { command } => execute_query(state, command),
@@ -152,6 +159,19 @@ pub(crate) fn run() -> Result<u8> {
         #[cfg(target_os = "macos")]
         Command::Vm { command } => vm::execute(command),
     }
+}
+
+fn execute_observation(
+    state: Option<&PathBuf>,
+    command: &observation::ObservationCommand,
+) -> Result<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        reject_managed_state(state)?;
+        observation::execute_managed(command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    observation::execute(&resolve_state(state.cloned())?, command)
 }
 
 fn execute_storage(state: Option<&PathBuf>, command: &storage::StorageCommand) -> Result<u8> {

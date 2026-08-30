@@ -1,0 +1,10 @@
+[
+  "index",
+  {
+    "type": "dir",
+    "name": "generated",
+    "label": "Design Contracts",
+    "collapsible": true,
+    "collapsed": false
+  }
+]

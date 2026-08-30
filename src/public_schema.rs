@@ -56,6 +56,56 @@ SELECT run_id, deleted_at, operation_id
 FROM main.run_tombstones;
 ";
 
+const OBSERVATION_TYPES_VIEW_SQL: &str = r"
+CREATE TEMP VIEW observation_types AS
+SELECT
+    observation_type AS type,
+    registered_at,
+    title,
+    description,
+    payload_schema_json AS payload_schema
+FROM main.observation_types;
+";
+
+const OBSERVATIONS_VIEW_SQL: &str = r"
+CREATE TEMP VIEW observations AS
+SELECT
+    observation.observation_id,
+    observation.run_id,
+    observation.observation_type AS type,
+    observation.submitted_at,
+    json_extract(observation.method_json, '$.name') AS method_name,
+    json_extract(observation.method_json, '$.version') AS method_version,
+    observation.payload_json AS payload,
+    observation.supersedes_observation_id,
+    replacement.observation_id AS superseded_by_observation_id,
+    retraction.retraction_id,
+    retraction.retracted_at,
+    retraction.reason AS retraction_reason,
+    CASE
+        WHEN retraction.retraction_id IS NOT NULL THEN 'retracted'
+        WHEN replacement.observation_id IS NOT NULL THEN 'superseded'
+        ELSE 'active'
+    END AS state
+FROM main.observations AS observation
+LEFT JOIN main.observations AS replacement
+  ON replacement.supersedes_observation_id = observation.observation_id
+LEFT JOIN main.observation_retractions AS retraction
+  ON retraction.observation_id = observation.observation_id;
+";
+
+const OBSERVATION_RETRACTIONS_VIEW_SQL: &str = r"
+CREATE TEMP VIEW observation_retractions AS
+SELECT
+    retraction.retraction_id,
+    observation.run_id,
+    retraction.observation_id,
+    retraction.retracted_at,
+    retraction.reason
+FROM main.observation_retractions AS retraction
+JOIN main.observations AS observation USING (observation_id);
+";
+
 #[derive(Clone, Copy)]
 struct Column {
     name: &'static str,
@@ -220,6 +270,153 @@ const RUN_DELETIONS_COLUMNS: &[Column] = &[
     },
 ];
 
+const OBSERVATION_TYPES_COLUMNS: &[Column] = &[
+    Column {
+        name: "type",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Immutable versioned Observation Type identity.",
+    },
+    Column {
+        name: "registered_at",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Exact RFC 3339 time when this State first registered the Type.",
+    },
+    Column {
+        name: "title",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Short human-readable Type title.",
+    },
+    Column {
+        name: "description",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Complete semantic contract for producers and consumers of the Type.",
+    },
+    Column {
+        name: "payload_schema",
+        data_type: "JSON",
+        nullable: false,
+        description: "Self-contained JSON Schema Draft 2020-12 used to validate every payload.",
+    },
+];
+
+const OBSERVATIONS_COLUMNS: &[Column] = &[
+    Column {
+        name: "observation_id",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Caller-owned canonical UUID v4 identifying this immutable Observation.",
+    },
+    Column {
+        name: "run_id",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Canonical identity of the single terminal Run being observed.",
+    },
+    Column {
+        name: "type",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Registered versioned Observation Type identity.",
+    },
+    Column {
+        name: "submitted_at",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Exact RFC 3339 time when RunLab first stored the Observation.",
+    },
+    Column {
+        name: "method_name",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Method identity declared by the Observation producer.",
+    },
+    Column {
+        name: "method_version",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Method version declared by the Observation producer.",
+    },
+    Column {
+        name: "payload",
+        data_type: "JSON",
+        nullable: false,
+        description: "Complete JSON payload validated against the registered Type schema.",
+    },
+    Column {
+        name: "supersedes_observation_id",
+        data_type: "TEXT",
+        nullable: true,
+        description: "Older active Observation replaced by this Observation, when present.",
+    },
+    Column {
+        name: "superseded_by_observation_id",
+        data_type: "TEXT",
+        nullable: true,
+        description: "Newer Observation that replaced this Observation, when present.",
+    },
+    Column {
+        name: "retraction_id",
+        data_type: "TEXT",
+        nullable: true,
+        description: "Immutable retraction identity when this Observation was withdrawn.",
+    },
+    Column {
+        name: "retracted_at",
+        data_type: "TEXT",
+        nullable: true,
+        description: "Exact RFC 3339 retraction time, when retracted.",
+    },
+    Column {
+        name: "retraction_reason",
+        data_type: "TEXT",
+        nullable: true,
+        description: "Caller-provided reason explaining the retraction.",
+    },
+    Column {
+        name: "state",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Derived state: active, superseded, or retracted.",
+    },
+];
+
+const OBSERVATION_RETRACTIONS_COLUMNS: &[Column] = &[
+    Column {
+        name: "retraction_id",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Caller-owned canonical UUID v4 identifying the immutable retraction.",
+    },
+    Column {
+        name: "run_id",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Run identity inherited from the retracted Observation.",
+    },
+    Column {
+        name: "observation_id",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Identity of the Observation that was withdrawn.",
+    },
+    Column {
+        name: "retracted_at",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Exact RFC 3339 time when RunLab first stored the retraction.",
+    },
+    Column {
+        name: "reason",
+        data_type: "TEXT",
+        nullable: false,
+        description: "Caller-provided reason explaining the retraction.",
+    },
+];
+
 struct Relation {
     name: &'static str,
     description: &'static str,
@@ -236,6 +433,21 @@ const RELATIONS: &[Relation] = &[
         name: "run_deletions",
         description: "Durable deletion facts for removed Run identities.",
         columns: RUN_DELETIONS_COLUMNS,
+    },
+    Relation {
+        name: "observation_types",
+        description: "Immutable Observation Type definitions used by the same validation and query path for built-in and externally registered Types.",
+        columns: OBSERVATION_TYPES_COLUMNS,
+    },
+    Relation {
+        name: "observations",
+        description: "Immutable structured Observations attached to one terminal Run, including generic JSON payloads and derived correction state.",
+        columns: OBSERVATIONS_COLUMNS,
+    },
+    Relation {
+        name: "observation_retractions",
+        description: "Immutable reasons withdrawing previously active Observations.",
+        columns: OBSERVATION_RETRACTIONS_COLUMNS,
     },
 ];
 
@@ -266,11 +478,16 @@ pub(crate) fn install(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(
             "DROP VIEW IF EXISTS temp.runs;
-             DROP VIEW IF EXISTS temp.run_deletions;",
+             DROP VIEW IF EXISTS temp.run_deletions;
+             DROP VIEW IF EXISTS temp.observation_types;
+             DROP VIEW IF EXISTS temp.observations;
+             DROP VIEW IF EXISTS temp.observation_retractions;",
         )
         .context("failed to replace public Relations")?;
     connection
-        .execute_batch(&format!("{RUNS_VIEW_SQL}{RUN_DELETIONS_VIEW_SQL}"))
+        .execute_batch(&format!(
+            "{RUNS_VIEW_SQL}{RUN_DELETIONS_VIEW_SQL}{OBSERVATION_TYPES_VIEW_SQL}{OBSERVATIONS_VIEW_SQL}{OBSERVATION_RETRACTIONS_VIEW_SQL}"
+        ))
         .context("failed to create public Relations")?;
     validate(connection)
 }

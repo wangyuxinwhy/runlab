@@ -20,11 +20,11 @@ pub enum ProgramStream {
     Stderr,
 }
 
-/// Best-effort, invocation-scoped observations from an Engine implementation.
+/// Best-effort, invocation-scoped events from an Engine implementation.
 ///
-/// Observations do not replace or extend [`run_protocol::RunOutput`]. Implementations
-/// may discard observations; observers must return promptly and must not panic.
-pub trait EngineObserver: Send + Sync {
+/// Live Events do not replace or extend [`run_protocol::RunOutput`]. Implementations
+/// may discard events; sinks must return promptly and must not panic.
+pub trait EngineEventSink: Send + Sync {
     /// Reports that the Engine entered a coarse execution boundary.
     fn stage(&self, _stage: EngineStage) {}
 
@@ -43,7 +43,7 @@ pub trait EngineObserver: Send + Sync {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) struct IgnoreObserver;
+pub(crate) struct IgnoreEventSink;
 
 #[cfg(target_os = "linux")]
-impl EngineObserver for IgnoreObserver {}
+impl EngineEventSink for IgnoreEventSink {}

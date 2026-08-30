@@ -167,7 +167,18 @@ fn authorize(
     public_count: &AtomicBool,
 ) -> Authorization {
     match context.action {
-        AuthAction::Select if matches!(context.accessor, Some("runs" | "run_deletions")) => {
+        AuthAction::Select
+            if matches!(
+                context.accessor,
+                Some(
+                    "runs"
+                        | "run_deletions"
+                        | "observation_types"
+                        | "observations"
+                        | "observation_retractions",
+                )
+            ) =>
+        {
             public_count.store(true, Ordering::Relaxed);
             Authorization::Allow
         }
@@ -178,7 +189,12 @@ fn authorize(
             Authorization::Allow
         }
         AuthAction::Read {
-            table_name: "runs" | "run_tombstones",
+            table_name:
+                "runs"
+                | "run_tombstones"
+                | "observation_types"
+                | "observations"
+                | "observation_retractions",
             column_name: "",
         } if context.database_name == Some("main")
             && context.accessor.is_none()
@@ -188,13 +204,35 @@ fn authorize(
         }
         AuthAction::Read { table_name, .. }
             if (context.database_name == Some("temp")
-                && matches!(table_name, "runs" | "run_deletions"))
+                && matches!(
+                    table_name,
+                    "runs"
+                        | "run_deletions"
+                        | "observation_types"
+                        | "observations"
+                        | "observation_retractions"
+                ))
                 || (context.database_name == Some("main")
                     && table_name == "runs"
                     && context.accessor == Some("runs"))
                 || (context.database_name == Some("main")
                     && table_name == "run_tombstones"
-                    && context.accessor == Some("run_deletions")) =>
+                    && context.accessor == Some("run_deletions"))
+                || (context.database_name == Some("main")
+                    && table_name == "observation_types"
+                    && context.accessor == Some("observation_types"))
+                || (context.database_name == Some("main")
+                    && table_name == "observations"
+                    && matches!(
+                        context.accessor,
+                        Some("observations" | "observation_retractions")
+                    ))
+                || (context.database_name == Some("main")
+                    && table_name == "observation_retractions"
+                    && matches!(
+                        context.accessor,
+                        Some("observations" | "observation_retractions")
+                    )) =>
         {
             Authorization::Allow
         }
@@ -325,20 +363,22 @@ mod tests {
         database
     }
 
+    fn execute(database: &Database, sql: &str) -> anyhow::Result<super::QueryReport> {
+        run(
+            database,
+            sql,
+            100,
+            64 * 1024,
+            64 * 1024,
+            Duration::from_secs(1),
+        )
+    }
+
     #[test]
     fn reads_only_the_public_runs_relation() {
         let database = database();
-        let execute = |sql: &str| {
-            run(
-                &database,
-                sql,
-                100,
-                64 * 1024,
-                64 * 1024,
-                Duration::from_secs(1),
-            )
-        };
         let report = execute(
+            &database,
             "SELECT run_id, initial_image_name, initial_image_digest, description, \
                     json_extract(labels, '$.suite') AS suite, completion_kind \
              FROM runs",
@@ -352,17 +392,25 @@ mod tests {
         );
         assert_eq!(report.rows[0]["suite"], "swe-bench");
         assert_eq!(report.rows[0]["completion_kind"], "engine_error");
-        let terminal = execute("SELECT terminal_at, terminal_unix_seconds FROM runs")
-            .expect("terminal range value");
+        let terminal = execute(
+            &database,
+            "SELECT terminal_at, terminal_unix_seconds FROM runs",
+        )
+        .expect("terminal range value");
         assert_eq!(
             terminal.rows[0]["terminal_at"],
             "2026-08-28T01:02:04.123456789Z"
         );
         assert!(terminal.rows[0]["terminal_unix_seconds"].as_f64().is_some());
 
-        let count = execute("SELECT COUNT(*) AS run_count FROM runs").expect("public count");
+        let count =
+            execute(&database, "SELECT COUNT(*) AS run_count FROM runs").expect("public count");
         assert_eq!(count.rows[0]["run_count"], 1);
+    }
 
+    #[test]
+    fn reads_the_public_run_deletions_relation() {
+        let database = database();
         database
             .with_connection(|connection| {
                 connection.execute(
@@ -377,21 +425,110 @@ mod tests {
                 Ok(())
             })
             .expect("tombstone fixture");
-        let deletions = execute("SELECT run_id, deleted_at, operation_id FROM run_deletions")
-            .expect("public deletion query");
+        let deletions = execute(
+            &database,
+            "SELECT run_id, deleted_at, operation_id FROM run_deletions",
+        )
+        .expect("public deletion query");
         assert_eq!(deletions.returned, 1);
         assert_eq!(
             deletions.rows[0]["operation_id"],
             "550e8400-e29b-41d4-a716-446655440002"
         );
-        let deletion_count =
-            execute("SELECT COUNT(*) AS n FROM run_deletions").expect("public deletion count");
+        let deletion_count = execute(&database, "SELECT COUNT(*) AS n FROM run_deletions")
+            .expect("public deletion count");
         assert_eq!(deletion_count.rows[0]["n"], 1);
+    }
 
+    #[test]
+    fn reads_observation_history_through_public_relations() {
+        let database = database();
+        let types = execute(
+            &database,
+            "SELECT type, json_extract(payload_schema, '$.properties.input_tokens.type') AS input_kind FROM observation_types",
+        )
+        .expect("public Observation Type query");
+        assert_eq!(types.rows[0]["type"], "runlab/token_usage@v1");
+        assert_eq!(types.rows[0]["input_kind"], "integer");
+        database
+            .with_connection(|connection| {
+                for (id, supersedes, total) in [
+                    ("550e8400-e29b-41d4-a716-446655440010", None, 15_400),
+                    (
+                        "550e8400-e29b-41d4-a716-446655440011",
+                        Some("550e8400-e29b-41d4-a716-446655440010"),
+                        15_200,
+                    ),
+                ] {
+                    connection.execute(
+                        "INSERT INTO main.observations(
+                            observation_id, run_id, observation_type, submitted_at,
+                            method_json, payload_json,
+                            supersedes_observation_id
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            id,
+                            "550e8400-e29b-41d4-a716-446655440000",
+                            "runlab/token_usage@v1",
+                            "2026-08-29T01:00:00Z",
+                            r#"{"name":"fixture","version":"1"}"#,
+                            serde_json::to_string(&serde_json::json!({
+                                "coverage": "complete",
+                                "input_tokens": total - 400,
+                                "cached_input_tokens": 8000,
+                                "cache_write_input_tokens": null,
+                                "output_tokens": 400,
+                                "reasoning_output_tokens": 100,
+                            }))?,
+                            supersedes,
+                        ],
+                    )?;
+                }
+                connection.execute(
+                    "INSERT INTO main.observation_retractions(
+                        retraction_id, observation_id, retracted_at, reason
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    [
+                        "550e8400-e29b-41d4-a716-446655440012",
+                        "550e8400-e29b-41d4-a716-446655440011",
+                        "2026-08-29T02:00:00Z",
+                        "fixture retraction",
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("Observation fixture");
+        let observations = execute(
+            &database,
+            "SELECT observation_id, json_extract(payload, '$.input_tokens') + \
+                    json_extract(payload, '$.output_tokens') AS total_tokens, \
+                    state, superseded_by_observation_id, \
+                    retraction_reason FROM observations ORDER BY observation_id",
+        )
+        .expect("public Observation query");
+        assert_eq!(observations.returned, 2);
+        assert_eq!(observations.rows[0]["state"], "superseded");
+        assert_eq!(observations.rows[1]["state"], "retracted");
+        assert_eq!(observations.rows[1]["total_tokens"], 15_200);
+        let retractions = execute(
+            &database,
+            "SELECT run_id, observation_id, reason FROM observation_retractions",
+        )
+        .expect("public retraction query");
+        assert_eq!(retractions.returned, 1);
+        assert_eq!(retractions.rows[0]["reason"], "fixture retraction");
+    }
+
+    #[test]
+    fn rejects_private_or_mutating_sql() {
+        let database = database();
         for sql in [
             "SELECT * FROM main.runs",
             "SELECT COUNT(*) FROM main.runs",
             "SELECT * FROM main.run_tombstones",
+            "SELECT * FROM main.observation_types",
+            "SELECT * FROM main.observations",
+            "SELECT * FROM main.observation_retractions",
             "SELECT (SELECT COUNT(*) FROM main.runs) AS leaked FROM runs",
             "SELECT * FROM sqlite_schema",
             "DELETE FROM runs",
@@ -399,7 +536,7 @@ mod tests {
             "SELECT load_extension('x')",
         ] {
             assert!(
-                execute(sql).is_err(),
+                execute(&database, sql).is_err(),
                 "private or mutating SQL was allowed: {sql}"
             );
         }

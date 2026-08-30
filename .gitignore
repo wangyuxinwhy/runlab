@@ -1,4 +1,8 @@
 /target/
 /target-*/
+/.rspress/
+/node_modules/
+.private/
+doc_build/
 __pycache__/
 *.pyc

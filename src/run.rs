@@ -23,13 +23,13 @@ use run_protocol::{
     EngineError, ImageDescriptor, Network, ProgramId, ProgramInput, RunControls, RunInput,
     RunOutput, RuntimeConfig, Secrets,
 };
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use uuid::{Uuid, Version};
 
 use crate::image::{ImageSelector, Images};
+use crate::live_event::RunLiveEvent;
 use crate::metadata::Metadata;
-use crate::observation::RunObservation;
 use crate::run_record::{CompletionRecord, EngineResultRecord, InputIdentityRecord, InputRecord};
 use crate::state::State;
 use crate::storage::{
@@ -65,6 +65,17 @@ impl Serialize for RunId {
         S: Serializer,
     {
         serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for RunId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -160,7 +171,7 @@ impl<'a> Runs<'a> {
     }
 
     pub(crate) fn start(&self, state: &State, request: &RunRequest) -> Result<RunStartResult> {
-        self.start_with_observation(state, request, true, false)
+        self.start_with_live_events(state, request, true, false)
     }
 
     pub(crate) fn start_detached_worker(
@@ -168,10 +179,10 @@ impl<'a> Runs<'a> {
         state: &State,
         request: &RunRequest,
     ) -> Result<RunStartResult> {
-        self.start_with_observation(state, request, false, true)
+        self.start_with_live_events(state, request, false, true)
     }
 
-    fn start_with_observation(
+    fn start_with_live_events(
         &self,
         state: &State,
         request: &RunRequest,
@@ -216,39 +227,39 @@ impl<'a> Runs<'a> {
             ) {
                 return Err(identity_conflict_error(&run_id));
             }
-            let observation = persistent_observation(&run_id, observe, false);
-            observation.finish();
+            let live_events = persistent_live_event(&run_id, observe, false);
+            live_events.finish();
             return start_result(&existing, false);
         }
         debug_assert!(matches!(insertion, RunInsertion::Created));
 
         let accepted = (|| {
-            let observation = persistent_observation(&run_id, observe, signal_detached_ready);
-            observation.stage("accepted");
-            observation.stage("preparing");
+            let live_events = persistent_live_event(&run_id, observe, signal_detached_ready);
+            live_events.stage("accepted");
+            live_events.stage("preparing");
             let cancellation = CancellationToken::new();
             let signal = SignalCancellation::install(&cancellation)?;
             self.database.run_mark_engine_running(&run_id)?;
             let input = prepared.input;
-            let (result, cancellation_monitor) = run_persistent_observed(
+            let (result, cancellation_monitor) = run_persistent_with_events(
                 &engine,
                 &input,
                 &cancellation,
-                observation.engine_observer(),
+                live_events.engine_event_sink(),
                 self.database,
                 &run_id,
             );
             signal.close()?;
-            observation.report_dropped_observation();
-            observation.stage("publishing");
+            live_events.report_dropped_events();
+            live_events.stage("publishing");
             let completion = CompletionRecord::engine_returned(result);
             let terminal_at = Utc::now().to_rfc3339();
             self.database.run_stage_completion(&run_id, &completion)?;
             if !self.database.run_publish_staged(&run_id, &terminal_at)? {
                 bail!("staged Run completion disappeared before publication");
             }
-            observation.stage("terminal");
-            observation.finish();
+            live_events.stage("terminal");
+            live_events.finish();
             cancellation_monitor?;
             let record = self
                 .database
@@ -283,19 +294,19 @@ impl<'a> Runs<'a> {
             )
         })?;
         let engine = native_engine(state)?;
-        let observation = RunObservation::exec_stderr();
-        observation.stage("preparing");
+        let live_events = RunLiveEvent::exec_stderr();
+        live_events.stage("preparing");
         let cancellation = CancellationToken::new();
         let signal = SignalCancellation::install(&cancellation)?;
-        let result = run_observed(
+        let result = run_with_events(
             &engine,
             &prepared.input,
             &cancellation,
-            observation.engine_observer(),
+            live_events.engine_event_sink(),
         );
         signal.close()?;
-        observation.report_dropped_observation();
-        observation.finish();
+        live_events.report_dropped_events();
+        live_events.finish();
         Ok(ExecResult {
             schema_version: 1,
             result: serde_json::to_value(EngineResultRecord::from(result))?,
@@ -654,27 +665,23 @@ fn current_execution_owner() -> Result<ExecutionOwner> {
     bail!("persistent Run execution requires Linux")
 }
 
-fn persistent_observation(
-    run_id: &str,
-    enabled: bool,
-    signal_detached_ready: bool,
-) -> RunObservation {
+fn persistent_live_event(run_id: &str, enabled: bool, signal_detached_ready: bool) -> RunLiveEvent {
     if signal_detached_ready {
-        RunObservation::detached_ready(run_id);
+        RunLiveEvent::detached_ready(run_id);
     }
     if enabled {
-        RunObservation::stderr(run_id)
+        RunLiveEvent::stderr(run_id)
     } else {
-        RunObservation::discarded()
+        RunLiveEvent::discarded()
     }
 }
 
 #[cfg(target_os = "linux")]
-fn run_persistent_observed(
+fn run_persistent_with_events(
     engine: &run_engine::NativeEngine,
     input: &RunInput,
     cancellation: &CancellationToken,
-    observer: Arc<dyn run_engine::EngineObserver>,
+    event_sink: Arc<dyn run_engine::EngineEventSink>,
     database: &Database,
     run_id: &str,
 ) -> (Result<RunOutput, EngineError>, Result<()>) {
@@ -690,7 +697,7 @@ fn run_persistent_observed(
             }
             Ok(())
         });
-        let result = run_observed(engine, input, cancellation, observer);
+        let result = run_with_events(engine, input, cancellation, event_sink);
         finished.store(true, Ordering::Release);
         watcher.thread().unpark();
         let watcher = watcher
@@ -702,11 +709,11 @@ fn run_persistent_observed(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_persistent_observed(
+fn run_persistent_with_events(
     _engine: &UnavailableEngine,
     _input: &RunInput,
     _cancellation: &CancellationToken,
-    _observer: Arc<dyn run_engine::EngineObserver>,
+    _event_sink: Arc<dyn run_engine::EngineEventSink>,
     _database: &Database,
     _run_id: &str,
 ) -> (Result<RunOutput, EngineError>, Result<()>) {
@@ -725,21 +732,21 @@ fn matches_request(
 }
 
 #[cfg(target_os = "linux")]
-fn run_observed(
+fn run_with_events(
     engine: &run_engine::NativeEngine,
     input: &RunInput,
     cancellation: &CancellationToken,
-    observer: Arc<dyn run_engine::EngineObserver>,
+    event_sink: Arc<dyn run_engine::EngineEventSink>,
 ) -> Result<RunOutput, EngineError> {
-    engine.run_observed(input, cancellation, observer)
+    engine.run_with_events(input, cancellation, event_sink)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_observed(
+fn run_with_events(
     _engine: &UnavailableEngine,
     _input: &RunInput,
     _cancellation: &CancellationToken,
-    _observer: Arc<dyn run_engine::EngineObserver>,
+    _event_sink: Arc<dyn run_engine::EngineEventSink>,
 ) -> Result<RunOutput, EngineError> {
     unreachable!("unavailable engine is never constructed")
 }

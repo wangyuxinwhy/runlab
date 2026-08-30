@@ -10,7 +10,7 @@ use run_protocol::{
 };
 use rustix::{fs::OFlags, fs::fcntl_getfl, fs::fcntl_setfl};
 
-use crate::{EngineObserver, ProgramStream};
+use crate::{EngineEventSink, ProgramStream};
 
 const PIPE_PUMP_BYTE_BUDGET: usize = 1024 * 1024;
 
@@ -106,15 +106,15 @@ pub(super) struct StreamDrain {
     omitted: bool,
     eof: bool,
     error: Option<String>,
-    observation: Option<Box<StreamObservation>>,
+    live_event: Option<Box<StreamLiveEvent>>,
 }
 
-struct StreamObservation {
+struct StreamLiveEvent {
     program_id: run_protocol::ProgramId,
     stream: ProgramStream,
     byte_offset: u64,
     closed: bool,
-    observer: Arc<dyn EngineObserver>,
+    event_sink: Arc<dyn EngineEventSink>,
 }
 
 impl StreamDrain {
@@ -134,22 +134,22 @@ impl StreamDrain {
             omitted: false,
             eof: false,
             error,
-            observation: None,
+            live_event: None,
         }
     }
 
-    pub(super) fn observe(
+    pub(super) fn forward_events(
         &mut self,
         program_id: run_protocol::ProgramId,
         stream: ProgramStream,
-        observer: Arc<dyn EngineObserver>,
+        event_sink: Arc<dyn EngineEventSink>,
     ) {
-        self.observation = Some(Box::new(StreamObservation {
+        self.live_event = Some(Box::new(StreamLiveEvent {
             program_id,
             stream,
             byte_offset: 0,
             closed: false,
-            observer,
+            event_sink,
         }));
     }
 
@@ -224,29 +224,29 @@ impl StreamDrain {
     }
 
     fn observe_bytes(&mut self, bytes: &[u8]) {
-        let Some(observation) = &mut self.observation else {
+        let Some(live_event) = &mut self.live_event else {
             return;
         };
-        observation.observer.program_output(
-            &observation.program_id,
-            observation.stream,
-            observation.byte_offset,
+        live_event.event_sink.program_output(
+            &live_event.program_id,
+            live_event.stream,
+            live_event.byte_offset,
             bytes,
         );
-        observation.byte_offset = observation
+        live_event.byte_offset = live_event
             .byte_offset
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
     }
 
     fn observe_closed(&mut self) {
-        let Some(observation) = &mut self.observation else {
+        let Some(live_event) = &mut self.live_event else {
             return;
         };
-        if !observation.closed {
-            observation.closed = true;
-            observation
-                .observer
-                .program_stream_closed(&observation.program_id, observation.stream);
+        if !live_event.closed {
+            live_event.closed = true;
+            live_event
+                .event_sink
+                .program_stream_closed(&live_event.program_id, live_event.stream);
         }
     }
 }
@@ -273,12 +273,12 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct CountingObserver {
+    struct CountingEventSink {
         bytes: AtomicU64,
         closed: AtomicBool,
     }
 
-    impl EngineObserver for CountingObserver {
+    impl EngineEventSink for CountingEventSink {
         fn program_output(
             &self,
             _program_id: &run_protocol::ProgramId,
@@ -316,11 +316,11 @@ mod tests {
             }
         });
         let mut drain = StreamDrain::new(reader);
-        let observer = Arc::new(CountingObserver::default());
-        drain.observe(
+        let event_sink = Arc::new(CountingEventSink::default());
+        drain.forward_events(
             run_protocol::ProgramId::primary(),
             ProgramStream::Stdout,
-            observer.clone(),
+            event_sink.clone(),
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         while !drain.is_closed() {
@@ -338,9 +338,9 @@ mod tests {
         assert!(facts.omitted_after_limit());
         assert!(facts.eof());
         assert_eq!(
-            observer.bytes.load(Ordering::Acquire),
+            event_sink.bytes.load(Ordering::Acquire),
             u64::try_from(MAX_CAPTURED_STREAM_BYTES + 17).expect("test stream length")
         );
-        assert!(observer.closed.load(Ordering::Acquire));
+        assert!(event_sink.closed.load(Ordering::Acquire));
     }
 }

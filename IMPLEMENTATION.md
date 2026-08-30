@@ -13,7 +13,7 @@ runlab ----------------> run_protocol
 
 `run_protocol` 以 `ProgramInput.secrets` 表达精确的敏感环境变量和文件字节；`run_engine::NativeEngine` 在调用内交付它们，不拥有 Secret 来源或持久化。根 `runlab` package 已从 legacy 实现重写，不保留 Docker、GC、RunLab-specific runtime-config DSL、registry transport 或旧 Base/Overlay/Task 模型。
 
-`runlab` 当前由十六个直接模块组成：
+`runlab` 当前由十八个直接模块组成：
 
 | 模块 | 责任 |
 | --- | --- |
@@ -23,10 +23,12 @@ runlab ----------------> run_protocol
 | `image` | OCI Image Layout 导入、Catalog 查询与 Image 检查 |
 | `managed_vm` | macOS 上固定 Lima/VZ Linux VM 的显式生命周期与兼容性检查 |
 | `metadata` | description 与任意字符串 label 的有界解析与校验 |
-| `observation` | `run start` 与 `exec` 期间实时 stderr NDJSON 事件的编码 |
-| `public_schema` | 稳定公共 `runs` SQL Relation 及可发现 schema |
+| `live_event` | `run start` 与 `exec` 期间 stderr NDJSON Live Event 的编码 |
+| `observation` | 终态 Run 的 typed Observation 校验、追加、修正与撤回语义 |
+| `public_schema` | 稳定公共 SQL Relations 及可发现 schema |
 | `query` | 有行、cell、总输出和时间边界的只读 SQL 执行 |
 | `run` | 协议输入构造、NativeEngine 调用，以及持久 Run 的 identity、结果投影与持久化 |
+| `run_deletion` | 终态 Run 资产的 checked plan、stale 检测与原子删除语义 |
 | `run_record` | 版本化持久 Run DTO、Protocol 结果投影与旧记录迁移 |
 | `runtime_config` | 从 OCI Image Config 与固定 Linux 执行骨架生成标准 OCI Runtime Configuration |
 | `state` | 本地 State 打开及组件装配 |
@@ -48,6 +50,8 @@ image export
 filesystem get
 filesystem changes
 exec
+observation submit
+observation retract
 run config generate
 run start
 run cancel
@@ -59,7 +63,7 @@ storage status
 storage prune check|apply
 ```
 
-此外，`docs list/get` 在打开 State 或连接 Managed VM 之前本地执行。`start-here`、`how-to/build-images` 与 `how-to/query-runs` 由普通 Markdown source、编译期 `include_str!` registry 和薄 CLI adapter 组成；Root Help 明确指向完整首次工作流，`list` 返回带 `schema_version` 的紧凑 JSON，`get` 默认返回 Markdown并支持 `--output json`。当前没有引入 `docs search`。
+此外，`docs list/get` 在打开 State 或连接 Managed VM 之前本地执行。`start-here` 与四个 `how-to/*` topic 由普通 Markdown source、编译期 `include_str!` registry 和薄 CLI adapter 组成；Root Help 明确指向完整首次工作流，`list` 返回带 `schema_version` 的紧凑 JSON，`get` 默认返回 Markdown并支持 `--output json`。当前没有引入 `docs search`。
 
 macOS 另外提供 `vm create/start/install/stop/status`。它们只管理固定名为 `runlab` 的 Lima 2.2.0/VZ 实例，要求宿主架构匹配、plain mode、零 host mounts 和 digest-pinned Ubuntu Image。`vm status` 不改变 VM；其他操作均可安全重试。
 
@@ -73,7 +77,9 @@ macOS Runtime Configuration 中除 RunLab 固定 resolver scaffold 外的 bind s
 
 CLI 失败统一写入 schema version 1 的 `runlab.error` JSON。已知输入错误、资源不存在、身份冲突、Managed VM 不可用与内部错误分别使用稳定 category；`accepted` 和 `run_created` 在无法证明时为 `null`。Guest 的结构化错误由 macOS transport 识别并保持字段不变；streaming 调用已经转发的错误不会在 Host 再输出一次。
 
-public `runs` Relation 直接从不可变 Run JSON 派生 primary Program 的 started/ended、执行毫秒数、acceptance→start、end→terminal、retained stdout/stderr bytes 与 Final Image digest。它不复制流内容或完整 Final Environment。
+public `runs` Relation 直接从不可变 Run JSON 派生 primary Program 的 started/ended、执行毫秒数、acceptance→start、end→terminal、retained stdout/stderr bytes 与 Final Image digest。它不复制流内容或完整 Final Environment。`observation_types`、`observations` 与 `observation_retractions` Relations 公开不可变 Type 定义、持久 Observation 历史及派生的 active/superseded/retracted 状态；Type-specific 字段统一通过 SQLite JSON 函数查询，不设 typed columns。
+
+实时终端通道统一称为 Live Event，并继续使用 `run.stream`、`run.stage`、`program.stdout` 与 `program.stderr` wire kinds。Observation 只表示终态 Run 上由外部 Method 产生的持久 typed record，不属于 Run Protocol 或 Engine。Method 自己拥有来源发现、解析和推导，RunLab 信任其声明并只记录 Method name/version。Observation Type 是 create-only 的五字段定义，内置 `runlab/token_usage@v1` 与外部注册 Type 共用 Draft 2020-12 validator、存储及查询路径。调用方拥有 Observation/retraction UUID，原文重试幂等，修正通过 append-only supersession，撤回通过独立 append-only retraction。Run 删除计划 schema v2 冻结 Run Record 与全套 Observation 资产的共同指纹，check 后的 Observation 变化会使 apply 以 stale conflict 失败。
 
 `image export` 把 Catalog Image 或一个 Run Program 的 Final Image 写成标准未压缩 OCI Image Layout archive。导出逐个流式复验 Descriptor size 与 SHA-256，以同目录临时文件和 no-replace rename 发布，不覆盖既有路径；macOS transport 还会复验整个 archive 的 size 和 digest。
 
@@ -95,7 +101,7 @@ Run identity 由调用者提供 canonical lowercase UUID v4。`run start` 在调
 
 `run start --detach` 启动同一 Coordinator 的独立进程组，只等待 accepted 事实可见后返回 Run ID 与恢复命令。它不建立第二种 Run，也不改变 Run Protocol；worker 继续走相同 accepted→Engine→terminal 生命周期。detached 调用不转发 Program stream，后续只通过 `run get` 或 `query run` 观察。
 
-`exec` 使用同一 Request Builder 与 `NativeEngine`，但把 `RunControls.capture_final_environment` 设为 `false`。它没有 `run_id`、metadata、accepted/terminal record、Query/get 面或恢复语义，也不发布 OCI Final Image。stderr 观察流的头部为 `run_id: null`，且不会发出 `accepted`、`capturing`、`publishing` 或 `terminal` 阶段；stdout 直接返回完整的有界 `RunOutput` 或 `EngineError`，Program 的 Final Environment 明确为 `not_requested`。`exec` 会真正运行 Program 并保留外部副作用，适用于 `run start` 前的检查和 Observation，不是模拟执行。
+`exec` 使用同一 Request Builder 与 `NativeEngine`，但把 `RunControls.capture_final_environment` 设为 `false`。它没有 `run_id`、metadata、accepted/terminal record、Query/get 面或恢复语义，也不发布 OCI Final Image。stderr Live Event 流的头部为 `run_id: null`，且不会发出 `accepted`、`capturing`、`publishing` 或 `terminal` 阶段；stdout 直接返回完整的有界 `RunOutput` 或 `EngineError`，Program 的 Final Environment 明确为 `not_requested`。`exec` 会真正运行 Program 并保留外部副作用，适用于 `run start` 前的检查，不是模拟执行。
 
 Coordinator 在接受 Run 时原子写入私有 execution journal，包括 Linux boot ID、PID、进程 start ticks 和执行阶段。Engine 返回的完整结果先持久化到 journal，再以单一事务发布 terminal completion；因此进程在这两个写入之间退出时，显式 `run reconcile RUN_ID` 可以发布已落盘结果。若 owner 已消失且 journal 仍为 `accepted`，reconcile 可以证明 Engine 从未启动并发布 `interrupted`；若 journal 已进入 `engine_running` 且既没有结果也没有资源清理证明，则返回 `evidence_incomplete` 并诚实保留 accepted。读取命令不隐式 reconcile，也不自动重试 Program。
 
@@ -109,13 +115,15 @@ Coordinator 在接受 Run 时原子写入私有 execution journal，包括 Linux
 - Native Linux 与 macOS Managed VM 的 `filesystem get` 都支持文件、目录和 symlink。
 - `filesystem get` 从 Run Program 的 Final Environment 或指定 Image 读取普通文件、目录或 symlink。目标路径必须尚不存在；单文件从最新 Layer 向前解析，目录只合并目标子树。OCI hardlink 按其所在 Layer 的 filesystem 视图解析为普通文件内容，避免错误跟随后续 Layer 对 link target 的覆盖。
 - `filesystem changes --run` 只派生 Final Environment 相对 Initial Image 的变化路径。它按路径稳定排序并分页，区分 `added`、`modified`、`deleted`；Final Layer 的候选路径只触发一次 Initial Layer chain 扫描，opaque whiteout 用 `subtree: true` 的目录事实表示，不展开全部下层后代。
-- stdout/stderr 既作为协议事实保存在完整 Run record 中，也在 `run start` 期间作为实时观察事件输出；独立 stream 命令尚未因真实场景而引入。
-- `exec` 的 stdout/stderr 不持久化，只在最终 stdout JSON 与实时 stderr 观察流中返回；调用方丢失结果后没有按身份恢复的读取面。
+- stdout/stderr 既作为协议事实保存在完整 Run record 中，也在 `run start` 期间作为 Live Event 输出；独立 stream 命令尚未因真实场景而引入。
+- `exec` 的 stdout/stderr 不持久化，只在最终 stdout JSON 与 stderr Live Event 流中返回；调用方丢失结果后没有按身份恢复的读取面。
 - 不实现对未返回 Engine 调用的自动恢复或重试，也不在 Engine 已启动但缺少资源清理证据时推断 interrupted；显式 reconcile 只发布已经持久化的 Engine 结果，或有 journal 证据证明 Engine 从未启动的 interruption。不实现验证、评分、golden comparison 或实验编排。
 
 ## 当前验证
 
-本轮 Linux 完成门禁通过 `scripts/verify-linux.sh` 执行默认 all-target tests、Clippy（warnings denied）、all-target check、三个 package 文件清单与六个精确命名、串行运行的真实 runc 场景；独立进程 CLI 测试 17 passed，六个 NativeEngine 场景全部通过，场景耗时依次为 5.63、3.64、34.21、23.92、1.64、2.88 秒。
+Observation 与 Live Event 纵切的 Linux 完成门禁通过 `scripts/verify-linux.sh` 执行默认 all-target tests、Clippy（warnings denied）、all-target check、三个 package 文件清单、真实 proc-exit churn 和六个精确命名、串行运行的真实 runc 场景。最终完整重跑中，`run_engine` 82 passed、7 个需显式能力的测试 ignored，`run_protocol` 25 passed，`runlab` 35 passed，独立进程 Linux CLI 29 passed，docs CLI 3 passed；六个 NativeEngine 场景全部通过，场景耗时依次为 432.52、163.47、258.28、313.92、210.80、232.09 秒。门禁覆盖 Observation 无效输入不创建 State、提交→修正→公共 Query→Run 删除的完整闭环，以及 Live Event 的 CLI contract。为这次验证创建的精确 Guest staging 目录在完成后已删除，共回收 2.1 GiB；VM 仍为 ready/compatible，根盘 65 GiB 中可用 49 GiB，Rust 1.97.1 与 runc 1.5.1 基线保持可用。
+
+本轮第一次 Linux 编译暴露了 `tests/cli.rs` 中只在 Linux 编译的临时 JSON borrow 缺陷，随后两条独立进程断言又暴露了旧的 `accepted` 预期和已重命名的 deletion plan 字段，Clippy 还发现两个测试函数超过长度约束。这些失败不算作通过；修正产品与测试代码后，从头运行的上述完整门禁才作为最终证据。
 
 本轮 macOS 默认并行 all-target suite 曾两次在 `detached_run_returns_after_acceptance_while_the_worker_continues` 的 5 秒 wall-clock 断言处失败，分别观测到 8.54 秒和 8.97 秒；这些失败证据保留且不算作通过。该测试现改为用 worker release marker 直接断言“父进程先返回、worker 后完成”的顺序关系，不再把并行负载下的绝对耗时当成产品契约；修改后默认并行 suite 通过。
 
@@ -128,7 +136,7 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Rust 1.95 MSRV all-target check 已通过。独立进程 CLI 测试覆盖最小命令面、OCI Layout 导入、名称和 digest 查询、通过 Run 或 Image 读取文件系统路径、跨 Layer 目录合并、whiteout、opaque 目录、symlink、拒绝覆盖目标，以及错误请求不输出成功 JSON。
+Rust 1.95 MSRV all-target check 已通过。本机最终 `cargo fmt --check`、`cargo test --workspace --all-targets`、`cargo clippy --workspace --all-targets -- -D warnings` 与 `git diff --check` 也全部通过。独立进程 CLI 测试覆盖最小命令面、OCI Layout 导入、名称和 digest 查询、通过 Run 或 Image 读取文件系统路径、跨 Layer 目录合并、whiteout、opaque 目录、symlink、拒绝覆盖目标，以及错误请求不输出成功 JSON。
 
 `docs list/get` 已通过跨平台独立进程测试：root/help 可以发现该命令；无效的 `RUNLAB_STATE` 与 `RUNLAB_LIMACTL` 不影响本地文档读取；Markdown 与 JSON 返回相同正文；未知 topic 以非零状态、空 stdout 和 `docs list` 提示失败。registry 单元测试另外覆盖稳定名称与跨 checkout 的 CRLF 归一化。`cargo package --list` 已确认 Markdown source、registry、CLI adapter 和独立进程测试均进入 root package 文件集合。
 
@@ -142,9 +150,9 @@ Run Query Plane 已在真实 Managed VM State 上验证：Run `fae36f03-6c87-429
 
 pidfd socket 的 State 路径解耦已在 Linux 上单独验证：非特权回归测试通过短 procfd 地址在超过 108 bytes 的私有 runtime 路径中完成 bind、connect 和 unlink；独立进程 `runlab exec` 又以 111-byte State 路径和 197-byte 旧式完整 socket 路径预算运行真实 runc，Program 输出 `long-state-ok`、exit 0，调用后 invocation、cgroup 和 runc 进程残留均为零。一次用 Ubuntu `base` 运行完整 E2E 的 egress 超时结果已经判定无效：测试脚本硬编码了 Image 中不存在的 `/bin/busybox`，而且先等待 HTTP target、后检查 Program 结果，遮蔽了真实的 `runc create` 错误。E2E 现通过 `PATH` 解析并显式检查 `wget`，在 Engine 返回后终止 target 并优先断言 Program 事实，将 egress workload 限制在 10 秒内，只比较当前测试进程拥有的 cgroup，并由实际 Program stdout 触发 cancellation。修正后的完整 opt-in E2E 使用 digest-pinned Alpine 3.22 arm64 OCI fixture，在同一长 workspace 中通过全部 NativeEngine 场景，1 passed、65.96 秒；同一 Ubuntu `base` 也以独立 `runlab exec` egress 探针取得 HTTP 200、`probe-ok`、exit 0 和零残留。
 
-`exec` 中断也由前台 systemd unit 独立验证：在 Program 输出 `interrupt-started` 后向 Guest CLI MainPID 发送 SIGINT，最终 `cancelled: true`、`timed_out: false`，Program 在共享停止宽限期后以 signal 9 结束，观察流出现 `stopping` 而没有 `capturing`，调用后 workspace 为空。更早一次把 CLI 作为非交互 shell 后台 job 的探针没有触发取消；后台 job 的 SIGINT 处置改变了测量路径，因此该结果只证明探针无效，不用于评价 CLI 中断行为。
+`exec` 中断也由前台 systemd unit 独立验证：在 Program 输出 `interrupt-started` 后向 Guest CLI MainPID 发送 SIGINT，最终 `cancelled: true`、`timed_out: false`，Program 在共享停止宽限期后以 signal 9 结束，Live Event 流出现 `stopping` 而没有 `capturing`，调用后 workspace 为空。更早一次把 CLI 作为非交互 shell 后台 job 的探针没有触发取消；后台 job 的 SIGINT 处置改变了测量路径，因此该结果只证明探针无效，不用于评价 CLI 中断行为。
 
-真实 Linux CLI 纵切已通过 `runc 1.5.1`：导入 arm64 OCI Image，执行返回 exit 7 的 Run，保存独立 stdout/stderr 与 Final Image，通过 Final Image digest 提取 `/result/value` 的精确字节，并验证同 identity 重试返回 `created: false`。单独的长运行进程收到 SIGINT 后得到 terminal、`cancelled: true` 的 RunOutput，Engine workspace 无残留。实时观察纵切中，`run.stream`、`accepted`、`preparing` 在 0.107 秒到达，`executing` 在 0.242 秒到达，Program 首批 stdout/stderr 在 0.253 秒到达，Program 两秒后的第二段 stdout 在 2.251 秒到达，最终 stdout 摘要在 2.621 秒返回，证明事件没有等 Run 完成后批量输出。
+真实 Linux CLI 纵切已通过 `runc 1.5.1`：导入 arm64 OCI Image，执行返回 exit 7 的 Run，保存独立 stdout/stderr 与 Final Image，通过 Final Image digest 提取 `/result/value` 的精确字节，并验证同 identity 重试返回 `created: false`。单独的长运行进程收到 SIGINT 后得到 terminal、`cancelled: true` 的 RunOutput，Engine workspace 无残留。Live Event 纵切中，`run.stream`、`accepted`、`preparing` 在 0.107 秒到达，`executing` 在 0.242 秒到达，Program 首批 stdout/stderr 在 0.253 秒到达，Program 两秒后的第二段 stdout 在 2.251 秒到达，最终 stdout 摘要在 2.621 秒返回，证明事件没有等 Run 完成后批量输出。
 
 紧凑 `run start` 结果也已通过真实 Linux CLI 验证：确定性 Program 分别写入 `compact-stdout` 与 `compact-stderr` 后 exit 7，命令返回 663-byte 摘要，保留 process 与 Final Environment 且不包含两个 stream payload；随后 `run get` 从完整 Record 精确恢复两段字节。同 identity 重试只把 `created` 改为 `false`，其余摘要一致。
 

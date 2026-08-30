@@ -1,6 +1,6 @@
 # Start Here
 
-RunLab executes a standard OCI Image with an OCI Runtime Configuration, stdin, Secrets, and explicit Run controls. Use `exec` for a synchronous disposable observation. Use `run start` when the execution must become an immutable Run asset with a Final Environment.
+RunLab executes a standard OCI Image with an OCI Runtime Configuration, stdin, Secrets, and explicit Run controls. Use `exec` for a synchronous disposable inspection. Use `run start` when the execution must become an immutable Run asset with a Final Environment.
 
 ```text
 OCI Image + Runtime Configuration + stdin + Secrets + controls
@@ -57,7 +57,7 @@ Use `exec` to inspect an Image or command when no persistent identity or Final E
 runlab exec --image base --runtime-config config.json
 ```
 
-The complete bounded result is written to stdout. stderr is an NDJSON observation stream containing Run stages and Program stdout/stderr. `exec` has no ID and cannot be queried or resumed. Its side effects are real, so do not present a later persistent Run as the first attempt when the same evaluation task was already used with `exec`.
+The complete bounded result is written to stdout. stderr is an NDJSON Live Event stream containing Run stages and Program stdout/stderr. `exec` has no ID and cannot be queried or resumed. Its side effects are real, so do not present a later persistent Run as the first attempt when the same evaluation task was already used with `exec`.
 
 Add input and controls only when needed:
 
@@ -87,7 +87,7 @@ runlab run start \
   --label purpose=smoke
 ```
 
-By default the command waits for the Engine to return. stderr streams observations while stdout receives one bounded terminal summary. The Run is accepted before execution and remains queryable even when execution fails. Reusing the same ID is idempotent only for the same input and metadata.
+By default the command waits for the Engine to return. stderr streams Live Events while stdout receives one bounded terminal summary. The Run is accepted before execution and remains queryable even when execution fails. Reusing the same ID is idempotent only for the same input and metadata.
 
 For concurrent work, detach after acceptance and inspect the persistent Run later:
 
@@ -107,6 +107,8 @@ runlab query run \
 ```
 
 Discover Relation columns before querying with `runlab schema list` and `runlab schema get runs`. See `runlab docs get how-to/query-runs` for bounds and selection patterns.
+
+After a Run is terminal, an external Method may derive a typed, persistent Observation. Discover or register its immutable Type first; built-in and external Types use the same validation, storage, and generic JSON query path. See `runlab docs get how-to/observe-runs`. This is distinct from the ephemeral Live Event stream emitted while execution is active.
 
 ## Read the Final Environment
 

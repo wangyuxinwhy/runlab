@@ -5,8 +5,14 @@ edition = "2024"
 rust-version = "1.95"
 description = "Native Linux implementation of the Run Protocol"
 repository = "https://github.com/wangyuxinwhy/runlab"
+homepage = "https://wangyuxinwhy.github.io/runlab/"
+documentation = "https://docs.rs/run_engine"
 license = "MIT"
-publish = false
+readme = "README.md"
+keywords = ["agent", "oci", "runtime", "execution"]
+categories = ["development-tools"]
+include = ["/Cargo.toml", "/LICENSE", "/README.md", "/src/**"]
+publish = ["crates-io"]
 
 [dependencies]
 anyhow = "1.0.104"

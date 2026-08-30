@@ -15,7 +15,7 @@ use super::report::output_internal;
 use super::stdio::{InputTransfer, StreamDrain};
 use super::subprocess::{InvocationSupervisor, RunningHelper, SupervisorToken};
 use super::time::{checked_deadline, wall_clock_now};
-use crate::{EngineObserver, ProgramStream};
+use crate::{EngineEventSink, ProgramStream};
 
 pub(super) struct ProgramRun {
     pub(super) supervision: SupervisionState,
@@ -120,20 +120,20 @@ impl ProgramRun {
         }
     }
 
-    pub(super) fn observe_output(
+    pub(super) fn forward_output_events(
         &mut self,
         program_id: run_protocol::ProgramId,
-        observer: Arc<dyn EngineObserver>,
+        event_sink: Arc<dyn EngineEventSink>,
     ) {
         if let Some(stdout) = &mut self.io.stdout_drain {
-            stdout.observe(
+            stdout.forward_events(
                 program_id.clone(),
                 ProgramStream::Stdout,
-                Arc::clone(&observer),
+                Arc::clone(&event_sink),
             );
         }
         if let Some(stderr) = &mut self.io.stderr_drain {
-            stderr.observe(program_id, ProgramStream::Stderr, observer);
+            stderr.forward_events(program_id, ProgramStream::Stderr, event_sink);
         }
     }
 

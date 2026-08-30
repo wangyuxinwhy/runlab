@@ -42,6 +42,11 @@ fn docs_are_discoverable_without_state_or_managed_vm() {
                     "summary": "Discover and query bounded Run selection facts with read-only SQL."
                 },
                 {
+                    "name": "how-to/observe-runs",
+                    "title": "Observe Terminal Runs",
+                    "summary": "Submit, query, correct, and retract typed terminal Run Observations."
+                },
+                {
                     "name": "how-to/delete-runs",
                     "title": "Delete Terminal Runs",
                     "summary": "Select, preview, and permanently delete bounded terminal Run assets."
@@ -82,6 +87,12 @@ fn docs_get_returns_markdown_or_compact_json() {
     let query = text(&query.stdout);
     assert!(query.starts_with("# Query Runs\n"));
     assert!(query.contains("runlab schema get runs"));
+
+    let observation = run(&["docs", "get", "how-to/observe-runs"]);
+    assert_success(&observation);
+    let observation = text(&observation.stdout);
+    assert!(observation.starts_with("# Observe Terminal Runs\n"));
+    assert!(observation.contains("runlab/token_usage@v1"));
 }
 
 #[test]

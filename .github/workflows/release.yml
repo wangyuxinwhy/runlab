@@ -1,0 +1,227 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*.*.*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated vMAJOR.MINOR.PATCH tag to package
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Validate release version
+        id: version
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${REQUESTED_TAG:-${GITHUB_REF_NAME}}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "invalid release tag: $tag" >&2
+            exit 1
+          }
+          git rev-parse --verify "refs/tags/$tag^{commit}" >/dev/null
+          test "$(git cat-file -t "refs/tags/$tag")" = tag || {
+            echo "$tag must be an annotated tag" >&2
+            exit 1
+          }
+          version="${tag#v}"
+          manifest_version="$(git show "$tag:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n 1)"
+          test "$version" = "$manifest_version" || {
+            echo "tag $tag does not match Cargo.toml $manifest_version" >&2
+            exit 1
+          }
+          git show "$tag:CHANGELOG.md" | grep -F "## [$version]" >/dev/null || {
+            echo "CHANGELOG.md has no $version section" >&2
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  package-linux:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bundle_architecture: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundle_architecture: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package Linux release and Managed VM guest
+        run: |
+          binary="target/${{ matrix.target }}/release/runlab"
+          scripts/package-release.sh \
+            --binary "$binary" \
+            --target "${{ matrix.target }}" \
+            --output-root dist \
+            --version "${{ needs.validate.outputs.version }}"
+          mkdir -p guest
+          install -m 0755 "$binary" "guest/runlab-linux-${{ matrix.bundle_architecture }}"
+          scripts/assemble-release.sh \
+            --dist-root dist \
+            --version "${{ needs.validate.outputs.version }}" \
+            --require-target "${{ matrix.target }}"
+          scripts/test-installer.sh \
+            --dist-root dist \
+            --version "${{ needs.validate.outputs.version }}"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: guest-${{ matrix.bundle_architecture }}
+          path: guest/runlab-linux-${{ matrix.bundle_architecture }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/v${{ needs.validate.outputs.version }}/*.tar.gz
+            dist/v${{ needs.validate.outputs.version }}/*.tar.gz.sha256
+          if-no-files-found: error
+
+  package-macos:
+    needs: [validate, package-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundle_architecture: x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            bundle_architecture: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: guest-${{ matrix.bundle_architecture }}
+          path: guest
+      - name: Fetch pinned runc
+        run: scripts/fetch-runc.sh --architecture "${{ matrix.bundle_architecture }}" --output runc
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package and test macOS release
+        run: |
+          scripts/package-release.sh \
+            --binary "target/${{ matrix.target }}/release/runlab" \
+            --target "${{ matrix.target }}" \
+            --output-root dist \
+            --version "${{ needs.validate.outputs.version }}" \
+            --guest-binary "guest/runlab-linux-${{ matrix.bundle_architecture }}" \
+            --runc-binary "runc/runc-linux-${{ matrix.bundle_architecture }}" \
+            --runc-license runc/RUNC-LICENSE \
+            --runc-notice runc/RUNC-NOTICE
+          scripts/assemble-release.sh \
+            --dist-root dist \
+            --version "${{ needs.validate.outputs.version }}" \
+            --require-target "${{ matrix.target }}"
+          scripts/test-installer.sh \
+            --dist-root dist \
+            --version "${{ needs.validate.outputs.version }}"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/v${{ needs.validate.outputs.version }}/*.tar.gz
+            dist/v${{ needs.validate.outputs.version }}/*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [validate, package-linux, package-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist/v${{ needs.validate.outputs.version }}
+          merge-multiple: true
+      - name: Assemble and verify release
+        run: |
+          scripts/assemble-release.sh \
+            --dist-root dist \
+            --version "${{ needs.validate.outputs.version }}" \
+            --require-target x86_64-unknown-linux-gnu \
+            --require-target aarch64-unknown-linux-gnu \
+            --require-target x86_64-apple-darwin \
+            --require-target aarch64-apple-darwin
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/v${{ needs.validate.outputs.version }}/*.tar.gz
+      - name: Create or update Draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.validate.outputs.version }}"
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+          tag="${{ needs.validate.outputs.tag }}"
+          assets=(
+            dist/install.sh
+            dist/latest
+            dist/manifest.json
+            dist/SHA256SUMS
+            dist/v"$version"/*.tar.gz
+            dist/v"$version"/*.tar.gz.sha256
+          )
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "RunLab $tag" \
+              --notes-file release-notes.md
+            gh release upload "$tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "RunLab $tag" \
+              --notes-file release-notes.md \
+              "${assets[@]}"
+          fi

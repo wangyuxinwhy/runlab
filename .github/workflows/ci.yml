@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-linux:
+    name: Rust contract / Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install declared Rust toolchain
+        run: rustup show active-toolchain
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run all-target tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Check minimum supported Rust version
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          cargo +1.95.0 check --workspace --all-targets --locked
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Check rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --document-private-items --locked
+      - name: Verify normalized Cargo packages
+        run: scripts/verify-packages.sh
+
+  rust-macos:
+    name: Rust contract / macOS
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install declared Rust toolchain
+        run: rustup show active-toolchain
+      - name: Run all-target tests
+        run: cargo test --workspace --all-targets --locked
+
+  docs:
+    name: Public documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run docs:check

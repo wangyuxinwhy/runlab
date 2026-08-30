@@ -13,7 +13,7 @@ use crate::storage::{
     StoredRunDeletionFacts,
 };
 
-const PLAN_SCHEMA_VERSION: u32 = 1;
+const PLAN_SCHEMA_VERSION: u32 = 2;
 const PLAN_KIND: &str = "run_delete_plan";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,7 +65,7 @@ pub(crate) struct RunDeletePlan {
     operation_id: OperationId,
     requested_runs: usize,
     eligible: bool,
-    candidate_record_bytes: u64,
+    candidate_asset_bytes: u64,
     candidates: Vec<RunDeleteCandidate>,
     already_deleted: Vec<DeletedRun>,
     blocked: Vec<BlockedRun>,
@@ -77,8 +77,11 @@ struct RunDeleteCandidate {
     run_id: String,
     accepted_at: String,
     terminal_at: String,
-    record_fingerprint: String,
-    record_bytes: u64,
+    asset_fingerprint: String,
+    run_record_bytes: u64,
+    observation_count: u64,
+    observation_bytes: u64,
+    asset_bytes: u64,
     catalog_final_images: Vec<CatalogFinalImage>,
 }
 
@@ -137,7 +140,7 @@ pub(crate) fn check(
     let mut candidates = Vec::new();
     let mut already_deleted = Vec::new();
     let mut blocked = Vec::new();
-    let mut candidate_record_bytes = 0_u64;
+    let mut candidate_asset_bytes = 0_u64;
     for run_id in run_ids {
         if let Some(run) = facts.runs.get(run_id) {
             if run.terminal_at.is_none() || run.completion_json.is_none() {
@@ -148,9 +151,9 @@ pub(crate) fn check(
                 });
                 continue;
             }
-            let record_bytes = run.record_bytes();
-            candidate_record_bytes = candidate_record_bytes.saturating_add(record_bytes);
-            candidates.push(candidate(run, record_bytes, &catalog_names)?);
+            let asset_bytes = run.asset_bytes();
+            candidate_asset_bytes = candidate_asset_bytes.saturating_add(asset_bytes);
+            candidates.push(candidate(run, &catalog_names)?);
         } else if let Some(tombstone) = facts.tombstones.get(run_id) {
             already_deleted.push(tombstone.clone().into());
         } else {
@@ -167,7 +170,7 @@ pub(crate) fn check(
         operation_id,
         requested_runs: run_ids.len(),
         eligible: blocked.is_empty(),
-        candidate_record_bytes,
+        candidate_asset_bytes,
         candidates,
         already_deleted,
         blocked,
@@ -176,7 +179,6 @@ pub(crate) fn check(
 
 fn candidate(
     run: &StoredRunDeletionFacts,
-    record_bytes: u64,
     catalog_names: &BTreeMap<String, Vec<String>>,
 ) -> Result<RunDeleteCandidate> {
     let completion = decode_completion(
@@ -208,8 +210,11 @@ fn candidate(
             .terminal_at
             .clone()
             .context("terminal Run has no terminal_at")?,
-        record_fingerprint: run.record_fingerprint(),
-        record_bytes,
+        asset_fingerprint: run.asset_fingerprint(),
+        run_record_bytes: run.run_record_bytes(),
+        observation_count: run.observation_count,
+        observation_bytes: run.observation_bytes,
+        asset_bytes: run.asset_bytes(),
         catalog_final_images,
     })
 }
@@ -266,7 +271,14 @@ impl RunDeletePlan {
             }
             previous = Some(candidate.run_id.as_str());
             ids.insert(candidate.run_id.as_str());
-            bytes = bytes.saturating_add(candidate.record_bytes);
+            if candidate.asset_bytes
+                != candidate
+                    .run_record_bytes
+                    .saturating_add(candidate.observation_bytes)
+            {
+                bail!("Run deletion plan candidate byte counts are inconsistent");
+            }
+            bytes = bytes.saturating_add(candidate.asset_bytes);
         }
         for deleted in &self.already_deleted {
             crate::run::RunId::from_str(&deleted.run_id)
@@ -275,8 +287,8 @@ impl RunDeletePlan {
                 bail!("Run deletion plan repeats a Run identity");
             }
         }
-        if bytes != self.candidate_record_bytes {
-            bail!("Run deletion plan record byte total is inconsistent");
+        if bytes != self.candidate_asset_bytes {
+            bail!("Run deletion plan asset byte total is inconsistent");
         }
         Ok(())
     }
@@ -290,7 +302,7 @@ pub(crate) fn apply(database: &Database, plan: RunDeletePlan) -> Result<RunDelet
         .iter()
         .map(|candidate| PlannedRunDeletion {
             run_id: &candidate.run_id,
-            record_fingerprint: &candidate.record_fingerprint,
+            asset_fingerprint: &candidate.asset_fingerprint,
         })
         .collect::<Vec<_>>();
     let operation_id_text = operation_id.to_string();

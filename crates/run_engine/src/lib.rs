@@ -6,9 +6,9 @@
 mod cancellation;
 mod content;
 mod layer;
+mod live_event;
 #[cfg(target_os = "linux")]
 mod native;
-mod observer;
 #[cfg(target_os = "linux")]
 mod oci;
 #[cfg(target_os = "linux")]
@@ -18,9 +18,9 @@ mod timeouts;
 pub use cancellation::CancellationToken;
 pub use content::{ContentError, ContentErrorKind, OciContent, OciContentStore};
 pub use layer::{LayerDecodeError, decode_layer, supported_layer_media_types};
+pub use live_event::{EngineEventSink, EngineStage, ProgramStream};
 #[cfg(target_os = "linux")]
 pub use native::NativeEngine;
-pub use observer::{EngineObserver, EngineStage, ProgramStream};
 pub use timeouts::{
     MAX_OPERATION_TIMEOUT, OperationTimeoutError, OperationTimeouts, STOP_GRACE_PERIOD,
 };

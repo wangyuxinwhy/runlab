@@ -9,8 +9,10 @@ mod error;
 mod filesystem;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod image;
+mod live_event;
 mod managed_vm;
 mod metadata;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod observation;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod public_schema;
