@@ -29,3 +29,5 @@ The public command families are:
 | `storage` | Inspect State usage and explicitly check or apply safe pruning. |
 
 Read commands do not execute, synchronize, repair, reconcile, or mutate State. Commands that permanently delete Run assets or reclaim storage use explicit check/apply workflows.
+
+On macOS, `vm config get` returns the normalized complete share declaration. `vm config check --document FILE` validates it and reports derived Guest paths, warnings, required changes, and whether the stopped VM can accept it. `vm config apply --document FILE` replaces the declaration only while the VM is stopped. Each input share contains only `name` and a macOS directory `host_path`; the output derives `guest_path`, `type: "virtiofs"`, and `read_only: true`.

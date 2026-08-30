@@ -47,7 +47,7 @@ jq '.process.args = ["python", "-c", "print(\"ready\")"]' base.json >config.json
 
 RunLab does not invent a command DSL. Edit the standard JSON with `jq` or another JSON tool. Network is a Run control selected with `--network isolated|egress`; it is not written into `config.json`.
 
-On macOS, an explicit OCI bind mount source denotes a local Host file or directory. It must be absolute and contain the `ro` option. RunLab transfers it into the execution unit's private VM mount namespace without changing the Runtime Configuration bytes. Writable Host bind mounts are rejected because their writes cannot be faithfully reflected to macOS.
+On macOS, first declare read-only Host directories with `runlab vm config check/apply --document shares.json`. RunLab derives `/mnt/runlab-shares/<name>` inside the Guest. An OCI bind source must use that path or a child and contain `ro`; RunLab neither copies nor rewrites it. Share contents remain mutable external state, are not digested, and are not part of the Initial or Final Environment.
 
 ## Observe before preserving
 

@@ -53,11 +53,6 @@ pub(crate) struct ForwardExecution<'a> {
     pub(crate) network: &'a str,
 }
 
-struct ForwardedMount {
-    source: String,
-    destination: String,
-}
-
 impl From<Output> for ForwardedOutput {
     fn from(output: Output) -> Self {
         Self {
@@ -240,7 +235,20 @@ impl ManagedVm {
         self.ensure_ready()?;
         let mut staged = Vec::new();
         let arguments = (|| {
-            let mounts = self.stage_host_mounts(request.runtime_config, &mut staged)?;
+            if let Some(runtime_config) = request.runtime_config {
+                let shares = self.resolved_shares()?;
+                super::config::validate_runtime_mounts(runtime_config, &shares).map_err(
+                    |error| {
+                        crate::error::classify(
+                            error,
+                            crate::error::ErrorFacts::before_run(
+                                crate::error::ErrorCategory::InvalidInput,
+                                "mount_resolution",
+                            ),
+                        )
+                    },
+                )?;
+            }
             let runtime_config = request
                 .runtime_config
                 .map(|path| self.stage_input(path, "runtime-config"))
@@ -314,9 +322,9 @@ impl ManagedVm {
                     timeout.get().to_string().into(),
                 ]);
             }
-            Ok((command_arguments, mounts))
+            Ok(command_arguments)
         })();
-        let (arguments, mounts) = match arguments {
+        let arguments = match arguments {
             Ok(arguments) => arguments,
             Err(error) => {
                 self.cleanup_staged(&staged.iter().collect::<Vec<_>>());
@@ -324,7 +332,7 @@ impl ManagedVm {
             }
         };
         let references = staged.iter().collect::<Vec<_>>();
-        let output = self.systemd_state_command_streaming(arguments, &references, &mounts);
+        let output = self.systemd_state_command_streaming(arguments, &references);
         self.cleanup_staged(&references);
         output
     }
@@ -611,16 +619,13 @@ impl ManagedVm {
         &self,
         arguments: Vec<OsString>,
         cleanup: &[&String],
-        mounts: &[ForwardedMount],
     ) -> Result<ForwardedOutput> {
         self.ensure_ready()?;
         let unit = format!("runlab-execution-{}", Uuid::new_v4());
         let forwarding = GuestSignalForwarding::install(&self.limactl, &unit)?;
         let mut command = Command::new(&self.limactl);
         command.args(["shell", "--tty=false", INSTANCE, "--"]);
-        command.args(Self::systemd_state_arguments(
-            arguments, cleanup, mounts, &unit,
-        ));
+        command.args(Self::systemd_state_arguments(arguments, cleanup, &unit));
         command.process_group(0);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match command.spawn() {
@@ -679,7 +684,6 @@ impl ManagedVm {
     fn systemd_state_arguments(
         arguments: Vec<OsString>,
         cleanup: &[&String],
-        mounts: &[ForwardedMount],
         unit: &str,
     ) -> Vec<OsString> {
         let mut command = vec![
@@ -703,15 +707,6 @@ impl ManagedVm {
                         .map(|path| path.as_str())
                         .collect::<Vec<_>>()
                         .join(" ")
-                )),
-            ]);
-        }
-        for mount in mounts {
-            command.extend([
-                OsString::from("--property"),
-                OsString::from(format!(
-                    "BindReadOnlyPaths={}:{}",
-                    mount.source, mount.destination
                 )),
             ]);
         }
@@ -744,93 +739,6 @@ impl ManagedVm {
             return Err(error);
         }
         Ok(remote)
-    }
-
-    fn stage_host_mount(&self, source: &Path) -> Result<(ForwardedMount, Vec<String>)> {
-        let destination = source
-            .to_str()
-            .context("host mount source path is not valid UTF-8")?
-            .to_owned();
-        if source.is_file() {
-            let remote = self.stage_input(source, "mount")?;
-            return Ok((
-                ForwardedMount {
-                    source: remote.clone(),
-                    destination,
-                },
-                vec![remote],
-            ));
-        }
-        ensure!(
-            source.is_dir(),
-            "host mount source is not a regular file or directory: {}",
-            source.display()
-        );
-        let archive =
-            tempfile::NamedTempFile::new().context("failed to stage host mount directory")?;
-        let mut builder = tar::Builder::new(archive.reopen()?);
-        builder
-            .append_dir_all(".", source)
-            .with_context(|| format!("failed to archive host mount {}", source.display()))?;
-        builder.finish()?;
-        drop(builder);
-        let remote_archive = self.stage_input(archive.path(), "mount-archive")?;
-        let remote_root = format!("/var/tmp/runlab-mount-{}", Uuid::new_v4());
-        let setup = (|| {
-            self.guest_success([
-                "/usr/bin/sudo",
-                "/usr/bin/install",
-                "-d",
-                "-m",
-                "0700",
-                &remote_root,
-            ])?;
-            self.guest_success([
-                "/usr/bin/sudo",
-                "/usr/bin/tar",
-                "-xf",
-                &remote_archive,
-                "-C",
-                &remote_root,
-            ])
-        })();
-        if let Err(error) = setup {
-            self.cleanup_staged(&[&remote_archive, &remote_root]);
-            return Err(error);
-        }
-        Ok((
-            ForwardedMount {
-                source: remote_root.clone(),
-                destination,
-            },
-            vec![remote_archive, remote_root],
-        ))
-    }
-
-    fn stage_host_mounts(
-        &self,
-        runtime_config: Option<&Path>,
-        staged: &mut Vec<String>,
-    ) -> Result<Vec<ForwardedMount>> {
-        let sources = runtime_config
-            .map(host_mount_sources)
-            .transpose()
-            .map_err(|error| {
-                crate::error::classify(
-                    error,
-                    crate::error::ErrorFacts::before_run(
-                        crate::error::ErrorCategory::InvalidInput,
-                        "mount_staging",
-                    ),
-                )
-            })?;
-        let mut mounts = Vec::new();
-        for source in sources.into_iter().flatten() {
-            let (mount, cleanup) = self.stage_host_mount(&source)?;
-            staged.extend(cleanup);
-            mounts.push(mount);
-        }
-        Ok(mounts)
     }
 
     fn cleanup_inputs(&self, paths: &[&String]) {
@@ -976,57 +884,16 @@ fn new_output_path(output: &Path) -> Result<PathBuf> {
     }
 }
 
-fn host_mount_sources(runtime_config: &Path) -> Result<Vec<PathBuf>> {
-    let bytes = fs::read(runtime_config).with_context(|| {
-        format!(
-            "failed to read Runtime Configuration {}",
-            runtime_config.display()
-        )
-    })?;
-    let value: Value =
-        serde_json::from_slice(&bytes).context("Runtime Configuration is not valid JSON")?;
-    let Some(mounts) = value.get("mounts").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
-    let mut sources = BTreeSet::new();
-    for mount in mounts {
-        if mount.get("type").and_then(Value::as_str) != Some("bind")
-            || is_managed_resolver_mount(mount)
-        {
-            continue;
-        }
-        let source = mount
-            .get("source")
-            .and_then(Value::as_str)
-            .context("OCI bind mount source must be a string")?;
-        let path = PathBuf::from(source);
-        ensure!(
-            path.is_absolute(),
-            "macOS host bind mount source must be absolute: {source}"
-        );
-        ensure!(
-            !source.contains([':', '\n', '\r']),
-            "macOS host bind mount source contains an unsupported character: {source}"
-        );
-        let read_only = mount
-            .get("options")
-            .and_then(Value::as_array)
-            .is_some_and(|options| options.iter().any(|value| value.as_str() == Some("ro")));
-        ensure!(
-            read_only,
-            "macOS Managed VM supports only read-only host bind mounts: {source}"
-        );
-        ensure!(
-            path.is_file() || path.is_dir(),
-            "macOS host bind mount source does not exist or is unsupported: {source}"
-        );
-        sources.insert(path);
-    }
-    Ok(sources.into_iter().collect())
-}
-
-fn is_managed_resolver_mount(mount: &Value) -> bool {
-    mount.get("destination").and_then(Value::as_str) == Some("/etc/resolv.conf")
+pub(super) fn is_managed_resolver_mount(mount: &Value) -> bool {
+    let read_only = mount
+        .get("options")
+        .and_then(Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|value| value.as_str() == Some("ro"))
+                && !options.iter().any(|value| value.as_str() == Some("rw"))
+        });
+    read_only
+        && mount.get("destination").and_then(Value::as_str) == Some("/etc/resolv.conf")
         && matches!(
             mount.get("source").and_then(Value::as_str),
             Some(

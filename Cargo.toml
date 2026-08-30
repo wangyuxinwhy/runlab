@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "runlab"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Execute OCI Images and preserve immutable Agent Run Records"
@@ -40,8 +40,8 @@ clap = { version = "4.6.6", features = ["derive"] }
 flate2 = "1.1.9"
 jsonschema = { version = "0.52.0", default-features = false }
 oci-spec = { version = "0.10.0", default-features = false, features = ["image"] }
-run_engine = { version = "0.1.1", path = "crates/run_engine" }
-run_protocol = { version = "0.1.1", path = "crates/run_protocol" }
+run_engine = { version = "0.2.0", path = "crates/run_engine" }
+run_protocol = { version = "0.2.0", path = "crates/run_protocol" }
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 rustix = { version = "1.1.4", default-features = false, features = ["std", "fs"] }
 serde = { version = "1.0.229", features = ["derive"] }

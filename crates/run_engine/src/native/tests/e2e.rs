@@ -303,15 +303,15 @@ fn exercise_concurrent_egress(
             program.stdout().facts().expect("concurrent stdout").bytes(),
             b"concurrent"
         );
-        assert_eq!(
-            program.errors().count(),
-            0,
-            "concurrent egress polluted Program output"
+        let program_errors = program.errors().collect::<Vec<_>>();
+        assert!(
+            program_errors.is_empty(),
+            "concurrent egress polluted Program output: {program_errors:?}"
         );
-        assert_eq!(
-            output.execution().errors().count(),
-            0,
-            "concurrent egress polluted execution output"
+        let execution_errors = output.execution().errors().collect::<Vec<_>>();
+        assert!(
+            execution_errors.is_empty(),
+            "concurrent egress polluted execution output: {execution_errors:?}"
         );
     }
     assert_eq!(

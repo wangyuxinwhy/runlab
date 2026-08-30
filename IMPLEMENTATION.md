@@ -65,7 +65,9 @@ storage prune check|apply
 
 此外，`docs list/get` 在打开 State 或连接 Managed VM 之前本地执行。`start-here` 与四个 `how-to/*` topic 由普通 Markdown source、编译期 `include_str!` registry 和薄 CLI adapter 组成；Root Help 明确指向完整首次工作流，`list` 返回带 `schema_version` 的紧凑 JSON，`get` 默认返回 Markdown并支持 `--output json`。当前没有引入 `docs search`。
 
-macOS 另外提供 `vm create/start/install/stop/status`。它们只管理固定名为 `runlab` 的 Lima 2.2.0/VZ 实例，要求宿主架构匹配、plain mode、零 host mounts 和 digest-pinned Ubuntu Image。`vm status` 不改变 VM；其他操作均可安全重试。
+macOS 另外提供 `vm create/start/install/stop/status` 和 `vm config get/check/apply`。它们只管理固定名为 `runlab` 的 Lima 2.2.0/VZ 实例，要求宿主架构匹配、digest-pinned Ubuntu Image，以及显式 pin 的非 plain profile：VirtioFS、禁用 containerd、空额外网络和端口转发、禁用 proxy environment propagation。`vm status` 与 config get/check 不改变 VM；config apply 只在 VM 已停止时完整替换 share 声明，不替调用方 stop/start。
+
+旧 plain-mode 实例通过显式 `vm stop` 后应用完整 share document 原位迁移，不删除 VM disk。真实 Lima 2.2.0/VZ 验证已覆盖 plain→non-plain、空声明、一个工作区 share、Guest `findmnt` 的只读 VirtioFS 事实、容器读取与 EROFS、恢复空声明及 Guest/Runtime readiness；`/var/lib/runlab` 和 Rust baseline 在迁移后保持可用。
 
 `vm install` 从 macOS 可执行文件旁读取 `runlab-linux-<arch>` 与 `runc-linux-<arch>`，传输后复验 size 和 SHA-256，再以原子 rename 安装。开发构建可用 `RUNLAB_GUEST_BINARY` 与 `RUNLAB_GUEST_RUNC` 覆盖 bundle 路径。Guest 握手必须与 Host 的 RunLab version、transport version、Linux OS 和 architecture 完全一致。reference profile 当前固定 runc 1.5.1、`ip`、`iptables`、`ip6tables`、`nsenter`、cgroup v2、OverlayFS 与 IPv4 forwarding。
 
@@ -73,7 +75,7 @@ macOS 上所有 State 命令都在固定 Guest State `/var/lib/runlab` 执行，
 
 `filesystem get` 在 Guest 物化请求节点后，将文件、目录或 symlink 封装成只含一个 `payload` 的临时 archive。Host 校验 archive identity、路径边界、节点类型以及普通文件的 digest/size，再以 no-replace rename 发布到请求的 macOS 路径；返回 JSON 中只出现该路径，不泄露 Guest staging path。
 
-macOS Runtime Configuration 中除 RunLab 固定 resolver scaffold 外的 bind source 被解释为 macOS Host 路径。只读普通文件和目录按校验过的 bytes/archive 暂存到 VM，并通过 transient systemd unit 的 `BindReadOnlyPaths` 映射到配置中未修改的绝对路径；每次执行拥有私有 mount namespace，结束时同时清理 staging。这样 Guest 接受、Engine 执行和 Run Record 保存的仍是调用方原始 Runtime Configuration。未含 `ro` 的 Host bind mount 在接受 Run 前拒绝，避免产生不会同步回 Host 的伪 writable mount。
+VM share 配置输入只包含稳定 `name` 与已解析的 macOS 绝对目录 `host_path`；RunLab 派生只读 VirtioFS Guest 路径 `/mnt/runlab-shares/<name>`。Lima effective mounts、声明 fingerprint 与 profile 必须逐项匹配；effective `host_path` 还必须继续解析为同一个现存 canonical directory。手工增加、改名、换路径或改成 writable 都会使 `vm status` 报 incompatible。macOS Runtime Configuration 中除固定 resolver scaffold 外的 bind source 必须位于已声明 Guest share 子树并包含 `ro`；其他 source 在接受前以 `mount_resolution` 拒绝。传输层不再猜测 macOS 命名空间，不 tar/copy/extract bind source，也不改写 Runtime Configuration。Share 内容是未计算 digest 的外部可变状态，不进入 Initial/Final Environment；case-insensitive Host volume 会由 config check/apply 报告语义告警。
 
 CLI 失败统一写入 schema version 1 的 `runlab.error` JSON。已知输入错误、资源不存在、身份冲突、Managed VM 不可用与内部错误分别使用稳定 category；`accepted` 和 `run_created` 在无法证明时为 `null`。Guest 的结构化错误由 macOS transport 识别并保持字段不变；streaming 调用已经转发的错误不会在 Host 再输出一次。
 

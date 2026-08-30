@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+pub(crate) mod config;
 mod guest;
 #[cfg(target_os = "macos")]
 mod host;

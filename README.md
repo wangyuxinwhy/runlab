@@ -9,7 +9,7 @@ RunLab executes programs from OCI Images. `run start` preserves an execution as 
 On macOS, use the GitHub Release installer because the complete bundle includes the same-version Linux RunLab binary and `runc` required by the Managed VM. On Linux, the installer provides a prebuilt RunLab binary and its private, pinned `runlab-runc`; it does not replace the system `runc`. Rust users can also install from crates.io with Rust 1.95 or newer:
 
 ```bash
-cargo install runlab --version 0.1.1 --locked
+cargo install runlab --version 0.2.0 --locked
 ```
 
 See the [installation guide](https://wangyuxinwhy.github.io/runlab/how-to/install) for the verified installer, platform prerequisites, and Managed VM setup.
@@ -74,15 +74,20 @@ runlab vm start
 runlab vm install
 runlab vm stop
 runlab vm status
+runlab vm config get
+runlab vm config check --document shares.json
+runlab vm config apply --document shares.json
 ```
 
-`vm status` is read-only and reports configured capacity plus Guest-used and available bytes. The other lifecycle commands are idempotent and never expose a general VM shell or command executor. `vm install` verifies and atomically installs the bundled, architecture-matched Linux `runlab` and `runc`, then checks the minimal NativeEngine reference profile. Release bundles place these files beside the macOS executable as `runlab-linux-<arch>` and `runc-linux-<arch>`; development builds can select them with `RUNLAB_GUEST_BINARY` and `RUNLAB_GUEST_RUNC`.
+`vm status` and `vm config get/check` are read-only. `vm config apply` replaces the complete share declaration and only operates while the VM is stopped; it never stops or starts the VM. The other lifecycle commands are idempotent and never expose a general VM shell or command executor. `vm install` verifies and atomically installs the bundled, architecture-matched Linux `runlab` and `runc`, then checks the minimal NativeEngine reference profile. Release bundles place these files beside the macOS executable as `runlab-linux-<arch>` and `runc-linux-<arch>`; development builds can select them with `RUNLAB_GUEST_BINARY` and `RUNLAB_GUEST_RUNC`.
+
+An existing plain-mode VM is migrated explicitly: confirm that no Run is active, run `runlab vm stop`, then apply a complete document (use `{"schema_version":1,"shares":[]}` when no shares are wanted) before `runlab vm start`. The migration preserves the VM disk and `/var/lib/runlab`. `vm status` verifies both the effective Lima declaration and, while running, that every declared Guest path is an actual read-only VirtioFS mount.
 
 On macOS, the ordinary `exec`, `image`, `run`, `filesystem`, `schema`, and `query` commands execute the same-version Linux `runlab` inside the ready VM. State remains fixed at `/var/lib/runlab`; macOS rejects `--state` and `RUNLAB_STATE` rather than treating a host path as a guest path.
 
 Input files cross the VM boundary as explicit bytes and are checked by size and SHA-256 before use. `run start` is owned by a transient systemd service, so an unexpected macOS control-connection loss does not cancel the Run; reconnect with `run get RUN_ID` or explicitly request cancellation with `run cancel RUN_ID`. A foreground `SIGINT` or `SIGTERM` is forwarded to the exact Guest invocation and RunLab waits for its bounded termination result. `filesystem get` transfers a file, directory, or symlink through one checked archive and publishes it to a new macOS path without overwriting an existing node.
 
-An explicit macOS Runtime Configuration can bind-mount a local regular file or directory when the mount contains the OCI `ro` option. RunLab stages the source into the VM and maps it back to the unchanged absolute source path inside the execution unit's private mount namespace, so the exact caller JSON remains the Run Protocol input and persisted Run fact. Writable Host bind mounts are rejected before acceptance because silently discarding their writes would violate OCI bind-mount semantics.
+A macOS VM share document contains only `schema_version: 1` and an array of `{name, host_path}` entries. `host_path` must resolve to a unique macOS directory. RunLab derives the read-only VirtioFS Guest path `/mnt/runlab-shares/<name>`; OCI Runtime Configuration bind sources must use that Guest path or a child and must contain `ro`. Other bind sources are rejected before acceptance. RunLab does not tar, copy, rewrite, version, or digest share contents. A case-insensitive Host filesystem produces an explicit warning, and the same Runtime Configuration is not portable to native Linux unless that path exists there.
 
 Command failures write one JSON object to stderr with `kind: "runlab.error"`, a stable category and stage, optional Run identity, explicit acceptance and creation facts when known, retryability, and an optional recovery command. A `null` acceptance fact means RunLab could not prove the state, not `false`. Program stdout/stderr Live Events are not converted into command errors.
 

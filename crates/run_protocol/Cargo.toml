@@ -1,6 +1,6 @@
 [package]
 name = "run_protocol"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Data model and invariants for the Run Protocol"
