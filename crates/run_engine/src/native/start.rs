@@ -27,15 +27,15 @@ use super::subprocess::{
     terminate_child,
 };
 use super::time::{POLL_INTERVAL, checked_deadline, execution_expired, wall_clock_now};
-use crate::{CancellationToken, EngineObserver, OperationTimeouts};
+use crate::{CancellationToken, EngineEventSink, OperationTimeouts};
 
 pub(super) struct ProgramStarter<'a> {
     supervisor: &'a InvocationSupervisor,
     runc: &'a Path,
     runtime_root: &'a Path,
     timeouts: OperationTimeouts,
-    observer: Arc<dyn EngineObserver>,
-    execution_observed: Cell<bool>,
+    event_sink: Arc<dyn EngineEventSink>,
+    execution_event_sent: Cell<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -65,15 +65,15 @@ impl<'a> ProgramStarter<'a> {
         runc: &'a Path,
         runtime_root: &'a Path,
         timeouts: OperationTimeouts,
-        observer: Arc<dyn EngineObserver>,
+        event_sink: Arc<dyn EngineEventSink>,
     ) -> Self {
         Self {
             supervisor,
             runc,
             runtime_root,
             timeouts,
-            observer,
-            execution_observed: Cell::new(false),
+            event_sink,
+            execution_event_sent: Cell::new(false),
         }
     }
 }
@@ -94,7 +94,7 @@ impl ProgramStarter<'_> {
         }
         match self.create(prepared, input, control, other_runs) {
             CreateOutcome::Ready(mut run) => {
-                run.observe_output(program_id.clone(), Arc::clone(&self.observer));
+                run.forward_output_events(program_id.clone(), Arc::clone(&self.event_sink));
                 self.start_created(prepared, control, other_runs, run)
             }
             CreateOutcome::Finished(run) => run,
@@ -190,8 +190,8 @@ impl ProgramStarter<'_> {
         let start_wall = wall_clock_now();
         let start_monotonic = Instant::now();
         run.runtime.execution_entry = Some((start_wall, start_monotonic));
-        if !self.execution_observed.replace(true) {
-            self.observer.stage(crate::EngineStage::Executing);
+        if !self.execution_event_sent.replace(true) {
+            self.event_sink.stage(crate::EngineStage::Executing);
         }
         let (start_deadline, deadline_message) =
             start_deadline(start_monotonic, execution_start, execution_limit, timeouts);

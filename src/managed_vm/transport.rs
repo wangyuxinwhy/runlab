@@ -333,6 +333,54 @@ impl ManagedVm {
         self.state_command(["run", "get", id]).map(Into::into)
     }
 
+    pub(crate) fn forward_observation_document(
+        &self,
+        command: &[&str],
+        document: &[u8],
+    ) -> Result<ForwardedOutput> {
+        ensure!(
+            matches!(command, ["submit" | "retract"] | ["type", "register"]),
+            "unsupported Observation document command"
+        );
+        let mut input =
+            tempfile::NamedTempFile::new().context("failed to stage Observation document")?;
+        input.write_all(document)?;
+        input.flush()?;
+        let staged = self.stage_input(input.path(), "observation")?;
+        let mut arguments = vec![OsString::from("observation")];
+        arguments.extend(command.iter().map(OsString::from));
+        arguments.extend([OsString::from("--document"), OsString::from(&staged)]);
+        let output = self.state_command(arguments);
+        self.cleanup_inputs(&[&staged]);
+        output.map(Into::into)
+    }
+
+    pub(crate) fn forward_observation_type_get(
+        &self,
+        observation_type: &str,
+    ) -> Result<ForwardedOutput> {
+        self.state_command(["observation", "type", "get", observation_type])
+            .map(Into::into)
+    }
+
+    pub(crate) fn forward_observation_type_list(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<ForwardedOutput> {
+        let mut arguments: Vec<OsString> = vec![
+            "observation".into(),
+            "type".into(),
+            "list".into(),
+            "--limit".into(),
+            limit.to_string().into(),
+        ];
+        if let Some(after) = after {
+            arguments.extend(["--after".into(), after.into()]);
+        }
+        self.state_command(arguments).map(Into::into)
+    }
+
     pub(crate) fn forward_run_delete_check(
         &self,
         operation_id: &str,

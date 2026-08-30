@@ -5,8 +5,14 @@ edition = "2024"
 rust-version = "1.95"
 description = "Data model and invariants for the Run Protocol"
 repository = "https://github.com/wangyuxinwhy/runlab"
+homepage = "https://wangyuxinwhy.github.io/runlab/"
+documentation = "https://docs.rs/run_protocol"
 license = "MIT"
-publish = false
+readme = "README.md"
+keywords = ["agent", "oci", "protocol", "execution"]
+categories = ["development-tools"]
+include = ["/Cargo.toml", "/LICENSE", "/README.md", "/src/**"]
+publish = ["crates-io"]
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }

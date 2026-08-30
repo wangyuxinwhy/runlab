@@ -19,6 +19,7 @@ fn help_exposes_the_managed_vm_product_surface() {
         "exec",
         "filesystem",
         "image",
+        "observation",
         "run",
         "schema",
         "query",
@@ -39,7 +40,7 @@ fn help_exposes_the_managed_vm_product_surface() {
     assert!(stdout.contains("--description"));
     assert!(stdout.contains("--label <KEY=VALUE>"));
     assert!(stdout.contains("are not execution facts"));
-    assert!(stdout.contains("streams NDJSON observations"));
+    assert!(stdout.contains("NDJSON Live Event stream"));
     assert!(stdout.contains("must be read-only regular files or directories"));
     assert!(stdout.contains("--detach"));
     assert!(!stdout.contains("--detached-worker"));
@@ -205,6 +206,97 @@ fn run_deletion_inputs_are_validated_and_staged_to_the_guest() {
         "run delete check --operation-id {operation_id} --ids /var/tmp/runlab-run-delete-ids-"
     )));
     assert!(calls.contains("run delete apply --plan /var/tmp/runlab-run-delete-plan-"));
+}
+
+#[test]
+fn observation_document_is_validated_locally_and_staged_to_the_guest() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (limactl, log) = fake_limactl(temporary.path());
+    let document = temporary.path().join("observation.json");
+    fs::write(
+        &document,
+        r#"{
+          "schema_version":1,
+          "observation_id":"550e8400-e29b-41d4-a716-446655440101",
+          "run_id":"550e8400-e29b-41d4-a716-446655440100",
+          "type":"runlab/token_usage@v1",
+          "method":{"name":"example/token-counter","version":"1.0.0"},
+          "payload":{
+            "coverage":"complete",
+            "input_tokens":12000,
+            "cached_input_tokens":8000,
+            "cache_write_input_tokens":null,
+            "output_tokens":3400,
+            "reasoning_output_tokens":900
+          }
+        }"#,
+    )
+    .expect("Observation document");
+    let output = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .args(["observation", "submit", "--document", path(&document)])
+        .output()
+        .expect("runlab process");
+    assert_success(&output);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).expect("submission")["created"],
+        true
+    );
+    let calls = fs::read_to_string(log).expect("fake limactl log");
+    assert!(calls.contains("observation submit --document /var/tmp/runlab-observation-"));
+}
+
+#[test]
+fn observation_type_registry_commands_are_forwarded_to_the_guest() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (limactl, log) = fake_limactl(temporary.path());
+    let definition = temporary.path().join("observation-type.json");
+    fs::write(
+        &definition,
+        r#"{
+          "schema_version":1,
+          "type":"example/score@v1",
+          "title":"Score",
+          "description":"A fixture score.",
+          "payload_schema":{
+            "$schema":"https://json-schema.org/draft/2020-12/schema",
+            "type":"number"
+          }
+        }"#,
+    )
+    .expect("Observation Type document");
+    for arguments in [
+        vec![
+            "observation",
+            "type",
+            "register",
+            "--document",
+            path(&definition),
+        ],
+        vec!["observation", "type", "get", "example/score@v1"],
+        vec![
+            "observation",
+            "type",
+            "list",
+            "--limit",
+            "7",
+            "--after",
+            "example/old@v1",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_runlab"))
+            .env("RUNLAB_LIMACTL", &limactl)
+            .env("RUNLAB_FAKE_LOG", &log)
+            .args(arguments)
+            .output()
+            .expect("runlab process");
+        assert_success(&output);
+    }
+    let calls = fs::read_to_string(log).expect("fake limactl log");
+    assert!(calls.contains("observation type register --document /var/tmp/runlab-observation-"));
+    assert!(calls.contains("observation type get example/score@v1"));
+    assert!(calls.contains("observation type list --limit 7 --after example/old@v1"));
 }
 
 #[test]
@@ -432,7 +524,7 @@ fn read_only_host_mounts_use_the_execution_mount_namespace() {
 }
 
 #[test]
-fn run_start_forwards_guest_observations_before_completion() {
+fn run_start_forwards_guest_live_events_before_completion() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let (limactl, log) = fake_limactl(temporary.path());
     let started = Instant::now();
@@ -457,7 +549,7 @@ fn run_start_forwards_guest_observations_before_completion() {
         .expect("runlab process");
     let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
     let mut first = String::new();
-    stderr.read_line(&mut first).expect("first observation");
+    stderr.read_line(&mut first).expect("first Live Event");
     let first_elapsed = started.elapsed();
     assert_eq!(
         serde_json::from_str::<Value>(&first).expect("first event")["kind"],
@@ -473,7 +565,7 @@ fn run_start_forwards_guest_observations_before_completion() {
     assert!(completed_elapsed >= Duration::from_millis(900));
     assert!(
         completed_elapsed.saturating_sub(first_elapsed) >= Duration::from_millis(750),
-        "first observation arrived at {first_elapsed:?}, completion at {completed_elapsed:?}"
+        "first Live Event arrived at {first_elapsed:?}, completion at {completed_elapsed:?}"
     );
     assert_eq!(
         serde_json::from_str::<Value>(remaining.trim()).expect("Program event")["kind"],
@@ -531,7 +623,7 @@ fn detached_run_returns_after_acceptance_while_the_worker_continues() {
 }
 
 #[test]
-fn exec_forwards_an_unidentified_observation_stream_without_persistent_arguments() {
+fn exec_forwards_an_unidentified_live_event_stream_without_persistent_arguments() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let (limactl, log) = fake_limactl(temporary.path());
     let output = Command::new(env!("CARGO_BIN_EXE_runlab"))
@@ -544,7 +636,7 @@ fn exec_forwards_an_unidentified_observation_stream_without_persistent_arguments
 
     let events = text(&output.stderr)
         .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("observation event"))
+        .map(|line| serde_json::from_str::<Value>(line).expect("Live Event"))
         .collect::<Vec<_>>();
     assert_eq!(events[0]["kind"], "run.stream");
     assert!(events[0]["run_id"].is_null());
@@ -578,7 +670,7 @@ fn foreground_signal_cancels_the_exact_managed_vm_execution() {
         .expect("runlab process");
     let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
     let mut header = String::new();
-    stderr.read_line(&mut header).expect("observation header");
+    stderr.read_line(&mut header).expect("Live Event header");
     assert_eq!(
         serde_json::from_str::<Value>(&header).expect("header")["kind"],
         "run.stream"
@@ -592,7 +684,7 @@ fn foreground_signal_cancels_the_exact_managed_vm_execution() {
     let mut remaining = String::new();
     stderr
         .read_to_string(&mut remaining)
-        .expect("remaining observations");
+        .expect("remaining Live Events");
     let output = child.wait_with_output().expect("runlab completion");
     assert_success(&output);
     assert_eq!(
@@ -739,10 +831,22 @@ case "$*" in
     ;;
   *"run cancel 550e8400-e29b-41d4-a716-446655440000"*) printf '%s\n' '{{"schema_version":1,"run_id":"550e8400-e29b-41d4-a716-446655440000","lifecycle":"accepted","cancellation_requested":true,"cancellation_requested_at":"2026-08-28T00:00:00Z","terminal_at":null}}' ;;
   *"run delete check --operation-id 550e8400-e29b-41d4-a716-446655440092 --ids /var/tmp/runlab-run-delete-ids-"*)
-    printf '%s\n' '{{"schema_version":1,"kind":"run_delete_plan","operation_id":"550e8400-e29b-41d4-a716-446655440092","requested_runs":1,"eligible":true,"candidate_record_bytes":0,"candidates":[],"already_deleted":[{{"run_id":"550e8400-e29b-41d4-a716-446655440091","deleted_at":"2026-08-29T00:00:00Z","operation_id":"550e8400-e29b-41d4-a716-446655440090"}}],"blocked":[]}}'
+    printf '%s\n' '{{"schema_version":2,"kind":"run_delete_plan","operation_id":"550e8400-e29b-41d4-a716-446655440092","requested_runs":1,"eligible":true,"candidate_asset_bytes":0,"candidates":[],"already_deleted":[{{"run_id":"550e8400-e29b-41d4-a716-446655440091","deleted_at":"2026-08-29T00:00:00Z","operation_id":"550e8400-e29b-41d4-a716-446655440090"}}],"blocked":[]}}'
     ;;
   *"run delete apply --plan /var/tmp/runlab-run-delete-plan-"*)
     printf '%s\n' '{{"schema_version":1,"mode":"no_change","operation_id":"550e8400-e29b-41d4-a716-446655440092","deleted_at":null,"deleted_runs":[],"already_deleted":[],"recovery":"runlab storage prune check"}}'
+    ;;
+  *"observation submit --document /var/tmp/runlab-observation-"*)
+    printf '%s\n' '{{"schema_version":1,"kind":"runlab.observation_submission","created":true,"observation":{{"observation_id":"550e8400-e29b-41d4-a716-446655440101"}}}}'
+    ;;
+  *"observation type register --document /var/tmp/runlab-observation-"*)
+    printf '%s\n' '{{"schema_version":1,"kind":"runlab.observation_type_registration","created":true,"observation_type":{{"type":"example/score@v1"}}}}'
+    ;;
+  *"observation type get example/score@v1"*)
+    printf '%s\n' '{{"schema_version":1,"kind":"runlab.observation_type","observation_type":{{"type":"example/score@v1"}}}}'
+    ;;
+  *"observation type list --limit 7 --after example/old@v1"*)
+    printf '%s\n' '{{"schema_version":1,"kind":"runlab.observation_type_list","observation_types":[]}}'
     ;;
   *"run get e11ce005-0000-4000-8000-000000000005"*)
     if test -e "$RUNLAB_FAKE_ACCEPTED"; then

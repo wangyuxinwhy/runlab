@@ -14,7 +14,7 @@ use super::stop::stop_all;
 use super::subprocess::{InvocationSupervisor, SupervisorLifecycle};
 use super::time::{POLL_INTERVAL, execution_expired, wall_clock_now};
 use super::wait::{finalize_children, poll_children};
-use crate::{CancellationToken, EngineObserver, EngineStage, OciContentStore, OperationTimeouts};
+use crate::{CancellationToken, EngineEventSink, EngineStage, OciContentStore, OperationTimeouts};
 use anyhow::{Result as AnyResult, bail};
 use run_protocol::{
     Availability, EngineError, ExecutionInterval, ExecutionOutput, FinalEnvironment,
@@ -24,19 +24,19 @@ use run_protocol::{
 pub(super) struct ExecutionContext {
     store: Arc<dyn OciContentStore>,
     timeouts: OperationTimeouts,
-    observer: Arc<dyn EngineObserver>,
+    event_sink: Arc<dyn EngineEventSink>,
 }
 
 impl ExecutionContext {
     pub(super) const fn new(
         store: Arc<dyn OciContentStore>,
         timeouts: OperationTimeouts,
-        observer: Arc<dyn EngineObserver>,
+        event_sink: Arc<dyn EngineEventSink>,
     ) -> Self {
         Self {
             store,
             timeouts,
-            observer,
+            event_sink,
         }
     }
 }
@@ -62,7 +62,7 @@ pub(super) fn execute(
     }
     let interval_end = wall_clock_now();
     if lifecycle.requires_stop_observation() {
-        context.observer.stage(EngineStage::Stopping);
+        context.event_sink.stage(EngineStage::Stopping);
     }
     stop_all(
         &prepared.runc,
@@ -80,7 +80,7 @@ pub(super) fn execute(
     cleanup_program_runtimes(context, prepared, &mut lifecycle.runs, supervisor_deadline);
     let capture_ready = finalize_supervisor(prepared, &mut lifecycle.runs, supervisor_deadline)?;
     if input.controls().capture_final_environment() {
-        context.observer.stage(EngineStage::Capturing);
+        context.event_sink.stage(EngineStage::Capturing);
     }
     let outputs = capture_outputs(
         context,
@@ -181,7 +181,7 @@ impl ExecutionLifecycle {
             &prepared.runc,
             &prepared.runtime_root,
             context.timeouts,
-            Arc::clone(&context.observer),
+            Arc::clone(&context.event_sink),
         );
         for program_id in program_order(input) {
             if self.stop_requested(cancellation) {

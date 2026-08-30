@@ -16,7 +16,7 @@ use crate::run_record::{
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const DATABASE_SCHEMA_VERSION: i64 = 4;
+const DATABASE_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionOwner {
@@ -76,6 +76,86 @@ pub(crate) enum RunInsertion {
     Deleted(RunTombstone),
 }
 
+pub(crate) struct NewObservation<'a> {
+    pub(crate) observation_id: &'a str,
+    pub(crate) run_id: &'a str,
+    pub(crate) observation_type: &'a str,
+    pub(crate) submitted_at: &'a str,
+    pub(crate) method_json: &'a str,
+    pub(crate) payload_json: &'a str,
+    pub(crate) supersedes_observation_id: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredObservation {
+    pub(crate) observation_id: String,
+    pub(crate) run_id: String,
+    pub(crate) observation_type: String,
+    pub(crate) submitted_at: String,
+    pub(crate) method_json: String,
+    pub(crate) payload_json: String,
+    pub(crate) supersedes_observation_id: Option<String>,
+}
+
+pub(crate) struct NewObservationType<'a> {
+    pub(crate) observation_type: &'a str,
+    pub(crate) registered_at: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) description: &'a str,
+    pub(crate) payload_schema_json: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredObservationType {
+    pub(crate) observation_type: String,
+    pub(crate) registered_at: String,
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) payload_schema_json: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum ObservationTypeInsertion {
+    Created(StoredObservationType),
+    Existing(StoredObservationType),
+    Conflict,
+}
+
+#[derive(Debug)]
+pub(crate) enum ObservationInsertion {
+    Created(StoredObservation),
+    Existing(StoredObservation),
+    IdentityConflict,
+    RunNotFound,
+    RunNotTerminal,
+    SupersededNotFound,
+    SupersededMismatch,
+}
+
+pub(crate) struct NewObservationRetraction<'a> {
+    pub(crate) retraction_id: &'a str,
+    pub(crate) observation_id: &'a str,
+    pub(crate) retracted_at: &'a str,
+    pub(crate) reason: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredObservationRetraction {
+    pub(crate) retraction_id: String,
+    pub(crate) observation_id: String,
+    pub(crate) retracted_at: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum ObservationRetractionInsertion {
+    Created(StoredObservationRetraction),
+    Existing(StoredObservationRetraction),
+    IdentityConflict,
+    ObservationNotFound,
+    ObservationInactive,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StoredRunDeletionFacts {
     pub(crate) run_id: String,
@@ -87,10 +167,13 @@ pub(crate) struct StoredRunDeletionFacts {
     pub(crate) cancellation_requested_at: Option<String>,
     pub(crate) terminal_at: Option<String>,
     pub(crate) completion_json: Option<String>,
+    pub(crate) observation_count: u64,
+    pub(crate) observation_bytes: u64,
+    observation_fingerprint: String,
 }
 
 impl StoredRunDeletionFacts {
-    pub(crate) fn record_fingerprint(&self) -> String {
+    fn run_record_fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
         for value in [
             Some(self.run_id.as_str()),
@@ -120,7 +203,19 @@ impl StoredRunDeletionFacts {
         encoded
     }
 
-    pub(crate) fn record_bytes(&self) -> u64 {
+    pub(crate) fn asset_fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        for value in [
+            self.run_record_fingerprint(),
+            self.observation_fingerprint.clone(),
+        ] {
+            hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        format_sha256(hasher)
+    }
+
+    pub(crate) fn run_record_bytes(&self) -> u64 {
         [
             Some(self.run_id.as_str()),
             Some(self.accepted_at.as_str()),
@@ -138,6 +233,11 @@ impl StoredRunDeletionFacts {
             total.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
         })
     }
+
+    pub(crate) fn asset_bytes(&self) -> u64 {
+        self.run_record_bytes()
+            .saturating_add(self.observation_bytes)
+    }
 }
 
 pub(crate) struct RunDeletionFacts {
@@ -148,7 +248,7 @@ pub(crate) struct RunDeletionFacts {
 
 pub(crate) struct PlannedRunDeletion<'a> {
     pub(crate) run_id: &'a str,
-    pub(crate) record_fingerprint: &'a str,
+    pub(crate) asset_fingerprint: &'a str,
 }
 
 #[derive(Debug)]
@@ -442,6 +542,250 @@ impl Database {
         })
     }
 
+    pub(crate) fn observation_type_insert(
+        &self,
+        observation_type: &NewObservationType<'_>,
+    ) -> Result<ObservationTypeInsertion> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) = transaction
+            .query_row(
+                "SELECT observation_type, registered_at, title, description, payload_schema_json
+                 FROM main.observation_types WHERE observation_type = ?1",
+                [observation_type.observation_type],
+                read_observation_type,
+            )
+            .optional()?
+        {
+            let same = stored.title == observation_type.title
+                && stored.description == observation_type.description
+                && stored.payload_schema_json == observation_type.payload_schema_json;
+            transaction.commit()?;
+            return Ok(if same {
+                ObservationTypeInsertion::Existing(stored)
+            } else {
+                ObservationTypeInsertion::Conflict
+            });
+        }
+        transaction.execute(
+            "INSERT INTO main.observation_types(
+                observation_type, registered_at, title, description, payload_schema_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                observation_type.observation_type,
+                observation_type.registered_at,
+                observation_type.title,
+                observation_type.description,
+                observation_type.payload_schema_json,
+            ],
+        )?;
+        let stored = transaction.query_row(
+            "SELECT observation_type, registered_at, title, description, payload_schema_json
+             FROM main.observation_types WHERE observation_type = ?1",
+            [observation_type.observation_type],
+            read_observation_type,
+        )?;
+        transaction.commit()?;
+        Ok(ObservationTypeInsertion::Created(stored))
+    }
+
+    pub(crate) fn observation_type_get(
+        &self,
+        observation_type: &str,
+    ) -> Result<Option<StoredObservationType>> {
+        self.lock()?
+            .query_row(
+                "SELECT observation_type, registered_at, title, description, payload_schema_json
+                 FROM main.observation_types WHERE observation_type = ?1",
+                [observation_type],
+                read_observation_type,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn observation_type_list(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<StoredObservationType>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT observation_type, registered_at, title, description, payload_schema_json
+             FROM main.observation_types
+             WHERE (?1 IS NULL OR observation_type > ?1)
+             ORDER BY observation_type ASC LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).context("Observation Type list limit is too large")?;
+        Ok(statement
+            .query_map(params![after, limit], read_observation_type)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn observation_insert(
+        &self,
+        observation: &NewObservation<'_>,
+    ) -> Result<ObservationInsertion> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) = transaction
+            .query_row(
+                "SELECT observation_id, run_id, observation_type, submitted_at, method_json,
+                        payload_json, supersedes_observation_id
+                 FROM main.observations WHERE observation_id = ?1",
+                [observation.observation_id],
+                read_observation,
+            )
+            .optional()?
+        {
+            let same = stored.run_id == observation.run_id
+                && stored.observation_type == observation.observation_type
+                && stored.method_json == observation.method_json
+                && stored.payload_json == observation.payload_json
+                && stored.supersedes_observation_id.as_deref()
+                    == observation.supersedes_observation_id;
+            transaction.commit()?;
+            return Ok(if same {
+                ObservationInsertion::Existing(stored)
+            } else {
+                ObservationInsertion::IdentityConflict
+            });
+        }
+        let run_terminal = transaction
+            .query_row(
+                "SELECT terminal_at IS NOT NULL AND completion_json IS NOT NULL
+                 FROM main.runs WHERE run_id = ?1",
+                [observation.run_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        match run_terminal {
+            None => return Ok(ObservationInsertion::RunNotFound),
+            Some(false) => return Ok(ObservationInsertion::RunNotTerminal),
+            Some(true) => {}
+        }
+        if let Some(superseded_id) = observation.supersedes_observation_id {
+            let superseded = transaction
+                .query_row(
+                    "SELECT observation_id, run_id, observation_type, submitted_at, method_json,
+                            payload_json, supersedes_observation_id
+                     FROM main.observations WHERE observation_id = ?1",
+                    [superseded_id],
+                    read_observation,
+                )
+                .optional()?;
+            let Some(superseded) = superseded else {
+                return Ok(ObservationInsertion::SupersededNotFound);
+            };
+            let inactive: bool = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM main.observations WHERE supersedes_observation_id = ?1
+                 ) OR EXISTS(
+                     SELECT 1 FROM main.observation_retractions WHERE observation_id = ?1
+                 )",
+                [superseded_id],
+                |row| row.get(0),
+            )?;
+            if superseded.run_id != observation.run_id
+                || superseded.observation_type != observation.observation_type
+                || inactive
+            {
+                return Ok(ObservationInsertion::SupersededMismatch);
+            }
+        }
+        transaction.execute(
+            "INSERT INTO main.observations(
+                observation_id, run_id, observation_type, submitted_at, method_json,
+                payload_json, supersedes_observation_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                observation.observation_id,
+                observation.run_id,
+                observation.observation_type,
+                observation.submitted_at,
+                observation.method_json,
+                observation.payload_json,
+                observation.supersedes_observation_id,
+            ],
+        )?;
+        let stored = transaction.query_row(
+            "SELECT observation_id, run_id, observation_type, submitted_at, method_json,
+                    payload_json, supersedes_observation_id
+             FROM main.observations WHERE observation_id = ?1",
+            [observation.observation_id],
+            read_observation,
+        )?;
+        transaction.commit()?;
+        Ok(ObservationInsertion::Created(stored))
+    }
+
+    pub(crate) fn observation_retract(
+        &self,
+        retraction: &NewObservationRetraction<'_>,
+    ) -> Result<ObservationRetractionInsertion> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) = transaction
+            .query_row(
+                "SELECT retraction_id, observation_id, retracted_at, reason
+                 FROM main.observation_retractions WHERE retraction_id = ?1",
+                [retraction.retraction_id],
+                read_observation_retraction,
+            )
+            .optional()?
+        {
+            let same = stored.observation_id == retraction.observation_id
+                && stored.reason == retraction.reason;
+            transaction.commit()?;
+            return Ok(if same {
+                ObservationRetractionInsertion::Existing(stored)
+            } else {
+                ObservationRetractionInsertion::IdentityConflict
+            });
+        }
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.observations WHERE observation_id = ?1
+             )",
+            [retraction.observation_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(ObservationRetractionInsertion::ObservationNotFound);
+        }
+        let inactive: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.observations WHERE supersedes_observation_id = ?1
+             ) OR EXISTS(
+                 SELECT 1 FROM main.observation_retractions WHERE observation_id = ?1
+             )",
+            [retraction.observation_id],
+            |row| row.get(0),
+        )?;
+        if inactive {
+            return Ok(ObservationRetractionInsertion::ObservationInactive);
+        }
+        transaction.execute(
+            "INSERT INTO main.observation_retractions(
+                retraction_id, observation_id, retracted_at, reason
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                retraction.retraction_id,
+                retraction.observation_id,
+                retraction.retracted_at,
+                retraction.reason
+            ],
+        )?;
+        let stored = transaction.query_row(
+            "SELECT retraction_id, observation_id, retracted_at, reason
+             FROM main.observation_retractions WHERE retraction_id = ?1",
+            [retraction.retraction_id],
+            read_observation_retraction,
+        )?;
+        transaction.commit()?;
+        Ok(ObservationRetractionInsertion::Created(stored))
+    }
+
     pub(crate) fn run_tombstone(&self, run_id: &str) -> Result<Option<RunTombstone>> {
         self.lock()?
             .query_row(
@@ -463,7 +807,7 @@ impl Database {
         let mut runs = BTreeMap::new();
         let mut tombstones = BTreeMap::new();
         for run_id in run_ids {
-            if let Some(run) = transaction
+            if let Some(mut run) = transaction
                 .query_row(
                     "SELECT run_id, accepted_at, initial_image_name, metadata_json, input_json,
                             input_identity_json, cancellation_requested_at,
@@ -474,6 +818,7 @@ impl Database {
                 )
                 .optional()?
             {
+                load_observation_deletion_facts(&transaction, &mut run)?;
                 runs.insert(run_id.clone(), run);
                 continue;
             }
@@ -575,7 +920,7 @@ impl Database {
                     read_run_deletion_facts,
                 )
                 .optional()?;
-            let Some(stored) = stored else {
+            let Some(mut stored) = stored else {
                 return Err(deletion_conflict(format!(
                     "Run deletion plan is stale because a candidate no longer exists: {}",
                     candidate.run_id
@@ -587,7 +932,8 @@ impl Database {
                     candidate.run_id
                 )));
             }
-            if stored.record_fingerprint() != candidate.record_fingerprint {
+            load_observation_deletion_facts(&transaction, &mut stored)?;
+            if stored.asset_fingerprint() != candidate.asset_fingerprint {
                 return Err(deletion_conflict(format!(
                     "Run deletion plan is stale because a candidate changed: {}",
                     candidate.run_id
@@ -872,6 +1218,95 @@ fn read_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
     })
 }
 
+fn read_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredObservation> {
+    Ok(StoredObservation {
+        observation_id: row.get("observation_id")?,
+        run_id: row.get("run_id")?,
+        observation_type: row.get("observation_type")?,
+        submitted_at: row.get("submitted_at")?,
+        method_json: row.get("method_json")?,
+        payload_json: row.get("payload_json")?,
+        supersedes_observation_id: row.get("supersedes_observation_id")?,
+    })
+}
+
+fn read_observation_type(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredObservationType> {
+    Ok(StoredObservationType {
+        observation_type: row.get("observation_type")?,
+        registered_at: row.get("registered_at")?,
+        title: row.get("title")?,
+        description: row.get("description")?,
+        payload_schema_json: row.get("payload_schema_json")?,
+    })
+}
+
+fn read_observation_retraction(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredObservationRetraction> {
+    Ok(StoredObservationRetraction {
+        retraction_id: row.get("retraction_id")?,
+        observation_id: row.get("observation_id")?,
+        retracted_at: row.get("retracted_at")?,
+        reason: row.get("reason")?,
+    })
+}
+
+fn load_observation_deletion_facts(
+    connection: &Connection,
+    run: &mut StoredRunDeletionFacts,
+) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT observation.observation_id, observation.observation_type,
+                observation.submitted_at, observation.method_json,
+                observation.payload_json,
+                observation.supersedes_observation_id,
+                retraction.retraction_id, retraction.retracted_at, retraction.reason
+         FROM main.observations AS observation
+         LEFT JOIN main.observation_retractions AS retraction
+           ON retraction.observation_id = observation.observation_id
+         WHERE observation.run_id = ?1
+         ORDER BY observation.observation_id",
+    )?;
+    let mut rows = statement.query([&run.run_id])?;
+    let mut hasher = Sha256::new();
+    let mut count = 0_u64;
+    let mut bytes = 0_u64;
+    while let Some(row) = rows.next()? {
+        count = count.saturating_add(1);
+        for index in 0..9 {
+            let value = row.get::<_, Option<String>>(index)?;
+            hash_optional_text(&mut hasher, value.as_deref());
+            if let Some(value) = value {
+                bytes = bytes.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
+            }
+        }
+    }
+    run.observation_count = count;
+    run.observation_bytes = bytes;
+    run.observation_fingerprint = format_sha256(hasher);
+    Ok(())
+}
+
+fn hash_optional_text(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn format_sha256(hasher: Sha256) -> String {
+    let mut encoded = String::from("sha256:");
+    for byte in hasher.finalize() {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
 fn read_run_deletion_facts(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRunDeletionFacts> {
     Ok(StoredRunDeletionFacts {
         run_id: row.get("run_id")?,
@@ -883,6 +1318,10 @@ fn read_run_deletion_facts(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRu
         cancellation_requested_at: row.get("cancellation_requested_at")?,
         terminal_at: row.get("terminal_at")?,
         completion_json: row.get("completion_json")?,
+        observation_count: 0,
+        observation_bytes: 0,
+        observation_fingerprint:
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
     })
 }
 
@@ -933,7 +1372,38 @@ fn migrate_database(connection: &mut Connection) -> Result<()> {
             "RunLab database schema version {version} is newer than supported version {DATABASE_SCHEMA_VERSION}"
         );
     }
-    transaction.execute_batch(
+    ensure_database_tables(&transaction)?;
+    ensure_metadata_column(&transaction, "catalog")?;
+    ensure_metadata_column(&transaction, "runs")?;
+    ensure_column(
+        &transaction,
+        "runs",
+        "initial_image_name",
+        "ALTER TABLE runs ADD COLUMN initial_image_name TEXT",
+    )?;
+    ensure_column(
+        &transaction,
+        "runs",
+        "cancellation_requested_at",
+        "ALTER TABLE runs ADD COLUMN cancellation_requested_at TEXT",
+    )?;
+    if version == 0 {
+        migrate_run_records(&transaction)?;
+    }
+    if version == 2 {
+        migrate_execution_journal_v2(&transaction)?;
+    }
+    ensure_builtin_observation_type(&transaction)?;
+    if version == 5 {
+        migrate_observations_v5(&transaction)?;
+    }
+    transaction.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn ensure_database_tables(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
         r#"CREATE TABLE IF NOT EXISTS catalog (
                name TEXT PRIMARY KEY,
                descriptor_json TEXT NOT NULL,
@@ -967,30 +1437,127 @@ fn migrate_database(connection: &mut Connection) -> Result<()> {
                operation_id TEXT NOT NULL
            ) STRICT;
            CREATE INDEX IF NOT EXISTS run_tombstones_operation
-               ON run_tombstones(operation_id, run_id);"#,
+               ON run_tombstones(operation_id, run_id);
+           CREATE TABLE IF NOT EXISTS observation_types (
+               observation_type TEXT PRIMARY KEY,
+               registered_at TEXT NOT NULL,
+               title TEXT NOT NULL,
+               description TEXT NOT NULL,
+               payload_schema_json TEXT NOT NULL
+           ) STRICT;
+           CREATE TABLE IF NOT EXISTS observations (
+               observation_id TEXT PRIMARY KEY,
+               run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+               observation_type TEXT NOT NULL
+                   REFERENCES observation_types(observation_type),
+               submitted_at TEXT NOT NULL,
+               method_json TEXT NOT NULL,
+               payload_json TEXT NOT NULL,
+               supersedes_observation_id TEXT REFERENCES observations(observation_id),
+               CHECK (
+                   supersedes_observation_id IS NULL
+                   OR supersedes_observation_id <> observation_id
+               )
+           ) STRICT;
+           CREATE INDEX IF NOT EXISTS observations_run_order
+               ON observations(run_id, submitted_at, observation_id);
+           CREATE UNIQUE INDEX IF NOT EXISTS observations_one_replacement
+               ON observations(supersedes_observation_id)
+               WHERE supersedes_observation_id IS NOT NULL;
+           CREATE TABLE IF NOT EXISTS observation_retractions (
+               retraction_id TEXT PRIMARY KEY,
+               observation_id TEXT NOT NULL UNIQUE
+                   REFERENCES observations(observation_id) ON DELETE CASCADE,
+               retracted_at TEXT NOT NULL,
+               reason TEXT NOT NULL
+           ) STRICT;"#,
     )?;
-    ensure_metadata_column(&transaction, "catalog")?;
-    ensure_metadata_column(&transaction, "runs")?;
-    ensure_column(
-        &transaction,
-        "runs",
-        "initial_image_name",
-        "ALTER TABLE runs ADD COLUMN initial_image_name TEXT",
+    Ok(())
+}
+
+fn ensure_builtin_observation_type(connection: &Connection) -> Result<()> {
+    let (title, description, payload_schema_json) =
+        crate::observation::builtin_token_usage_parts()?;
+    let registered_at = chrono::Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT OR IGNORE INTO observation_types(
+            observation_type, registered_at, title, description, payload_schema_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            crate::observation::TOKEN_USAGE_TYPE,
+            registered_at,
+            title,
+            description,
+            payload_schema_json,
+        ],
     )?;
-    ensure_column(
-        &transaction,
-        "runs",
-        "cancellation_requested_at",
-        "ALTER TABLE runs ADD COLUMN cancellation_requested_at TEXT",
+    let stored = connection.query_row(
+        "SELECT observation_type, registered_at, title, description, payload_schema_json
+         FROM observation_types WHERE observation_type = ?1",
+        [crate::observation::TOKEN_USAGE_TYPE],
+        read_observation_type,
     )?;
-    if version == 0 {
-        migrate_run_records(&transaction)?;
+    let (title, description, payload_schema_json) =
+        crate::observation::builtin_token_usage_parts()?;
+    if stored.title != title
+        || stored.description != description
+        || stored.payload_schema_json != payload_schema_json
+    {
+        bail!(
+            "registered built-in Observation Type differs from this RunLab version: {}",
+            crate::observation::TOKEN_USAGE_TYPE
+        );
     }
-    if version == 2 {
-        migrate_execution_journal_v2(&transaction)?;
-    }
-    transaction.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
-    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_observations_v5(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE observation_retractions_v5_backup AS
+             SELECT retraction_id, observation_id, retracted_at, reason
+             FROM observation_retractions;
+         DROP TABLE observation_retractions;
+         ALTER TABLE observations RENAME TO observations_v5;
+         CREATE TABLE observations (
+             observation_id TEXT PRIMARY KEY,
+             run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+             observation_type TEXT NOT NULL REFERENCES observation_types(observation_type),
+             submitted_at TEXT NOT NULL,
+             method_json TEXT NOT NULL,
+             payload_json TEXT NOT NULL,
+             supersedes_observation_id TEXT REFERENCES observations(observation_id),
+             CHECK (
+                 supersedes_observation_id IS NULL
+                 OR supersedes_observation_id <> observation_id
+             )
+         ) STRICT;
+         INSERT INTO observations(
+             observation_id, run_id, observation_type, submitted_at, method_json,
+             payload_json, supersedes_observation_id
+         )
+         SELECT observation_id, run_id, observation_type, submitted_at, method_json,
+                json_remove(payload_json, '$.total_tokens'), supersedes_observation_id
+         FROM observations_v5;
+         DROP TABLE observations_v5;
+         CREATE INDEX observations_run_order
+             ON observations(run_id, submitted_at, observation_id);
+         CREATE UNIQUE INDEX observations_one_replacement
+             ON observations(supersedes_observation_id)
+             WHERE supersedes_observation_id IS NOT NULL;
+         CREATE TABLE observation_retractions (
+             retraction_id TEXT PRIMARY KEY,
+             observation_id TEXT NOT NULL UNIQUE
+                 REFERENCES observations(observation_id) ON DELETE CASCADE,
+             retracted_at TEXT NOT NULL,
+             reason TEXT NOT NULL
+         ) STRICT;
+         INSERT INTO observation_retractions(
+             retraction_id, observation_id, retracted_at, reason
+         )
+         SELECT retraction_id, observation_id, retracted_at, reason
+         FROM observation_retractions_v5_backup;
+         DROP TABLE observation_retractions_v5_backup;",
+    )?;
     Ok(())
 }
 
@@ -1085,7 +1652,7 @@ fn ensure_column(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
@@ -1101,7 +1668,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BUSY_TIMEOUT, DATABASE_SCHEMA_VERSION, Database, ExecutionOwner, NewRun, RunInsertion,
+        BUSY_TIMEOUT, DATABASE_SCHEMA_VERSION, Database, ExecutionOwner, NewObservation,
+        NewObservationRetraction, NewObservationType, NewRun, ObservationInsertion,
+        ObservationRetractionInsertion, ObservationTypeInsertion, PlannedRunDeletion,
+        RunDeletionCommit, RunInsertion,
     };
     use crate::metadata::Metadata;
     use crate::run_record::{CompletionRecord, InputIdentityRecord, InputRecord};
@@ -1257,7 +1827,7 @@ mod tests {
             })
             .expect("schema version");
         assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        assert_eq!(version, 4, "schema v4 is the intentional downgrade barrier");
+        assert_eq!(version, 6, "schema v6 is the intentional downgrade barrier");
         let tombstones_exist = database
             .with_connection(|connection| {
                 connection
@@ -1271,6 +1841,22 @@ mod tests {
             })
             .expect("tombstone schema");
         assert_eq!(tombstones_exist, 1);
+        let observation_tables = database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_schema
+                         WHERE type = 'table'
+                           AND name IN (
+                               'observation_types', 'observations', 'observation_retractions'
+                           )",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("Observation schema");
+        assert_eq!(observation_tables, 3);
         drop(database);
 
         let connection = rusqlite::Connection::open(&path).expect("raw connection");
@@ -1282,6 +1868,92 @@ mod tests {
             panic!("future schema must be rejected");
         };
         assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[test]
+    fn migrates_v5_observations_to_the_generic_type_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("runlab.sqlite3");
+        let connection = rusqlite::Connection::open(&path).expect("raw v5 database");
+        connection
+            .execute_batch(
+                r#"CREATE TABLE runs (
+                       run_id TEXT PRIMARY KEY,
+                       accepted_at TEXT NOT NULL,
+                       initial_image_name TEXT,
+                       metadata_json TEXT NOT NULL,
+                       input_json TEXT NOT NULL,
+                       input_identity_json TEXT NOT NULL,
+                       cancellation_requested_at TEXT,
+                       terminal_at TEXT,
+                       completion_json TEXT
+                   ) STRICT;
+                   INSERT INTO runs VALUES (
+                       '550e8400-e29b-41d4-a716-446655440120',
+                       '2026-08-29T00:00:00Z', NULL,
+                       '{"description":null,"labels":{}}', '{}', '{}', NULL,
+                       '2026-08-29T00:00:01Z', '{}'
+                   );
+                   CREATE TABLE observations (
+                       observation_id TEXT PRIMARY KEY,
+                       run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                       observation_type TEXT NOT NULL,
+                       submitted_at TEXT NOT NULL,
+                       method_json TEXT NOT NULL,
+                       source_refs_json TEXT NOT NULL,
+                       payload_json TEXT NOT NULL,
+                       supersedes_observation_id TEXT REFERENCES observations(observation_id)
+                   ) STRICT;
+                   INSERT INTO observations VALUES (
+                       '550e8400-e29b-41d4-a716-446655440121',
+                       '550e8400-e29b-41d4-a716-446655440120',
+                       'runlab/token_usage@v1', '2026-08-29T00:00:02Z',
+                       '{"name":"fixture","version":"1"}',
+                       '[{"kind":"final_image_path"}]',
+                       '{"coverage":"complete","input_tokens":10,"cached_input_tokens":null,"cache_write_input_tokens":null,"output_tokens":2,"reasoning_output_tokens":null,"total_tokens":12}',
+                       NULL
+                   );
+                   CREATE TABLE observation_retractions (
+                       retraction_id TEXT PRIMARY KEY,
+                       observation_id TEXT NOT NULL UNIQUE
+                           REFERENCES observations(observation_id) ON DELETE CASCADE,
+                       retracted_at TEXT NOT NULL,
+                       reason TEXT NOT NULL
+                   ) STRICT;
+                   PRAGMA user_version = 5;"#,
+            )
+            .expect("v5 fixture");
+        drop(connection);
+
+        let database = Database::open(&path).expect("migrate v5 database");
+        database
+            .with_connection(|connection| {
+                let source_column: i64 = connection.query_row(
+                    "SELECT instr(sql, 'source_refs_json') FROM main.sqlite_schema
+                     WHERE type = 'table' AND name = 'observations'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(source_column, 0);
+                let payload: String = connection.query_row(
+                    "SELECT payload_json FROM main.observations",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&payload)?["total_tokens"],
+                    serde_json::Value::Null
+                );
+                let registered: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM main.observation_types
+                     WHERE observation_type = 'runlab/token_usage@v1'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(registered, 1);
+                Ok(())
+            })
+            .expect("generic Observation storage");
     }
 
     #[test]
@@ -1346,6 +2018,241 @@ mod tests {
         };
         assert_eq!(tombstone.run_id, run_id);
         assert!(database.run_get(run_id).expect("read Run").is_none());
+    }
+
+    #[test]
+    fn observations_are_idempotent_and_corrections_preserve_history() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database =
+            Database::open(&directory.path().join("runlab.sqlite3")).expect("open database");
+        let run_id = "550e8400-e29b-41d4-a716-446655440100";
+        insert_terminal_run(&database, run_id);
+
+        let original = new_observation(
+            "550e8400-e29b-41d4-a716-446655440101",
+            run_id,
+            r#"{"input_tokens":10,"output_tokens":2,"total_tokens":12}"#,
+            None,
+        );
+        assert!(matches!(
+            database
+                .observation_insert(&original)
+                .expect("insert Observation"),
+            ObservationInsertion::Created(_)
+        ));
+        assert!(matches!(
+            database
+                .observation_insert(&original)
+                .expect("retry Observation"),
+            ObservationInsertion::Existing(_)
+        ));
+        let conflicting = new_observation(
+            original.observation_id,
+            run_id,
+            r#"{"input_tokens":11,"output_tokens":2,"total_tokens":13}"#,
+            None,
+        );
+        assert!(matches!(
+            database
+                .observation_insert(&conflicting)
+                .expect("detect identity conflict"),
+            ObservationInsertion::IdentityConflict
+        ));
+
+        let replacement = new_observation(
+            "550e8400-e29b-41d4-a716-446655440102",
+            run_id,
+            r#"{"input_tokens":11,"output_tokens":2,"total_tokens":13}"#,
+            Some(original.observation_id),
+        );
+        assert!(matches!(
+            database
+                .observation_insert(&replacement)
+                .expect("replace Observation"),
+            ObservationInsertion::Created(_)
+        ));
+        let second_replacement = new_observation(
+            "550e8400-e29b-41d4-a716-446655440103",
+            run_id,
+            r#"{"input_tokens":12,"output_tokens":2,"total_tokens":14}"#,
+            Some(original.observation_id),
+        );
+        assert!(matches!(
+            database
+                .observation_insert(&second_replacement)
+                .expect("reject second replacement"),
+            ObservationInsertion::SupersededMismatch
+        ));
+
+        let original_retraction = NewObservationRetraction {
+            retraction_id: "550e8400-e29b-41d4-a716-446655440104",
+            observation_id: original.observation_id,
+            retracted_at: "2026-08-27T00:00:06Z",
+            reason: "superseded records cannot also be retracted",
+        };
+        assert!(matches!(
+            database
+                .observation_retract(&original_retraction)
+                .expect("reject inactive retraction"),
+            ObservationRetractionInsertion::ObservationInactive
+        ));
+        let replacement_retraction = NewObservationRetraction {
+            retraction_id: "550e8400-e29b-41d4-a716-446655440105",
+            observation_id: replacement.observation_id,
+            retracted_at: "2026-08-27T00:00:07Z",
+            reason: "source artifact was incomplete",
+        };
+        assert!(matches!(
+            database
+                .observation_retract(&replacement_retraction)
+                .expect("retract replacement"),
+            ObservationRetractionInsertion::Created(_)
+        ));
+        assert!(matches!(
+            database
+                .observation_retract(&replacement_retraction)
+                .expect("retry retraction"),
+            ObservationRetractionInsertion::Existing(_)
+        ));
+    }
+
+    #[test]
+    fn observation_type_registration_is_create_only_and_idempotent() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database =
+            Database::open(&directory.path().join("runlab.sqlite3")).expect("open database");
+        let definition = NewObservationType {
+            observation_type: "example/score@v1",
+            registered_at: "2026-08-29T00:00:00Z",
+            title: "Score",
+            description: "A fixture score.",
+            payload_schema_json: r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"number"}"#,
+        };
+        assert!(matches!(
+            database
+                .observation_type_insert(&definition)
+                .expect("register Type"),
+            ObservationTypeInsertion::Created(_)
+        ));
+        assert!(matches!(
+            database
+                .observation_type_insert(&definition)
+                .expect("retry Type"),
+            ObservationTypeInsertion::Existing(_)
+        ));
+        let changed = NewObservationType {
+            description: "A different contract.",
+            ..definition
+        };
+        assert!(matches!(
+            database
+                .observation_type_insert(&changed)
+                .expect("conflicting Type"),
+            ObservationTypeInsertion::Conflict
+        ));
+    }
+
+    #[test]
+    fn run_deletion_freezes_and_cascades_the_observation_set() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database =
+            Database::open(&directory.path().join("runlab.sqlite3")).expect("open database");
+        let run_id = "550e8400-e29b-41d4-a716-446655440110";
+        insert_terminal_run(&database, run_id);
+        let requested = BTreeSet::from([run_id.to_owned()]);
+        let before = database
+            .run_deletion_facts(&requested)
+            .expect("deletion facts before Observation");
+        let before_fingerprint = before.runs[run_id].asset_fingerprint();
+
+        let observation = new_observation(
+            "550e8400-e29b-41d4-a716-446655440111",
+            run_id,
+            r#"{"input_tokens":10,"output_tokens":2,"total_tokens":12}"#,
+            None,
+        );
+        assert!(matches!(
+            database
+                .observation_insert(&observation)
+                .expect("insert Observation"),
+            ObservationInsertion::Created(_)
+        ));
+        let replacement = new_observation(
+            "550e8400-e29b-41d4-a716-446655440114",
+            run_id,
+            r#"{"input_tokens":11,"output_tokens":2,"total_tokens":13}"#,
+            Some(observation.observation_id),
+        );
+        assert!(matches!(
+            database
+                .observation_insert(&replacement)
+                .expect("insert replacement"),
+            ObservationInsertion::Created(_)
+        ));
+        assert!(matches!(
+            database
+                .observation_retract(&NewObservationRetraction {
+                    retraction_id: "550e8400-e29b-41d4-a716-446655440115",
+                    observation_id: replacement.observation_id,
+                    retracted_at: "2026-08-27T00:00:07Z",
+                    reason: "source artifact was incomplete",
+                })
+                .expect("retract replacement"),
+            ObservationRetractionInsertion::Created(_)
+        ));
+        let stale = [PlannedRunDeletion {
+            run_id,
+            asset_fingerprint: &before_fingerprint,
+        }];
+        let error = database
+            .run_delete_apply(
+                "550e8400-e29b-41d4-a716-446655440112",
+                "2026-08-27T00:00:08Z",
+                &stale,
+                &[run_id],
+            )
+            .expect_err("new Observation makes deletion plan stale");
+        assert!(error.to_string().contains("candidate changed"));
+        assert!(database.run_get(run_id).expect("read Run").is_some());
+
+        let after = database
+            .run_deletion_facts(&requested)
+            .expect("deletion facts after Observation");
+        let after_run = &after.runs[run_id];
+        assert_eq!(after_run.observation_count, 2);
+        assert!(after_run.observation_bytes > 0);
+        assert_ne!(after_run.asset_fingerprint(), before_fingerprint);
+        let after_fingerprint = after_run.asset_fingerprint();
+        let current = [PlannedRunDeletion {
+            run_id,
+            asset_fingerprint: &after_fingerprint,
+        }];
+        assert!(matches!(
+            database
+                .run_delete_apply(
+                    "550e8400-e29b-41d4-a716-446655440113",
+                    "2026-08-27T00:00:09Z",
+                    &current,
+                    &[run_id],
+                )
+                .expect("delete Run and Observation"),
+            RunDeletionCommit::Applied { .. }
+        ));
+        let (runs, observations, retractions): (i64, i64, i64) = database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT (SELECT count(*) FROM main.runs),
+                                (SELECT count(*) FROM main.observations),
+                                (SELECT count(*) FROM main.observation_retractions)",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("count persisted assets");
+        assert_eq!((runs, observations, retractions), (0, 0, 0));
+        assert!(database.run_tombstone(run_id).expect("tombstone").is_some());
     }
 
     #[test]
@@ -1467,6 +2374,73 @@ mod tests {
         )
         .expect("RunInput");
         (input, runtime_bytes, descriptor)
+    }
+
+    fn insert_terminal_run(database: &Database, run_id: &str) {
+        let (input, runtime_bytes, descriptor) = protocol_input();
+        let input_record = InputRecord::primary(
+            &descriptor,
+            &runtime_bytes,
+            b"",
+            &Secrets::empty(),
+            None,
+            Network::Isolated,
+            true,
+        );
+        let identity = InputIdentityRecord::primary(
+            &descriptor,
+            input.programs()[&ProgramId::primary()]
+                .runtime_config()
+                .as_json(),
+            b"",
+            &Secrets::empty(),
+            None,
+            Network::Isolated,
+        );
+        database
+            .run_insert(&NewRun {
+                run_id,
+                accepted_at: "2026-08-27T00:00:00Z",
+                initial_image_name: Some("base"),
+                metadata: &Metadata::default(),
+                input: &input_record,
+                input_identity: &identity,
+                owner: &ExecutionOwner {
+                    boot_id: "test-boot".to_owned(),
+                    pid: 1,
+                    start_ticks: 1,
+                },
+            })
+            .expect("insert Run");
+        database
+            .run_mark_engine_running(run_id)
+            .expect("mark Engine running");
+        database
+            .run_stage_completion(
+                run_id,
+                &CompletionRecord::engine_returned(Ok(protocol_output(&input))),
+            )
+            .expect("stage completion");
+        database
+            .run_publish_staged(run_id, "2026-08-27T00:00:04Z")
+            .expect("publish terminal Run");
+    }
+
+    fn new_observation<'a>(
+        observation_id: &'a str,
+        run_id: &'a str,
+        payload_json: &'a str,
+        supersedes_observation_id: Option<&'a str>,
+    ) -> NewObservation<'a> {
+        NewObservation {
+            observation_id,
+            run_id,
+            observation_type: "runlab/token_usage@v1",
+            submitted_at: "2026-08-27T00:00:05Z",
+            method_json: r#"{"name":"test","version":"1"}"#,
+            payload_json,
+            supersedes_observation_id,
+        }
     }
 
     fn protocol_output(input: &RunInput) -> run_protocol::RunOutput {

@@ -38,7 +38,7 @@ fn final_environment_unavailability_preserves_the_failed_capture_evidence() {
     let context = ExecutionContext::new(
         Arc::new(UnavailableStore),
         OperationTimeouts::default(),
-        Arc::new(crate::observer::IgnoreObserver),
+        Arc::new(crate::live_event::IgnoreEventSink),
     );
     let capture_ready = FinalCaptureReady(());
 
@@ -136,7 +136,7 @@ fn runtime_cleanup_reports_nonempty_mount_artifact_as_rootfs_instability() {
     let context = ExecutionContext::new(
         Arc::new(UnavailableStore),
         OperationTimeouts::default(),
-        Arc::new(crate::observer::IgnoreObserver),
+        Arc::new(crate::live_event::IgnoreEventSink),
     );
     let capture_ready = FinalCaptureReady(());
     let unavailable = capture_final(

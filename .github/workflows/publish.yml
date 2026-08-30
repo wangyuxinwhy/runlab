@@ -1,0 +1,55 @@
+name: Publish Cargo packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH release tag
+        required: true
+        type: string
+      authentication:
+        description: Use a bootstrap token only for first publication, then Trusted Publishing
+        required: true
+        default: trusted-publisher
+        type: choice
+        options:
+          - trusted-publisher
+          - bootstrap-token
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag }}
+      - name: Validate tag and version
+        run: |
+          tag="${{ inputs.tag }}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git rev-parse --verify "refs/tags/$tag^{commit}" >/dev/null
+          version="${tag#v}"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "$version" = "$manifest_version"
+          grep -F "## [$version]" CHANGELOG.md >/dev/null
+      - name: Verify normalized Cargo packages
+        run: scripts/verify-packages.sh
+      - name: Authenticate with crates.io Trusted Publishing
+        if: inputs.authentication == 'trusted-publisher'
+        id: trusted-publisher
+        uses: rust-lang/crates-io-auth-action@63a7064947ceca9989005e118db3a5fecdc9259f
+      - name: Publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ inputs.authentication == 'trusted-publisher' && steps.trusted-publisher.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN" || {
+            echo "the selected crates.io authentication mode produced no token" >&2
+            exit 1
+          }
+          scripts/publish-crates.sh

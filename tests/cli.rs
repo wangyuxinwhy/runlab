@@ -99,7 +99,7 @@ fn help_exposes_only_the_minimal_product_surface() {
     assert!(stdout.contains("generated from the Image when omitted"));
     assert!(stdout.contains("possible values: isolated, egress"));
     assert!(stdout.contains("compact JSON summary"));
-    assert!(stdout.contains("stderr emits an NDJSON observation stream"));
+    assert!(stdout.contains("stderr emits an NDJSON Live Event stream"));
     assert!(stdout.contains("Use run get for the complete persisted Run record"));
     assert!(stdout.contains("--secret-env"));
     assert!(stdout.contains("--secret-file"));
@@ -121,6 +121,323 @@ fn help_exposes_only_the_minimal_product_surface() {
     let stdout = text(&delete_apply.stdout);
     assert!(stdout.contains("--plan"));
     assert!(stdout.contains("all-or-nothing"));
+}
+
+#[test]
+fn observation_help_exposes_the_external_method_workflow() {
+    let observation = run(&["observation", "--help"]);
+    assert_success(&observation);
+    let stdout = text(&observation.stdout);
+    assert!(stdout.contains("type"));
+    assert!(stdout.contains("submit"));
+    assert!(stdout.contains("retract"));
+
+    let submit = run(&["observation", "submit", "--help"]);
+    assert_success(&submit);
+    let stdout = text(&submit.stdout);
+    assert!(stdout.contains("registered Type"));
+    assert!(stdout.contains("RunLab trusts the declared Method"));
+    assert!(stdout.contains("json_extract"));
+
+    let register = run(&["observation", "type", "register", "--help"]);
+    assert_success(&register);
+    assert!(text(&register.stdout).contains("immutable Type definition"));
+}
+
+#[test]
+fn invalid_observation_document_does_not_create_state() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let document = temporary.path().join("invalid-observation.json");
+    fs::write(&document, br#"{"schema_version":1}"#).expect("invalid document");
+    let output = run_with_state(
+        &state,
+        &["observation", "submit", "--document", path(&document)],
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+    assert_eq!(error["category"], "invalid_input");
+    assert_eq!(error["stage"], "observation_input");
+    assert_eq!(error["accepted"], false);
+    assert!(!state.exists());
+}
+
+#[test]
+fn observation_submission_correction_query_and_run_deletion_are_one_checked_workflow() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state = temporary.path().join("state");
+    let layout = create_layout_with_layers(temporary.path(), &[layer_bytes()]);
+    let imported = run_with_state(
+        &state,
+        &["image", "import", path(&layout), "--name", "base"],
+    );
+    assert_success(&imported);
+    let manifest = json_output(&imported)["manifest"].clone();
+    let run_id = "550e8400-e29b-41d4-a716-446655440020";
+    insert_terminal_run(&state, run_id, &manifest);
+    register_and_check_observation_type(temporary.path(), &state, run_id);
+    submit_correction_and_retraction(temporary.path(), &state, run_id);
+
+    assert_observation_query_and_run_deletion(temporary.path(), &state, run_id);
+}
+
+fn register_and_check_observation_type(temporary: &Path, state: &Path, run_id: &str) {
+    let built_in = run_with_state(
+        state,
+        &["observation", "type", "get", "runlab/token_usage@v1"],
+    );
+    assert_success(&built_in);
+    let built_in = json_output(&built_in);
+    assert_eq!(built_in["observation_type"]["schema_version"], 1);
+    assert!(
+        built_in["observation_type"]["payload_schema"]["properties"]["cache_write_input_tokens"]
+            .is_object()
+    );
+
+    let definition_path = temporary.join("rubric-score-type.json");
+    let definition = json!({
+        "schema_version": 1,
+        "type": "example/rubric_score@v1",
+        "title": "Rubric score",
+        "description": "A score from zero through one produced by the declared rubric Method.",
+        "payload_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["score"],
+            "properties": {"score": {"type": "number", "minimum": 0, "maximum": 1}}
+        }
+    });
+    fs::write(
+        &definition_path,
+        serde_json::to_vec(&definition).expect("Type definition JSON"),
+    )
+    .expect("write Type definition");
+    let registered = run_with_state(
+        state,
+        &[
+            "observation",
+            "type",
+            "register",
+            "--document",
+            path(&definition_path),
+        ],
+    );
+    assert_success(&registered);
+    assert_eq!(json_output(&registered)["created"], true);
+    let retry = run_with_state(
+        state,
+        &[
+            "observation",
+            "type",
+            "register",
+            "--document",
+            path(&definition_path),
+        ],
+    );
+    assert_success(&retry);
+    assert_eq!(json_output(&retry)["created"], false);
+
+    let listed = run_with_state(state, &["observation", "type", "list"]);
+    assert_success(&listed);
+    assert_eq!(
+        json_output(&listed)["observation_types"]
+            .as_array()
+            .expect("Type list")
+            .len(),
+        2
+    );
+
+    let unknown_path = temporary.join("unknown-type-observation.json");
+    let mut unknown = rubric_observation("550e8400-e29b-41d4-a716-446655440021", run_id, 0.8, None);
+    unknown["type"] = Value::String("example/unknown@v1".to_owned());
+    fs::write(
+        &unknown_path,
+        serde_json::to_vec(&unknown).expect("unknown Type Observation"),
+    )
+    .expect("write unknown Type Observation");
+    let rejected = run_with_state(
+        state,
+        &["observation", "submit", "--document", path(&unknown_path)],
+    );
+    assert!(!rejected.status.success());
+    assert_eq!(
+        json_output_from_stderr(&rejected)["category"],
+        "invalid_input"
+    );
+
+    unknown["type"] = Value::String("example/rubric_score@v1".to_owned());
+    unknown["payload"]["score"] = json!(2);
+    fs::write(
+        &unknown_path,
+        serde_json::to_vec(&unknown).expect("invalid payload Observation"),
+    )
+    .expect("write invalid payload Observation");
+    let rejected = run_with_state(
+        state,
+        &["observation", "submit", "--document", path(&unknown_path)],
+    );
+    assert!(!rejected.status.success());
+    assert_eq!(
+        json_output_from_stderr(&rejected)["stage"],
+        "observation_input"
+    );
+}
+
+fn submit_correction_and_retraction(temporary: &Path, state: &Path, run_id: &str) {
+    let first_id = "550e8400-e29b-41d4-a716-446655440021";
+    let first_path = temporary.join("first-observation.json");
+    fs::write(
+        &first_path,
+        serde_json::to_vec(&rubric_observation(first_id, run_id, 0.8, None))
+            .expect("Observation JSON"),
+    )
+    .expect("write Observation");
+    let first = run_with_state(
+        state,
+        &["observation", "submit", "--document", path(&first_path)],
+    );
+    assert_success(&first);
+    assert_eq!(json_output(&first)["created"], true);
+    assert_eq!(
+        json_output(&first)["observation"]["observation_id"],
+        first_id
+    );
+
+    let retry = run_with_state(
+        state,
+        &["observation", "submit", "--document", path(&first_path)],
+    );
+    assert_success(&retry);
+    assert_eq!(json_output(&retry)["created"], false);
+
+    let replacement_id = "550e8400-e29b-41d4-a716-446655440022";
+    let replacement_path = temporary.join("replacement-observation.json");
+    fs::write(
+        &replacement_path,
+        serde_json::to_vec(&rubric_observation(
+            replacement_id,
+            run_id,
+            0.9,
+            Some(first_id),
+        ))
+        .expect("replacement JSON"),
+    )
+    .expect("write replacement");
+    assert_success(&run_with_state(
+        state,
+        &[
+            "observation",
+            "submit",
+            "--document",
+            path(&replacement_path),
+        ],
+    ));
+
+    let retraction_id = "550e8400-e29b-41d4-a716-446655440023";
+    let retraction_path = temporary.join("retraction.json");
+    fs::write(
+        &retraction_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "retraction_id": retraction_id,
+            "observation_id": replacement_id,
+            "reason": "the rubric Method configuration was later shown to be invalid",
+        }))
+        .expect("retraction JSON"),
+    )
+    .expect("write retraction");
+    let retracted = run_with_state(
+        state,
+        &[
+            "observation",
+            "retract",
+            "--document",
+            path(&retraction_path),
+        ],
+    );
+    assert_success(&retracted);
+    assert_eq!(json_output(&retracted)["created"], true);
+}
+
+fn assert_observation_query_and_run_deletion(temporary: &Path, state: &Path, run_id: &str) {
+    let query = run_with_state(
+        state,
+        &[
+            "query",
+            "run",
+            "SELECT observation_id, type, json_extract(payload, '$.score') AS score, state FROM observations ORDER BY observation_id",
+        ],
+    );
+    assert_success(&query);
+    let query = json_output(&query);
+    let rows = query["rows"].as_array().expect("Observation rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["state"], "superseded");
+    assert_eq!(rows[1]["state"], "retracted");
+    assert_eq!(rows[1]["type"], "example/rubric_score@v1");
+    assert_eq!(rows[1]["score"], 0.9);
+
+    let ids = temporary.join("run-ids.txt");
+    fs::write(&ids, format!("{run_id}\n")).expect("Run IDs");
+    let operation_id = "550e8400-e29b-41d4-a716-446655440024";
+    let checked = run_with_state(
+        state,
+        &[
+            "run",
+            "delete",
+            "check",
+            "--operation-id",
+            operation_id,
+            "--ids",
+            path(&ids),
+        ],
+    );
+    assert_success(&checked);
+    let plan = json_output(&checked);
+    assert_eq!(plan["schema_version"], 2);
+    assert_eq!(plan["candidates"][0]["observation_count"], 2);
+    assert!(
+        plan["candidates"][0]["observation_bytes"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+    let plan_path = temporary.join("delete-plan.json");
+    fs::write(&plan_path, &checked.stdout).expect("delete plan");
+    assert_success(&run_with_state(
+        state,
+        &["run", "delete", "apply", "--plan", path(&plan_path)],
+    ));
+    let after = run_with_state(
+        state,
+        &["query", "run", "SELECT COUNT(*) AS n FROM observations"],
+    );
+    assert_success(&after);
+    assert_eq!(json_output(&after)["rows"][0]["n"], 0);
+}
+
+fn rubric_observation(
+    observation_id: &str,
+    run_id: &str,
+    score: f64,
+    supersedes: Option<&str>,
+) -> Value {
+    let mut value = json!({
+        "schema_version": 1,
+        "observation_id": observation_id,
+        "run_id": run_id,
+        "type": "example/rubric_score@v1",
+        "method": {
+            "name": "example/rubric-grader",
+            "version": "1.0.0"
+        },
+        "payload": {"score": score}
+    });
+    if let Some(supersedes) = supersedes {
+        value["supersedes_observation_id"] = Value::String(supersedes.to_owned());
+    }
+    value
 }
 
 #[test]
@@ -631,7 +948,7 @@ fn run_delete_workflow_is_atomic_idempotent_and_shared_lease_compatible() {
     assert_eq!(plan["kind"], "run_delete_plan");
     assert_eq!(plan["eligible"], true);
     assert!(plan.get("plan_digest").is_none());
-    assert!(plan["candidate_record_bytes"].as_u64() > Some(0));
+    assert!(plan["candidate_asset_bytes"].as_u64() > Some(0));
     let catalog_finals = plan["candidates"][0]["catalog_final_images"]
         .as_array()
         .expect("Catalog Final Images");
@@ -742,7 +1059,12 @@ fn run_delete_workflow_is_atomic_idempotent_and_shared_lease_compatible() {
     );
     assert!(!reuse.status.success());
     let error: Value = serde_json::from_slice(&reuse.stderr).expect("structured error");
-    assert_eq!(error["category"], "conflict");
+    assert_eq!(
+        error["category"],
+        "conflict",
+        "unexpected reuse error: {}",
+        text(&reuse.stderr)
+    );
     assert_eq!(error["retryable"], false);
     assert!(
         error["message"]
@@ -2158,6 +2480,11 @@ fn assert_success(output: &Output) {
 fn json_output(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("invalid JSON: {error}; stdout={}", text(&output.stdout)))
+}
+
+fn json_output_from_stderr(output: &Output) -> Value {
+    serde_json::from_slice(&output.stderr)
+        .unwrap_or_else(|error| panic!("invalid JSON: {error}; stderr={}", text(&output.stderr)))
 }
 
 fn text(bytes: &[u8]) -> String {

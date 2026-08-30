@@ -6,8 +6,8 @@ use std::sync::Arc;
 use run_protocol::{EngineError, RunInput, RunOutput};
 
 use crate::{
-    CancellationToken, EngineObserver, OciContentStore, OperationTimeouts, RunEngine,
-    observer::IgnoreObserver,
+    CancellationToken, EngineEventSink, OciContentStore, OperationTimeouts, RunEngine,
+    live_event::IgnoreEventSink,
 };
 
 mod budget;
@@ -66,8 +66,8 @@ impl NativeEngine {
         self.timeouts
     }
 
-    fn execution_context(&self, observer: Arc<dyn EngineObserver>) -> ExecutionContext {
-        ExecutionContext::new(Arc::clone(&self.store), self.timeouts, observer)
+    fn execution_context(&self, event_sink: Arc<dyn EngineEventSink>) -> ExecutionContext {
+        ExecutionContext::new(Arc::clone(&self.store), self.timeouts, event_sink)
     }
 
     fn run_supervised(
@@ -75,7 +75,7 @@ impl NativeEngine {
         input: &RunInput,
         cancellation: &CancellationToken,
         supervisor: &InvocationSupervisor,
-        observer: Arc<dyn EngineObserver>,
+        event_sink: Arc<dyn EngineEventSink>,
     ) -> Result<RunOutput, EngineError> {
         let budget = OperationBudget::new(self.timeouts.preparation(), "NativeEngine preparation")
             .map_err(|error| EngineError::internal(format!("{error:#}")))?;
@@ -100,28 +100,28 @@ impl NativeEngine {
             },
         };
         execute(
-            &self.execution_context(observer),
+            &self.execution_context(event_sink),
             input,
             cancellation,
             &mut prepared,
         )
     }
 
-    /// Executes one invocation while reporting best-effort execution observations.
+    /// Executes one invocation while reporting best-effort Live Events.
     ///
-    /// The observer is invocation-scoped and does not affect the returned Run Protocol result.
+    /// The event sink is invocation-scoped and does not affect the returned Run Protocol result.
     ///
     /// # Errors
     ///
     /// Returns the same [`EngineError`] categories as [`RunEngine::run`].
-    pub fn run_observed(
+    pub fn run_with_events(
         &self,
         input: &RunInput,
         cancellation: &CancellationToken,
-        observer: Arc<dyn EngineObserver>,
+        event_sink: Arc<dyn EngineEventSink>,
     ) -> Result<RunOutput, EngineError> {
         let supervisor = InvocationSupervisor::new();
-        self.run_supervised(input, cancellation, &supervisor, observer)
+        self.run_supervised(input, cancellation, &supervisor, event_sink)
     }
 }
 
@@ -131,6 +131,6 @@ impl RunEngine for NativeEngine {
         input: RunInput,
         cancellation: CancellationToken,
     ) -> Result<RunOutput, EngineError> {
-        self.run_observed(&input, &cancellation, Arc::new(IgnoreObserver))
+        self.run_with_events(&input, &cancellation, Arc::new(IgnoreEventSink))
     }
 }

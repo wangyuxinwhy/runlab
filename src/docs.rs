@@ -52,6 +52,14 @@ const TOPICS: &[Topic] = &[
     },
     Topic {
         summary: TopicSummary {
+            name: "how-to/observe-runs",
+            title: "Observe Terminal Runs",
+            summary: "Submit, query, correct, and retract typed terminal Run Observations.",
+        },
+        content: include_str!("../docs/how-to/observe-runs.md"),
+    },
+    Topic {
+        summary: TopicSummary {
             name: "how-to/delete-runs",
             title: "Delete Terminal Runs",
             summary: "Select, preview, and permanently delete bounded terminal Run assets.",
@@ -95,11 +103,12 @@ mod tests {
     #[test]
     fn lists_and_gets_bundled_topics() {
         let topics = list();
-        assert_eq!(topics.len(), 4);
+        assert_eq!(topics.len(), 5);
         assert_eq!(topics[0].name, "start-here");
         assert_eq!(topics[1].name, "how-to/build-images");
         assert_eq!(topics[2].name, "how-to/query-runs");
-        assert_eq!(topics[3].name, "how-to/delete-runs");
+        assert_eq!(topics[3].name, "how-to/observe-runs");
+        assert_eq!(topics[4].name, "how-to/delete-runs");
         assert!(
             get("start-here")
                 .expect("start documentation")
@@ -123,6 +132,12 @@ mod tests {
                 .expect("Run query documentation")
                 .content
                 .contains("runlab schema get runs")
+        );
+        assert!(
+            get("how-to/observe-runs")
+                .expect("Run Observation documentation")
+                .content
+                .contains("A **Live Event** is an ephemeral NDJSON event")
         );
 
         let error = get("missing").expect_err("reject unknown topic");

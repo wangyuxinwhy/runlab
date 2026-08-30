@@ -1,6 +1,6 @@
 # Delete Terminal Runs
 
-Run deletion permanently removes complete terminal Run Records. It does not decide which Runs are expired, implement a TTL, delete only part of a record, erase OCI content, VACUUM SQLite, or claim secure erasure. The caller owns the retention judgment.
+Run deletion permanently removes complete terminal Run assets: the Run Record plus its Observation and retraction history. It does not decide which Runs are expired, implement a TTL, delete only part of a record, erase OCI content, VACUUM SQLite, or claim secure erasure. The caller owns the retention judgment.
 
 Accepted Runs cannot be deleted. Try `runlab run reconcile RUN_ID` first. A dead coordinator can sometimes be reconciled to a terminal interruption when durable evidence proves the Engine never started. A Run whose reconciliation outcome is `evidence_incomplete` remains accepted and has no deletion override.
 
@@ -44,7 +44,7 @@ runlab run delete check \
   --ids run-ids.txt >delete-plan.json
 ```
 
-`check` writes every candidate's exact `terminal_at`, logical record bytes, and database record fingerprint. It also reports every Program Final Image that is still named by the Catalog; deletion is allowed, but the Catalog Image will no longer have this Run provenance link.
+`check` writes every candidate's exact `terminal_at`, Run Record bytes, Observation count and bytes, total asset bytes, and asset fingerprint. It also reports every Program Final Image that is still named by the Catalog; deletion is allowed, but the Catalog Image will no longer have this Run provenance link.
 
 `not_terminal` and `not_found` make the plan ineligible. A `not_terminal` entry includes the exact `runlab run reconcile RUN_ID` recovery command. `already_deleted` is non-blocking and is excluded from the candidate set so rerunning the complete ID workflow converges.
 
@@ -56,7 +56,7 @@ The plan has no aggregate digest. JSON parsing rejects truncation, and apply ver
 runlab run delete apply --plan delete-plan.json
 ```
 
-Apply takes the normal shared State lease and a short `BEGIN IMMEDIATE` SQLite transaction. It recomputes every candidate fingerprint, inserts tombstones, and deletes the complete batch or none of it. A concurrent database writer can return a retryable `conflict`; retry the same plan and operation ID. If commit succeeded but stdout was lost, the retry returns `already_applied`.
+Apply takes the normal shared State lease and a short `BEGIN IMMEDIATE` SQLite transaction. It recomputes every Run-plus-Observation asset fingerprint, inserts tombstones, and deletes the complete batch or none of it. An Observation submitted, corrected, or retracted after check makes the plan stale. A concurrent database writer can return a retryable `conflict`; retry the same plan and operation ID. If commit succeeded but stdout was lost, the retry returns `already_applied`.
 
 For a direct pipe when a separate plan artifact is unnecessary:
 

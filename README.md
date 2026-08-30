@@ -1,6 +1,18 @@
 # RunLab
 
-RunLab executes programs from OCI Images. `run start` preserves an execution as a local Run asset; `exec` performs the same protocol invocation for immediate observation without creating a Run.
+RunLab executes programs from OCI Images. `run start` preserves an execution as a local Run asset; `exec` performs the same protocol invocation for immediate inspection without creating a Run.
+
+[Documentation](https://wangyuxinwhy.github.io/runlab/) · [Start Here](https://wangyuxinwhy.github.io/runlab/start-here) · [Releases](https://github.com/wangyuxinwhy/runlab/releases)
+
+## Install
+
+On macOS, use the GitHub Release installer because the complete bundle includes the same-version Linux RunLab binary and `runc` required by the Managed VM. On Linux, the same installer provides a prebuilt binary; Rust users can also install from crates.io:
+
+```bash
+cargo install runlab --version 0.1.0 --locked
+```
+
+See the [installation guide](https://wangyuxinwhy.github.io/runlab/how-to/install) for the verified installer, platform prerequisites, and Managed VM setup.
 
 The repository is a Rust workspace with exactly three packages:
 
@@ -14,7 +26,7 @@ runlab -> run_engine -> run_protocol
 - `run_engine` executes the protocol. Its current implementation is the Linux `NativeEngine` backed by `runc`.
 - `runlab` owns the local OCI content store, Image catalog, Run records, and command-line product surface.
 
-Settled design is maintained in the [RunLab Agent Wiki](http://localhost:8787/app/pages/runlab-index--nw). This README describes only the implemented repository surface.
+Versioned product, protocol, and architecture contracts are published with the [RunLab design documentation](https://wangyuxinwhy.github.io/runlab/design/). This README describes the implemented repository surface.
 
 ## Commands
 
@@ -27,7 +39,9 @@ runlab image get
 runlab image export
 runlab filesystem get
 runlab filesystem changes
+runlab observation type register|list|get
 runlab exec
+runlab observation submit|retract
 runlab run config generate
 runlab run start
 runlab run cancel
@@ -47,6 +61,7 @@ runlab docs list
 runlab docs get how-to/build-images
 runlab docs get how-to/query-runs
 runlab docs get how-to/delete-runs
+runlab docs get how-to/observe-runs
 ```
 
 `docs get` writes Markdown by default; `--output json` returns the same document in a compact JSON envelope. The bundled guides cover standard OCI Image authoring and bounded read-only Run queries.
@@ -69,7 +84,7 @@ Input files cross the VM boundary as explicit bytes and are checked by size and 
 
 An explicit macOS Runtime Configuration can bind-mount a local regular file or directory when the mount contains the OCI `ro` option. RunLab stages the source into the VM and maps it back to the unchanged absolute source path inside the execution unit's private mount namespace, so the exact caller JSON remains the Run Protocol input and persisted Run fact. Writable Host bind mounts are rejected before acceptance because silently discarding their writes would violate OCI bind-mount semantics.
 
-Command failures write one JSON object to stderr with `kind: "runlab.error"`, a stable category and stage, optional Run identity, explicit acceptance and creation facts when known, retryability, and an optional recovery command. A `null` acceptance fact means RunLab could not prove the state, not `false`. Program stdout/stderr observations remain NDJSON events and are not converted into command errors.
+Command failures write one JSON object to stderr with `kind: "runlab.error"`, a stable category and stage, optional Run identity, explicit acceptance and creation facts when known, retryability, and an optional recovery command. A `null` acceptance fact means RunLab could not prove the state, not `false`. Program stdout/stderr Live Events are not converted into command errors.
 
 Image building and registry transport belong to external OCI tools. `image import` accepts a standard OCI Image Layout directory or an uncompressed tar archive containing one Image Manifest.
 
@@ -108,7 +123,7 @@ jq '.process.args = ["python", "-m", "agent"]' base-config.json >config.json
 
 The generated configuration always creates a new network namespace and is compatible with both Run network modes. Network policy is not an OCI Runtime Configuration field.
 
-`exec` is the non-persistent execution surface. It resolves the same Image, Runtime Configuration, stdin, Secrets, timeout, and network controls as `run start`, but it has no `run_id` or metadata, does not insert a Run record, and asks the Engine not to capture a Final Environment. Program and external side effects are real, so it is useful for preflight inspection and Observation but is not a dry run:
+`exec` is the non-persistent execution surface. It resolves the same Image, Runtime Configuration, stdin, Secrets, timeout, and network controls as `run start`, but it has no `run_id` or metadata, does not insert a Run record, and asks the Engine not to capture a Final Environment. Program and external side effects are real, so it is useful for preflight inspection but is not a dry run:
 
 ```bash
 $runlab --state "$state" exec \
@@ -118,7 +133,7 @@ $runlab --state "$state" exec \
   --network isolated >execution.json
 ```
 
-stderr uses the same NDJSON observation event shapes as `run start`, beginning with `{"kind":"run.stream","schema_version":1,"run_id":null}`. stdout contains the complete bounded `RunOutput` or `EngineError`, including retained stdout and stderr, because there is no later `run get`. The Final Environment field is explicitly `not_requested`.
+stderr uses the same NDJSON Live Event shapes as `run start`, beginning with `{"kind":"run.stream","schema_version":1,"run_id":null}`. stdout contains the complete bounded `RunOutput` or `EngineError`, including retained stdout and stderr, because there is no later `run get`. The Final Environment field is explicitly `not_requested`.
 
 `run start` is Linux-only and requires `runc`. The caller supplies a canonical lowercase UUID v4 and an imported Image. When `--runtime-config` is omitted, RunLab uses the same bytes produced by `run config generate`:
 
@@ -151,19 +166,21 @@ $runlab --state "$state" query run \
 
 The same Run identity, semantically identical input, and identical accepted caller facts make `run start` idempotent. Reusing the identity with a different input, Initial Image name, or metadata fails.
 
-Without `--detach`, `run start` streams observations and waits for its terminal summary. With `--detach`, RunLab waits only until acceptance is observable, then returns the Run ID and recovery command while an independent Coordinator continues. Use `run get` or `query run` for subsequent observation; detached submission deliberately has no terminal-bound Program stream.
+Without `--detach`, `run start` streams Live Events and waits for its terminal summary. With `--detach`, RunLab waits only until acceptance is visible, then returns the Run ID and recovery command while an independent Coordinator continues. Use `run get` or `query run` for subsequent inspection; detached submission deliberately has no terminal-bound Program stream.
 
 `run cancel RUN_ID` idempotently persists a cancellation request for a non-terminal Run. Its success confirms that the request is stored, not that the Program has already stopped. `run get RUN_ID` exposes `cancellation_requested_at`; the final `RunOutput` remains the source of truth for `cancelled`, stop actions, and the process result. A terminal Run is returned unchanged.
 
 `--secret-env NAME` reads one variable from the caller environment. `--secret-file HOST_FILE=CONTAINER_PATH` reads one host file and exposes its exact bytes as a read-only regular file during execution. Secret values are part of the in-memory Run Protocol input, but RunLab does not serialize them from the Secret fields into the public Run record or Final Environment. A Program can still disclose a Secret by writing it to stdout, stderr, or its writable filesystem.
 
-While `run start` is active, stderr emits an NDJSON observation stream beginning with `run.stream`, followed by `run.stage`, `program.stdout`, and `program.stderr` records as those observations occur. Its stdout remains reserved for one compact final JSON result containing the Run identity, lifecycle, execution facts, process results, final environments, and errors. It does not repeat the exact input or captured stdout/stderr. Use `run get RUN_ID` when the complete persisted Run record is required.
+While `run start` is active, stderr emits an NDJSON Live Event stream beginning with `run.stream`, followed by `run.stage`, `program.stdout`, and `program.stderr` events. Its stdout remains reserved for one compact final JSON result containing the Run identity, lifecycle, execution facts, process results, final environments, and errors. It does not repeat the exact input or captured stdout/stderr. Use `run get RUN_ID` when the complete persisted Run record is required.
+
+A Live Event is ephemeral execution progress. A persistent Observation is a separate, immutable typed record appended to a terminal Run by an external Method. Observation Types are immutable registered contracts; built-in and external Types use the same JSON Schema validation, generic `observations` query path, correction rules, and retraction history. Start with `runlab docs get how-to/observe-runs` for the exact JSON contracts and workflow.
 
 For a foreground `exec`, `SIGINT` and `SIGTERM` cancel the current synchronous Engine invocation; no temporary public identity or follow-up command is created. `--state` can be replaced by `RUNLAB_STATE`. Otherwise RunLab uses `$XDG_DATA_HOME/runlab` or `$HOME/.local/share/runlab`.
 
 `storage status` reports filesystem capacity, State component allocation, immutable asset references, missing referenced content, and safely reclaimable bytes. `storage prune check` reports the same facts without mutation and supports `--without-runs FILE` for a hypothetical terminal-Run root set. `storage prune apply` requires exclusive State access, fails closed when the reference graph is incomplete, and removes only unreferenced OCI blobs, unreachable snapshot cache entries, and stale invocation staging. Snapshot removal turns subsequent execution timing into cold-cache evidence.
 
-Terminal Run assets are deleted separately with `run delete check --operation-id UUID --ids FILE` followed by `run delete apply --plan FILE`. The plan freezes a bounded database selection; apply is atomic and retryable by operation identity. Tombstones permanently prevent reuse of deleted Run UUIDs and remain queryable through `run_deletions`. Run deletion does not delete OCI content, does not VACUUM SQLite, and is storage lifecycle deletion rather than secure erasure. See `runlab docs get how-to/delete-runs`.
+Terminal Run assets are deleted separately with `run delete check --operation-id UUID --ids FILE` followed by `run delete apply --plan FILE`. The plan freezes each Run Record and its Observation history; any intervening Observation submission or retraction makes the plan stale. Apply is atomic and retryable by operation identity. Tombstones permanently prevent reuse of deleted Run UUIDs and remain queryable through `run_deletions`. Run deletion does not delete OCI content, does not VACUUM SQLite, and is storage lifecycle deletion rather than secure erasure. See `runlab docs get how-to/delete-runs`.
 
 `assets.active_runs` counts Runs for which no terminal completion has been published. It is a persistent lifecycle count, not proof that a Coordinator or Program process is currently alive. `run reconcile RUN_ID` consults the private execution journal: it can publish a durably staged Engine result, or publish `interrupted` when the recorded owner is dead and the journal proves the Engine was never started. Once the Engine has started, the Run remains accepted with `evidence_incomplete` unless safe resource cleanup or an Engine result has been proved.
 
@@ -174,9 +191,12 @@ Terminal Run assets are deleted separately with `run delete check --operation-id
 ```bash
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo +1.95.0 check --workspace --all-targets --locked
-cargo package -p run_protocol --no-verify --locked
+npm ci
+npm run docs:check
+scripts/verify-packages.sh
+scripts/test-installer.sh --dist-root DIST --version VERSION
 ```
 
-Package dependents can be checked in publication order after `run_protocol 0.1.0` is available from the target registry. Linux completion additionally runs `scripts/verify-linux.sh` as root with `RUNLAB_NATIVE_E2E_OCI_LAYOUT` set to a deterministic OCI fixture; the gate fails unless all six opt-in real-`runc` scenarios actually run.
+`verify-packages.sh` verifies all three normalized Cargo packages before any registry publication. Linux completion additionally runs `scripts/verify-linux.sh` as root with `RUNLAB_NATIVE_E2E_OCI_LAYOUT` set to a small, digest-pinned Alpine OCI fixture that provides the commands used by the tests; the gate fails unless all six opt-in real-`runc` scenarios actually run.

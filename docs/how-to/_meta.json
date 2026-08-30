@@ -1,0 +1,7 @@
+[
+  "install",
+  "build-images",
+  "query-runs",
+  "observe-runs",
+  "delete-runs"
+]

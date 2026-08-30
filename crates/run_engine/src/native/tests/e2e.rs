@@ -20,7 +20,7 @@ use rustix::process::geteuid;
 use super::fixtures::*;
 use crate::native::network::HOST_ADDRESS;
 use crate::{
-    CancellationToken, EngineObserver, NativeEngine, OperationTimeouts, ProgramStream, RunEngine,
+    CancellationToken, EngineEventSink, NativeEngine, OperationTimeouts, ProgramStream, RunEngine,
     STOP_GRACE_PERIOD,
 };
 
@@ -406,7 +406,7 @@ fn real_runc_termination_timeout_and_cancellation() {
         None,
     );
     let cancellation_output = engine
-        .run_observed(
+        .run_with_events(
             &cancellation_input,
             &cancellation,
             Arc::new(CancelOnPrimaryOutput {
@@ -821,7 +821,7 @@ struct CancelOnPrimaryOutput {
     cancellation: CancellationToken,
 }
 
-impl EngineObserver for CancelOnPrimaryOutput {
+impl EngineEventSink for CancelOnPrimaryOutput {
     fn program_output(
         &self,
         program_id: &ProgramId,
