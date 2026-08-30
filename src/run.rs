@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::env;
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::num::NonZeroU64;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -753,7 +757,9 @@ fn run_with_events(
 
 #[cfg(target_os = "linux")]
 fn native_engine(state: &State) -> Result<run_engine::NativeEngine> {
-    let runc = executable_in_path("runc")?;
+    let current_executable =
+        env::current_exe().context("failed to locate the RunLab executable")?;
+    let runc = resolve_runc(&current_executable, env::var_os("PATH").as_deref())?;
     Ok(run_engine::NativeEngine::new(
         state.oci(),
         state.engine_workspace(),
@@ -763,9 +769,22 @@ fn native_engine(state: &State) -> Result<run_engine::NativeEngine> {
 }
 
 #[cfg(target_os = "linux")]
-fn executable_in_path(name: &str) -> Result<PathBuf> {
-    let path = env::var_os("PATH").context("PATH is not set")?;
-    for directory in env::split_paths(&path) {
+fn resolve_runc(current_executable: &Path, search_path: Option<&OsStr>) -> Result<PathBuf> {
+    let directory = current_executable
+        .parent()
+        .context("RunLab executable has no parent directory")?;
+    let bundled = directory.join("runlab-runc");
+    if bundled.is_file() {
+        return fs::canonicalize(&bundled)
+            .with_context(|| format!("failed to resolve bundled runc {}", bundled.display()));
+    }
+    executable_in_path("runc", search_path)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_in_path(name: &str, search_path: Option<&OsStr>) -> Result<PathBuf> {
+    let path = search_path.context("PATH is not set")?;
+    for directory in env::split_paths(path) {
         let candidate = directory.join(name);
         if candidate.is_file() {
             return fs::canonicalize(&candidate)
@@ -908,6 +927,47 @@ impl SignalCancellation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bundled_runc_takes_precedence_over_path() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let installed = root.path().join("installed");
+        let fallback = root.path().join("fallback");
+        fs::create_dir_all(&installed).expect("installed directory");
+        fs::create_dir_all(&fallback).expect("fallback directory");
+        let executable = installed.join("runlab");
+        let bundled = installed.join("runlab-runc");
+        fs::write(&executable, b"runlab").expect("RunLab fixture");
+        fs::write(&bundled, b"bundled").expect("bundled runc fixture");
+        fs::write(fallback.join("runc"), b"fallback").expect("PATH runc fixture");
+        let search_path = env::join_paths([fallback]).expect("search path");
+
+        assert_eq!(
+            resolve_runc(&executable, Some(&search_path)).expect("resolved runc"),
+            fs::canonicalize(bundled).expect("canonical bundled runc")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn path_runc_remains_the_source_build_fallback() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let installed = root.path().join("installed");
+        let fallback = root.path().join("fallback");
+        fs::create_dir_all(&installed).expect("installed directory");
+        fs::create_dir_all(&fallback).expect("fallback directory");
+        let executable = installed.join("runlab");
+        let fallback_runc = fallback.join("runc");
+        fs::write(&executable, b"runlab").expect("RunLab fixture");
+        fs::write(&fallback_runc, b"fallback").expect("PATH runc fixture");
+        let search_path = env::join_paths([fallback]).expect("search path");
+
+        assert_eq!(
+            resolve_runc(&executable, Some(&search_path)).expect("resolved runc"),
+            fs::canonicalize(fallback_runc).expect("canonical PATH runc")
+        );
+    }
 
     #[test]
     fn persisted_input_redacts_secret_bytes_but_identity_distinguishes_them() {

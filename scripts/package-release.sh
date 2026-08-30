@@ -61,24 +61,32 @@ install -m 0644 "$repository_root/THIRD_PARTY_NOTICES.md" "$staging_root/THIRD_P
 
 archive_entries=(LICENSE THIRD_PARTY_NOTICES.md runlab)
 case "$target" in
-    aarch64-apple-darwin) bundle_architecture="aarch64" ;;
-    x86_64-apple-darwin) bundle_architecture="x86_64" ;;
-    aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu) bundle_architecture="" ;;
+    aarch64-apple-darwin) platform="macos"; bundle_architecture="aarch64" ;;
+    x86_64-apple-darwin) platform="macos"; bundle_architecture="x86_64" ;;
+    aarch64-unknown-linux-gnu) platform="linux"; bundle_architecture="aarch64" ;;
+    x86_64-unknown-linux-gnu) platform="linux"; bundle_architecture="x86_64" ;;
     *) fail "unsupported release target: $target" ;;
 esac
 
-if [[ -n "$bundle_architecture" ]]; then
-    for required_file in "$guest_binary" "$runc_binary" "$runc_license" "$runc_notice"; do
-        [[ -f "$required_file" ]] || fail "macOS bundle input is missing: $required_file"
-    done
+[[ -x "$runc_binary" ]] || fail "pinned runc binary is missing or not executable: $runc_binary"
+for required_file in "$runc_license" "$runc_notice"; do
+    [[ -f "$required_file" ]] || fail "pinned runc input is missing: $required_file"
+done
+install -m 0644 "$runc_license" "$staging_root/RUNC-LICENSE"
+install -m 0644 "$runc_notice" "$staging_root/RUNC-NOTICE"
+archive_entries+=(RUNC-LICENSE RUNC-NOTICE)
+
+if [[ "$platform" == "macos" ]]; then
+    [[ -f "$guest_binary" ]] || fail "macOS guest binary is missing: $guest_binary"
     install -m 0755 "$guest_binary" "$staging_root/runlab-linux-$bundle_architecture"
     install -m 0755 "$runc_binary" "$staging_root/runc-linux-$bundle_architecture"
-    install -m 0644 "$runc_license" "$staging_root/RUNC-LICENSE"
-    install -m 0644 "$runc_notice" "$staging_root/RUNC-NOTICE"
-    archive_entries+=(RUNC-LICENSE RUNC-NOTICE "runlab-linux-$bundle_architecture" "runc-linux-$bundle_architecture")
+    archive_entries+=("runlab-linux-$bundle_architecture" "runc-linux-$bundle_architecture")
 else
-    [[ -z "$guest_binary$runc_binary$runc_license$runc_notice" ]] ||
-        fail "Linux release archives do not accept managed-VM bundle inputs"
+    if [[ -n "$guest_binary" ]]; then
+        fail "Linux release archives do not accept a Managed VM guest binary"
+    fi
+    install -m 0755 "$runc_binary" "$staging_root/runlab-runc"
+    archive_entries+=(runlab-runc)
 fi
 
 version_directory="$output_root/v$version"

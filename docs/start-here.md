@@ -77,7 +77,11 @@ Secrets are read from the caller and are not retained through their Secret field
 Generate a lowercase UUID v4, then start one persistent Run:
 
 ```bash
-run_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+if command -v uuidgen >/dev/null 2>&1; then
+  run_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+else
+  run_id=$(cat /proc/sys/kernel/random/uuid)
+fi
 
 runlab run start \
   --id "$run_id" \
@@ -86,6 +90,8 @@ runlab run start \
   --description 'runtime smoke' \
   --label purpose=smoke
 ```
+
+On Debian and Ubuntu, `uuidgen` is available from the `uuid-runtime` package. The fallback uses the Linux kernel interface; the caller still owns the ID and must reuse it when retrying the same Run.
 
 By default the command waits for the Engine to return. stderr streams Live Events while stdout receives one bounded terminal summary. The Run is accepted before execution and remains queryable even when execution fails. Reusing the same ID is idempotent only for the same input and metadata.
 

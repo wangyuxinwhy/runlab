@@ -37,12 +37,18 @@ This is a read-only hypothetical calculation. It excludes only existing terminal
 Create one canonical UUID v4 for the deletion intent. The caller owns this `operation_id` and must reuse it when retrying the same intent:
 
 ```bash
-operation_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+if command -v uuidgen >/dev/null 2>&1; then
+  operation_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+else
+  operation_id=$(cat /proc/sys/kernel/random/uuid)
+fi
 
 runlab run delete check \
   --operation-id "$operation_id" \
   --ids run-ids.txt >delete-plan.json
 ```
+
+On Debian and Ubuntu, `uuidgen` is available from the `uuid-runtime` package. The fallback uses the Linux kernel interface.
 
 `check` writes every candidate's exact `terminal_at`, Run Record bytes, Observation count and bytes, total asset bytes, and asset fingerprint. It also reports every Program Final Image that is still named by the Catalog; deletion is allowed, but the Catalog Image will no longer have this Run provenance link.
 
