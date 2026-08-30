@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
@@ -9,10 +9,13 @@ use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
+use super::config::{
+    LimaConfig, ResolvedVmShare, VmShareDocument, configured_document, edit_expression,
+    normalize_document, profile_problems, profile_value, resolved_shares,
+};
 use super::{GuestHandshake, TRANSPORT_VERSION};
 
 pub(super) const INSTANCE: &str = "runlab";
@@ -52,6 +55,7 @@ pub(crate) struct VmStatus {
     disk_used_bytes: Option<u64>,
     disk_available_bytes: Option<u64>,
     host_mounts: Option<usize>,
+    shares: Option<Vec<ResolvedVmShare>>,
     image: Option<VmImage>,
     ready: bool,
     readiness_problems: Vec<String>,
@@ -67,6 +71,28 @@ pub(crate) struct VmInstallResult {
     runc: InstalledFile,
     guest: GuestHandshake,
     runtime: RuntimeProfile,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct VmConfigCheck {
+    schema_version: u32,
+    instance: &'static str,
+    applicable: bool,
+    changes_required: bool,
+    problems: Vec<String>,
+    warnings: Vec<String>,
+    configuration: VmShareDocument,
+    shares: Vec<ResolvedVmShare>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct VmConfigApply {
+    schema_version: u32,
+    instance: &'static str,
+    changed: bool,
+    configuration: VmShareDocument,
+    shares: Vec<ResolvedVmShare>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,7 +142,7 @@ pub(super) struct FileIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct VmImage {
+pub(super) struct VmImage {
     location: String,
     arch: String,
     digest: Option<String>,
@@ -125,26 +151,18 @@ struct VmImage {
 }
 
 #[derive(Debug, Deserialize)]
-struct LimaInstance {
-    name: String,
-    status: String,
+pub(super) struct LimaInstance {
+    pub(super) name: String,
+    pub(super) status: String,
     #[serde(rename = "vmType")]
-    vm_type: String,
-    arch: String,
-    cpus: u16,
-    memory: u64,
-    disk: u64,
+    pub(super) vm_type: String,
+    pub(super) arch: String,
+    pub(super) cpus: u16,
+    pub(super) memory: u64,
+    pub(super) disk: u64,
     #[serde(rename = "limaVersion")]
-    lima_version: String,
-    config: LimaConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct LimaConfig {
-    plain: bool,
-    #[serde(default)]
-    mounts: Vec<Value>,
-    images: Vec<VmImage>,
+    pub(super) lima_version: String,
+    pub(super) config: LimaConfig,
 }
 
 impl ManagedVm {
@@ -163,6 +181,9 @@ impl ManagedVm {
             match self.installed_guest() {
                 Ok((guest, runtime)) => {
                     status.readiness_problems = runtime.problems();
+                    status
+                        .readiness_problems
+                        .extend(self.share_mount_problems(status.shares.as_deref().unwrap_or(&[])));
                     match self.disk_capacity() {
                         Ok((used, available)) => {
                             status.disk_used_bytes = Some(used);
@@ -210,7 +231,6 @@ impl ManagedVm {
                 "create",
                 "--name",
                 INSTANCE,
-                "--plain",
                 "--vm-type",
                 "vz",
                 "--arch",
@@ -265,7 +285,7 @@ impl ManagedVm {
         let instance = self
             .instance()?
             .context("managed VM does not exist; run `runlab vm create`")?;
-        ensure_compatible(&instance, &lima_version)?;
+        ensure_core_compatible(&instance, &lima_version)?;
         if !instance.status.eq_ignore_ascii_case("stopped") {
             self.run(["--tty=false", "stop", INSTANCE])?;
         }
@@ -275,6 +295,89 @@ impl ManagedVm {
             "managed VM did not reach stopped state"
         );
         Ok(status)
+    }
+
+    pub(crate) fn config_get(&self) -> Result<VmShareDocument> {
+        let lima_version = self.lima_version()?;
+        let instance = self
+            .instance()?
+            .context("managed VM does not exist; run `runlab vm create`")?;
+        ensure_core_compatible(&instance, &lima_version)?;
+        configured_document(&instance.config)
+            .context("managed VM share configuration is incompatible")
+    }
+
+    pub(crate) fn config_check(&self, document: VmShareDocument) -> Result<VmConfigCheck> {
+        let (document, warnings) = normalize_document(document)?;
+        let shares = resolved_shares(&document);
+        let lima_version = self.lima_version()?;
+        let instance = self
+            .instance()?
+            .context("managed VM does not exist; run `runlab vm create`")?;
+        let mut problems = core_compatibility_problems(&instance, &lima_version);
+        let changes_required = !profile_problems(&instance.config, Some(&document)).is_empty();
+        if !instance.status.eq_ignore_ascii_case("stopped") {
+            problems.push(
+                "managed VM must be stopped before configuration can be applied; run `runlab vm stop`"
+                    .to_owned(),
+            );
+        }
+        Ok(VmConfigCheck {
+            schema_version: 1,
+            instance: INSTANCE,
+            applicable: problems.is_empty(),
+            changes_required,
+            problems,
+            warnings,
+            configuration: document,
+            shares,
+        })
+    }
+
+    pub(crate) fn config_apply(&self, document: VmShareDocument) -> Result<VmConfigApply> {
+        let (document, warnings) = normalize_document(document)?;
+        let lima_version = self.lima_version()?;
+        let instance = self
+            .instance()?
+            .context("managed VM does not exist; run `runlab vm create`")?;
+        ensure_core_compatible(&instance, &lima_version)?;
+        ensure!(
+            instance.status.eq_ignore_ascii_case("stopped"),
+            "managed VM must be stopped before configuration can be applied; run `runlab vm stop`"
+        );
+        let changed = !profile_problems(&instance.config, Some(&document)).is_empty();
+        if changed {
+            let expression = edit_expression(&document)?;
+            self.run_dynamic([
+                OsString::from("--tty=false"),
+                OsString::from("edit"),
+                OsString::from("--set"),
+                OsString::from(expression),
+                OsString::from(INSTANCE),
+            ])?;
+            let updated = self
+                .instance()?
+                .context("managed VM disappeared while applying configuration")?;
+            ensure_core_compatible(&updated, &lima_version)?;
+            let problems = profile_problems(&updated.config, Some(&document));
+            ensure!(
+                problems.is_empty(),
+                "managed VM configuration was modified, but its effective profile is incompatible: {}; inspect `runlab vm status`, remove external Lima overrides, then reapply the complete document",
+                problems.join("; ")
+            );
+        }
+        Ok(VmConfigApply {
+            schema_version: 1,
+            instance: INSTANCE,
+            changed,
+            shares: resolved_shares(&document),
+            configuration: document,
+            warnings,
+        })
+    }
+
+    pub(super) fn resolved_shares(&self) -> Result<Vec<ResolvedVmShare>> {
+        Ok(resolved_shares(&self.config_get()?))
     }
 
     pub(crate) fn install(&self) -> Result<VmInstallResult> {
@@ -401,6 +504,11 @@ impl ManagedVm {
     pub(super) fn ensure_ready(&self) -> Result<()> {
         let status = self.status()?;
         ensure!(
+            status.compatible,
+            "managed VM profile is incompatible: {}; run `runlab vm stop`, then apply a complete share document with `runlab vm config apply --document FILE`",
+            status.problems.join("; ")
+        );
+        ensure!(
             status.ready,
             "managed VM is not ready: {}; run `runlab vm start` and `runlab vm install`",
             status.readiness_problems.join("; ")
@@ -499,6 +607,54 @@ impl ManagedVm {
         Ok((*used, *available))
     }
 
+    fn share_mount_problems(&self, shares: &[ResolvedVmShare]) -> Vec<String> {
+        let mut problems = Vec::new();
+        for share in shares {
+            let output = self.guest_output([
+                "/usr/bin/findmnt",
+                "--noheadings",
+                "--mountpoint",
+                &share.guest_path,
+                "--output",
+                "FSTYPE,OPTIONS",
+            ]);
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    problems.push(format!(
+                        "share {} is not mounted at {}: {error:#}",
+                        share.name, share.guest_path
+                    ));
+                    continue;
+                }
+            };
+            let text = match std::str::from_utf8(&output.stdout) {
+                Ok(text) => text.trim(),
+                Err(error) => {
+                    problems.push(format!(
+                        "share {} mount facts are not UTF-8: {error}",
+                        share.name
+                    ));
+                    continue;
+                }
+            };
+            let mut fields = text.split_whitespace();
+            let filesystem = fields.next();
+            let options = fields.next();
+            let read_only = options.is_some_and(|options| {
+                options.split(',').any(|option| option == "ro")
+                    && !options.split(',').any(|option| option == "rw")
+            });
+            if filesystem != Some("virtiofs") || !read_only || fields.next().is_some() {
+                problems.push(format!(
+                    "share {} must be an exact read-only virtiofs mount at {}; found {text:?}",
+                    share.name, share.guest_path
+                ));
+            }
+        }
+        problems
+    }
+
     fn guest_executable(&self, candidates: &[&str]) -> bool {
         for candidate in candidates {
             if self.guest_test(["-x", candidate]) {
@@ -594,7 +750,7 @@ impl ManagedVm {
         Ok(output)
     }
 
-    fn lima_version(&self) -> Result<String> {
+    pub(super) fn lima_version(&self) -> Result<String> {
         let output = self.run(["--version"])?;
         let value = std::str::from_utf8(&output.stdout)
             .context("limactl version output is not UTF-8")?
@@ -609,7 +765,7 @@ impl ManagedVm {
         Ok(value)
     }
 
-    fn instance(&self) -> Result<Option<LimaInstance>> {
+    pub(super) fn instance(&self) -> Result<Option<LimaInstance>> {
         let output = self.run(["list", "--json"])?;
         let mut found = None;
         for line in output.stdout.split(|byte| *byte == b'\n') {
@@ -629,6 +785,19 @@ impl ManagedVm {
     }
 
     fn run<const N: usize>(&self, arguments: [&str; N]) -> Result<Output> {
+        let output = Command::new(&self.limactl)
+            .args(arguments)
+            .output()
+            .with_context(|| format!("failed to run {}", self.limactl.display()))?;
+        ensure_success(&output, "limactl")?;
+        Ok(output)
+    }
+
+    fn run_dynamic<I, S>(&self, arguments: I) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let output = Command::new(&self.limactl)
             .args(arguments)
             .output()
@@ -663,6 +832,7 @@ fn status_from(instance: Option<&LimaInstance>, lima_version: String) -> VmStatu
             disk_used_bytes: None,
             disk_available_bytes: None,
             host_mounts: None,
+            shares: None,
             image: None,
             ready: false,
             readiness_problems: Vec::new(),
@@ -671,6 +841,9 @@ fn status_from(instance: Option<&LimaInstance>, lima_version: String) -> VmStatu
         };
     };
     let problems = compatibility_problems(instance, &lima_version);
+    let shares = configured_document(&instance.config)
+        .ok()
+        .map(|document| resolved_shares(&document));
     VmStatus {
         schema_version: 1,
         instance: INSTANCE,
@@ -686,6 +859,7 @@ fn status_from(instance: Option<&LimaInstance>, lima_version: String) -> VmStatu
         disk_used_bytes: None,
         disk_available_bytes: None,
         host_mounts: Some(instance.config.mounts.len()),
+        shares,
         image: instance.config.images.first().cloned(),
         ready: false,
         readiness_problems: Vec::new(),
@@ -699,10 +873,30 @@ fn ensure_compatible(instance: &LimaInstance, lima_version: &str) -> Result<()> 
     if problems.is_empty() {
         return Ok(());
     }
+    if core_compatibility_problems(instance, lima_version).is_empty() {
+        bail!(
+            "managed VM profile is incompatible: {}; run `runlab vm stop`, then apply a complete share document with `runlab vm config apply --document FILE`",
+            problems.join("; ")
+        );
+    }
+    bail!("managed VM is incompatible: {}", problems.join("; "))
+}
+
+fn ensure_core_compatible(instance: &LimaInstance, lima_version: &str) -> Result<()> {
+    let problems = core_compatibility_problems(instance, lima_version);
+    if problems.is_empty() {
+        return Ok(());
+    }
     bail!("managed VM is incompatible: {}", problems.join("; "))
 }
 
 fn compatibility_problems(instance: &LimaInstance, lima_version: &str) -> Vec<String> {
+    let mut problems = core_compatibility_problems(instance, lima_version);
+    problems.extend(profile_problems(&instance.config, None));
+    problems
+}
+
+fn core_compatibility_problems(instance: &LimaInstance, lima_version: &str) -> Vec<String> {
     let mut problems = Vec::new();
     if lima_version != LIMA_VERSION || instance.lima_version != LIMA_VERSION {
         problems.push(format!("Lima must be {LIMA_VERSION}"));
@@ -716,12 +910,6 @@ fn compatibility_problems(instance: &LimaInstance, lima_version: &str) -> Vec<St
         }
         Err(error) => problems.push(error.to_string()),
         _ => {}
-    }
-    if !instance.config.plain {
-        problems.push("Lima plain mode must be enabled".to_owned());
-    }
-    if !instance.config.mounts.is_empty() {
-        problems.push("host filesystem mounts are not allowed".to_owned());
     }
     match (
         expected_image(&instance.arch),
@@ -755,7 +943,7 @@ fn expected_image(architecture: &str) -> Result<(&'static str, &'static str)> {
 
 fn template(architecture: &str) -> Result<String> {
     let (location, digest) = expected_image(architecture)?;
-    serde_json::to_string(&serde_json::json!({
+    let mut template = serde_json::json!({
         "minimumLimaVersion": LIMA_VERSION,
         "images": [{
             "location": location,
@@ -763,8 +951,18 @@ fn template(architecture: &str) -> Result<String> {
             "digest": digest,
             "variant": "server",
         }]
-    }))
-    .context("failed to encode the managed VM template")
+    });
+    let profile = profile_value(&VmShareDocument::default());
+    let template_object = template
+        .as_object_mut()
+        .expect("managed VM template is an object");
+    for (key, value) in profile
+        .as_object()
+        .expect("managed VM profile is an object")
+    {
+        template_object.insert(key.clone(), value.clone());
+    }
+    serde_json::to_string(&template).context("failed to encode the managed VM template")
 }
 
 pub(super) fn guest_binary_path() -> String {
@@ -860,19 +1058,25 @@ pub(super) fn ensure_success(output: &Output, operation: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
-    fn pinned_template_has_no_implicit_lima_features() {
+    fn pinned_template_explicitly_disables_unneeded_lima_features() {
         let value: Value =
             serde_json::from_str(&template("aarch64").expect("template")).expect("template JSON");
         assert_eq!(value["minimumLimaVersion"], LIMA_VERSION);
         assert_eq!(value["images"][0]["digest"], ARM64_IMAGE_DIGEST);
-        assert!(value.get("mounts").is_none());
-        assert!(value.get("containerd").is_none());
+        assert_eq!(value["plain"], false);
+        assert_eq!(value["mountType"], "virtiofs");
+        assert_eq!(value["mounts"], serde_json::json!([]));
+        assert_eq!(value["containerd"]["system"], false);
+        assert_eq!(value["containerd"]["user"], false);
+        assert_eq!(value["portForwards"], serde_json::json!([]));
+        assert_eq!(value["propagateProxyEnv"], false);
     }
 
     #[test]
-    fn status_reports_incompatible_host_mounts() {
+    fn status_reports_an_unmanaged_mount_as_incompatible() {
         let instance: LimaInstance = serde_json::from_value(serde_json::json!({
             "name": "runlab",
             "status": "Running",
@@ -899,6 +1103,11 @@ mod tests {
 
         assert!(!status.compatible);
         assert_eq!(status.status, "running");
-        assert!(status.problems.iter().any(|value| value.contains("mounts")));
+        assert!(
+            status
+                .problems
+                .iter()
+                .any(|value| value.contains("fingerprint") || value.contains("plain mode"))
+        );
     }
 }

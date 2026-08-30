@@ -1,13 +1,15 @@
 #![cfg(target_os = "macos")]
 
 use std::fs;
-use std::io::{BufRead as _, BufReader, Read as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 #[test]
 fn help_exposes_the_managed_vm_product_surface() {
@@ -41,7 +43,7 @@ fn help_exposes_the_managed_vm_product_surface() {
     assert!(stdout.contains("--label <KEY=VALUE>"));
     assert!(stdout.contains("are not execution facts"));
     assert!(stdout.contains("NDJSON Live Event stream"));
-    assert!(stdout.contains("must be read-only regular files or directories"));
+    assert!(stdout.contains("must be inside a declared VM share"));
     assert!(stdout.contains("--detach"));
     assert!(!stdout.contains("--detached-worker"));
     assert!(!stdout.contains("--secret-env-file"));
@@ -72,7 +74,7 @@ fn help_exposes_the_managed_vm_product_surface() {
     assert_success(&vm);
     let stdout = text(&vm.stdout);
     assert!(!stdout.contains("--state"));
-    for command in ["create", "start", "install", "stop", "status"] {
+    for command in ["create", "start", "install", "stop", "status", "config"] {
         assert!(stdout.contains(&format!("\n  {command} ")));
     }
     for deferred in ["delete", "exec", "shell"] {
@@ -107,6 +109,206 @@ fn managed_vm_does_not_expose_artifact_paths_or_custom_state() {
     assert!(!environment_state.status.success());
     assert!(environment_state.stdout.is_empty());
     assert!(text(&environment_state.stderr).contains("does not apply"));
+}
+
+#[test]
+fn vm_share_configuration_is_complete_derived_and_stop_gated() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (limactl, log) = fake_limactl(temporary.path());
+    let get = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .args(["vm", "config", "get"])
+        .output()
+        .expect("config get");
+    assert_success(&get);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&get.stdout).expect("configuration"),
+        serde_json::json!({"schema_version": 1, "shares": []})
+    );
+
+    let document = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "shares": [{"name": "corpus", "host_path": temporary.path()}]
+    }))
+    .expect("document");
+    let mut check = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .args(["vm", "config", "check", "--document", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("config check");
+    check
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(&document)
+        .expect("write document");
+    let check = check.wait_with_output().expect("check output");
+    assert_success(&check);
+    let check: Value = serde_json::from_slice(&check.stdout).expect("check result");
+    assert_eq!(check["applicable"], false);
+    assert_eq!(check["changes_required"], true);
+    assert_eq!(
+        check["shares"][0]["guest_path"],
+        "/mnt/runlab-shares/corpus"
+    );
+    assert_eq!(check["shares"][0]["type"], "virtiofs");
+    assert_eq!(check["shares"][0]["read_only"], true);
+    assert!(
+        check["problems"][0]
+            .as_str()
+            .is_some_and(|problem| problem.contains("must be stopped"))
+    );
+
+    let mut apply = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .args(["vm", "config", "apply", "--document", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("config apply");
+    apply
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(&document)
+        .expect("write document");
+    let apply = apply.wait_with_output().expect("apply output");
+    assert!(!apply.status.success());
+    assert!(apply.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&apply.stderr).expect("structured error");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("must be stopped"))
+    );
+}
+
+#[test]
+fn stopped_vm_share_apply_edits_verifies_and_is_idempotent() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (limactl, log) = fake_limactl(temporary.path());
+    let host_root = temporary.path().canonicalize().expect("canonical share");
+    let fingerprint = share_fingerprint("corpus", &host_root);
+    let marker = temporary.path().join("applied");
+    let document = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "shares": [{"name": "corpus", "host_path": host_root}]
+    }))
+    .expect("document");
+
+    let apply = || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_runlab"))
+            .env("RUNLAB_LIMACTL", &limactl)
+            .env("RUNLAB_FAKE_LOG", &log)
+            .env("RUNLAB_FAKE_VM_STATUS", "Stopped")
+            .env("RUNLAB_FAKE_SHARE_HOST", &host_root)
+            .env("RUNLAB_FAKE_SHARE_FINGERPRINT", &fingerprint)
+            .env("RUNLAB_FAKE_APPLY_MARKER", &marker)
+            .args(["vm", "config", "apply", "--document", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("config apply");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(&document)
+            .expect("write document");
+        child.wait_with_output().expect("apply output")
+    };
+
+    let first = apply();
+    assert_success(&first);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first.stdout).expect("first apply")["changed"],
+        true
+    );
+    let second = apply();
+    assert_success(&second);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&second.stdout).expect("second apply")["changed"],
+        false
+    );
+    let calls = fs::read_to_string(log).expect("fake limactl log");
+    assert_eq!(calls.matches("edit --set").count(), 1);
+    assert!(calls.contains(".mounts = ["));
+    assert!(calls.contains("/mnt/runlab-shares/corpus"));
+}
+
+#[test]
+fn vm_status_rejects_a_guest_share_that_is_not_read_only_virtiofs() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (limactl, log) = fake_limactl(temporary.path());
+    let host_root = temporary.path().canonicalize().expect("canonical share");
+    let fingerprint = share_fingerprint("corpus", &host_root);
+    let output = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .env("RUNLAB_FAKE_SHARE_HOST", &host_root)
+        .env("RUNLAB_FAKE_SHARE_FINGERPRINT", &fingerprint)
+        .env("RUNLAB_FAKE_FINDMNT", "virtiofs rw,relatime")
+        .args(["vm", "status"])
+        .output()
+        .expect("vm status");
+    assert_success(&output);
+    let status: Value = serde_json::from_slice(&output.stdout).expect("status");
+    assert_eq!(status["compatible"], true);
+    assert_eq!(status["ready"], false);
+    assert!(
+        status["readiness_problems"][0]
+            .as_str()
+            .is_some_and(|problem| problem.contains("exact read-only virtiofs"))
+    );
+}
+
+#[test]
+fn vm_share_apply_reports_when_edit_changed_but_did_not_converge() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (limactl, log) = fake_limactl(temporary.path());
+    let host_root = temporary.path().canonicalize().expect("canonical share");
+    let fingerprint = share_fingerprint("corpus", &host_root);
+    let marker = temporary.path().join("not-applied");
+    let document = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "shares": [{"name": "corpus", "host_path": host_root}]
+    }))
+    .expect("document");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_runlab"))
+        .env("RUNLAB_LIMACTL", &limactl)
+        .env("RUNLAB_FAKE_LOG", &log)
+        .env("RUNLAB_FAKE_VM_STATUS", "Stopped")
+        .env("RUNLAB_FAKE_SHARE_HOST", &host_root)
+        .env("RUNLAB_FAKE_SHARE_FINGERPRINT", &fingerprint)
+        .env("RUNLAB_FAKE_APPLY_MARKER", &marker)
+        .env("RUNLAB_FAKE_EDIT_NOOP", "1")
+        .args(["vm", "config", "apply", "--document", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("config apply");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(&document)
+        .expect("write document");
+    let output = child.wait_with_output().expect("apply output");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("configuration was modified"))
+    );
 }
 
 #[test]
@@ -448,11 +650,14 @@ fn filesystem_get_transfers_files_directories_and_symlinks() {
 }
 
 #[test]
-fn read_only_host_mounts_use_the_execution_mount_namespace() {
+fn declared_vm_shares_pass_through_without_mount_staging() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let (limactl, log) = fake_limactl(temporary.path());
     let source = temporary.path().join("evidence.jsonl");
     fs::write(&source, b"evidence\n").expect("host mount source");
+    let host_root = temporary.path().canonicalize().expect("canonical share");
+    let fingerprint = share_fingerprint("corpus", &host_root);
+    let guest_source = "/mnt/runlab-shares/corpus/evidence.jsonl";
     let config = temporary.path().join("config.json");
     fs::write(
         &config,
@@ -460,7 +665,7 @@ fn read_only_host_mounts_use_the_execution_mount_namespace() {
             "mounts": [{
                 "destination": "/evidence/input.jsonl",
                 "type": "bind",
-                "source": source,
+                "source": guest_source,
                 "options": ["rbind", "ro"]
             }]
         }))
@@ -471,6 +676,8 @@ fn read_only_host_mounts_use_the_execution_mount_namespace() {
     let output = Command::new(env!("CARGO_BIN_EXE_runlab"))
         .env("RUNLAB_LIMACTL", &limactl)
         .env("RUNLAB_FAKE_LOG", &log)
+        .env("RUNLAB_FAKE_SHARE_HOST", &host_root)
+        .env("RUNLAB_FAKE_SHARE_FINGERPRINT", &fingerprint)
         .args([
             "exec",
             "--image",
@@ -482,8 +689,9 @@ fn read_only_host_mounts_use_the_execution_mount_namespace() {
         .expect("runlab process");
     assert_success(&output);
     let calls = fs::read_to_string(&log).expect("fake limactl log");
-    assert!(calls.contains("BindReadOnlyPaths=/var/tmp/runlab-mount-"));
-    assert!(calls.contains(&format!(":{}", source.display())));
+    assert!(!calls.contains("BindReadOnlyPaths="));
+    assert!(!calls.contains("runlab-mount-archive-"));
+    assert!(!calls.contains("runlab-mount-"));
 
     let writable_config = temporary.path().join("writable.json");
     fs::write(
@@ -492,7 +700,7 @@ fn read_only_host_mounts_use_the_execution_mount_namespace() {
             "mounts": [{
                 "destination": "/evidence/input.jsonl",
                 "type": "bind",
-                "source": source,
+                "source": guest_source,
                 "options": ["rbind", "rw"]
             }]
         }))
@@ -502,6 +710,8 @@ fn read_only_host_mounts_use_the_execution_mount_namespace() {
     let rejected = Command::new(env!("CARGO_BIN_EXE_runlab"))
         .env("RUNLAB_LIMACTL", limactl)
         .env("RUNLAB_FAKE_LOG", &log)
+        .env("RUNLAB_FAKE_SHARE_HOST", &host_root)
+        .env("RUNLAB_FAKE_SHARE_FINGERPRINT", &fingerprint)
         .args([
             "exec",
             "--image",
@@ -515,12 +725,37 @@ fn read_only_host_mounts_use_the_execution_mount_namespace() {
     assert!(rejected.stdout.is_empty());
     let error = serde_json::from_slice::<Value>(&rejected.stderr).expect("structured error");
     assert_eq!(error["category"], "invalid_input");
-    assert_eq!(error["stage"], "mount_staging");
+    assert_eq!(error["stage"], "mount_resolution");
     assert!(
         error["message"]
             .as_str()
-            .is_some_and(|message| message.contains("only read-only"))
+            .is_some_and(|message| message.contains("must not contain `rw`"))
     );
+}
+
+fn share_fingerprint(name: &str, host_path: &Path) -> String {
+    #[derive(Serialize)]
+    struct Document<'a> {
+        schema_version: u32,
+        shares: [Share<'a>; 1],
+    }
+    #[derive(Serialize)]
+    struct Share<'a> {
+        name: &'a str,
+        host_path: &'a Path,
+    }
+    let document = serde_json::to_vec(&Document {
+        schema_version: 1,
+        shares: [Share { name, host_path }],
+    })
+    .expect("share document");
+    let digest = Sha256::digest(document);
+    let encoded = digest.iter().fold(String::new(), |mut value, byte| {
+        use std::fmt::Write as _;
+        write!(value, "{byte:02x}").expect("hex");
+        value
+    });
+    format!("sha256:{encoded}")
 }
 
 #[test]
@@ -721,10 +956,26 @@ fn fake_limactl(root: &Path) -> (PathBuf, PathBuf) {
 printf '%s\n' "$*" >> "$RUNLAB_FAKE_LOG"
 case "$*" in
   "--version") printf '%s\n' 'limactl version 2.2.0' ;;
-  "list --json") printf '%s\n' '{{"name":"runlab","status":"Running","vmType":"vz","arch":"{architecture}","cpus":4,"memory":4294967296,"disk":21474836480,"limaVersion":"2.2.0","config":{{"plain":true,"mounts":[],"images":[{{"location":"{location}","arch":"{architecture}","digest":"{digest}","variant":"server"}}]}}}}' ;;
+  "list --json")
+    vm_status=${{RUNLAB_FAKE_VM_STATUS:-Running}}
+    share_active=false
+    if test -n "$RUNLAB_FAKE_SHARE_HOST" && {{ test -z "$RUNLAB_FAKE_APPLY_MARKER" || test -e "$RUNLAB_FAKE_APPLY_MARKER"; }}; then share_active=true; fi
+    if test "$share_active" = true; then
+      printf '{{"name":"runlab","status":"%s","vmType":"vz","arch":"{architecture}","cpus":4,"memory":4294967296,"disk":21474836480,"limaVersion":"2.2.0","config":{{"plain":false,"mountType":"virtiofs","mountInotify":false,"mounts":[{{"location":"%s","mountPoint":"/mnt/runlab-shares/corpus","writable":false}}],"containerd":{{"system":false,"user":false}},"portForwards":[],"networks":[],"hostResolver":{{"enabled":true,"ipv6":false}},"propagateProxyEnv":false,"env":{{"RUNLAB_SHARES_FINGERPRINT":"%s"}},"ssh":{{"loadDotSSHPubKeys":false,"forwardAgent":false,"forwardX11":false,"forwardX11Trusted":false}},"images":[{{"location":"{location}","arch":"{architecture}","digest":"{digest}","variant":"server"}}]}}}}\n' "$vm_status" "$RUNLAB_FAKE_SHARE_HOST" "$RUNLAB_FAKE_SHARE_FINGERPRINT"
+    else
+      printf '{{"name":"runlab","status":"%s","vmType":"vz","arch":"{architecture}","cpus":4,"memory":4294967296,"disk":21474836480,"limaVersion":"2.2.0","config":{{"plain":false,"mountType":"virtiofs","mountInotify":false,"mounts":[],"containerd":{{"system":false,"user":false}},"portForwards":[],"networks":[],"hostResolver":{{"enabled":true,"ipv6":false}},"propagateProxyEnv":false,"env":{{"RUNLAB_SHARES_FINGERPRINT":"sha256:e6d411ff7718b7165609dc8e315a5a1b2e9cb3daa217e1517e42e0eaeebcc756"}},"ssh":{{"loadDotSSHPubKeys":false,"forwardAgent":false,"forwardX11":false,"forwardX11Trusted":false}},"images":[{{"location":"{location}","arch":"{architecture}","digest":"{digest}","variant":"server"}}]}}}}\n' "$vm_status"
+    fi
+    ;;
+  *"edit --set"*)
+    if test "$RUNLAB_FAKE_EDIT_NOOP" != 1 && test -n "$RUNLAB_FAKE_APPLY_MARKER"; then : > "$RUNLAB_FAKE_APPLY_MARKER"; fi
+    ;;
   *"__managed-vm-handshake"*) printf '%s\n' '{{"schema_version":1,"transport_version":1,"runlab_version":"{version}","os":"linux","architecture":"{architecture}","capabilities":["native-engine","state-cli"]}}' ;;
   *"/usr/local/bin/runc --version"*) printf '%s\n' 'runc version 1.5.1' ;;
   *"/proc/sys/net/ipv4/ip_forward"*) printf '1\n' ;;
+  *"/usr/bin/findmnt --noheadings --mountpoint /mnt/runlab-shares/corpus --output FSTYPE,OPTIONS"*)
+    if test "$RUNLAB_FAKE_FINDMNT_FAIL" = 1; then exit 1; fi
+    printf '%s\n' "${{RUNLAB_FAKE_FINDMNT:-virtiofs ro,relatime}}"
+    ;;
   *"/usr/bin/df -B1 --output=used,avail /var/lib/runlab"*) printf 'Used Available\n10737418240 10737418240\n' ;;
   *"/usr/bin/id -u"*) printf '501\n' ;;
   *"/usr/bin/id -g"*) printf '20\n' ;;

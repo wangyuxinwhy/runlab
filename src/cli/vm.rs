@@ -1,11 +1,15 @@
 use anyhow::Result;
 use clap::Subcommand;
+use std::path::PathBuf;
 
 use crate::managed_vm::ManagedVm;
+use crate::managed_vm::config::parse_document;
 
-use super::emit;
+use super::{emit, input::read_bounded};
 
-#[derive(Clone, Copy, Debug, Subcommand)]
+const MAX_VM_CONFIG_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Subcommand)]
 pub(super) enum VmCommand {
     /// Create the fixed local Linux VM without starting it.
     Create {
@@ -27,6 +31,29 @@ pub(super) enum VmCommand {
     Stop,
     /// Report VM lifecycle and compatibility facts without changing it.
     Status,
+    /// Inspect, validate, and apply declarative read-only Host shares.
+    Config {
+        #[command(subcommand)]
+        command: VmConfigCommand,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(super) enum VmConfigCommand {
+    /// Return the normalized share declaration currently applied to the VM.
+    Get,
+    /// Validate a complete share declaration and report whether it can be applied.
+    Check {
+        /// Complete JSON document, or `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        document: PathBuf,
+    },
+    /// Replace the complete share declaration on a stopped VM.
+    Apply {
+        /// Complete JSON document, or `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        document: PathBuf,
+    },
 }
 
 pub(super) fn execute(command: VmCommand) -> Result<u8> {
@@ -44,6 +71,24 @@ pub(super) fn execute(command: VmCommand) -> Result<u8> {
         }
         VmCommand::Stop => vm.stop()?,
         VmCommand::Status => vm.status()?,
+        VmCommand::Config { command } => {
+            match command {
+                VmConfigCommand::Get => emit(&vm.config_get()?)?,
+                VmConfigCommand::Check { document } => {
+                    let bytes =
+                        read_bounded(&document, MAX_VM_CONFIG_BYTES, "VM share configuration")?;
+                    let document = parse_document(&bytes)?;
+                    emit(&vm.config_check(document)?)?;
+                }
+                VmConfigCommand::Apply { document } => {
+                    let bytes =
+                        read_bounded(&document, MAX_VM_CONFIG_BYTES, "VM share configuration")?;
+                    let document = parse_document(&bytes)?;
+                    emit(&vm.config_apply(document)?)?;
+                }
+            }
+            return Ok(0);
+        }
     };
     emit(&status)?;
     Ok(0)

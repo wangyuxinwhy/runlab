@@ -148,7 +148,7 @@ struct ExecutionArgs {
     /// Initial OCI Image selected by local name or Manifest digest.
     #[arg(long)]
     image: ImageSelector,
-    /// Exact OCI Runtime Configuration 1.3.0 JSON file; generated from the Image when omitted. On macOS, non-scaffold bind sources are local Host paths and must be read-only regular files or directories.
+    /// Exact OCI Runtime Configuration 1.3.0 JSON file; generated from the Image when omitted. On macOS, bind sources must be inside a declared VM share and contain `ro`.
     #[arg(long, value_name = "FILE")]
     runtime_config: Option<PathBuf>,
     /// Exact bytes delivered to the primary Program; omitted means empty stdin.

@@ -1,6 +1,6 @@
 [package]
 name = "run_engine"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native Linux implementation of the Run Protocol"
@@ -20,7 +20,7 @@ bincode = { version = "2.0.1", features = ["serde"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 flate2 = "1.1.9"
 oci-spec = { version = "0.10.0", default-features = false, features = ["image"] }
-run_protocol = { version = "0.1.1", path = "../run_protocol" }
+run_protocol = { version = "0.2.0", path = "../run_protocol" }
 rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "mount", "net", "process", "time"] }
 serde = "1.0.229"
 serde_json = "1.0.151"

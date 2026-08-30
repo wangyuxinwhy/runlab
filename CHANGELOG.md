@@ -2,6 +2,25 @@
 
 All notable public changes to RunLab are documented here.
 
+## [0.2.0] - 2026-08-30
+
+### Added
+
+- macOS Managed VMs now support declarative, read-only VirtioFS shares through `vm config get`, `vm config check`, and `vm config apply`.
+- Share checks derive stable Guest paths under `/mnt/runlab-shares/<name>`, detect case-insensitive Host filesystems, and verify active mounts as read-only VirtioFS.
+
+### Changed
+
+- The managed Lima profile now disables plain mode while continuing to pin containerd, additional networks, port forwarding, proxy propagation, and writable Host mounts off.
+- macOS OCI bind sources must resolve inside a declared Guest share and explicitly contain `ro`; RunLab no longer guesses macOS paths or stages bind sources through tar archives.
+- Share configuration changes require an explicitly stopped VM and never stop, start, or silently terminate Runs on the caller's behalf.
+
+### Compatibility
+
+- The Run Protocol, database schema, and native Linux execution contract remain unchanged from 0.1.1.
+- macOS Runtime Configurations that use local Host paths as OCI bind sources must declare a VM share and replace the source with its derived Guest path.
+- Share contents remain external mutable state: RunLab does not digest them, include them in Initial or Final Environments, or promise native Linux path portability.
+
 ## [0.1.1] - 2026-08-30
 
 ### Changed
@@ -38,5 +57,6 @@ Initial public release.
 - RunLab database schema 6 is the first public storage contract. Earlier private development States are migrated where the implementation has direct evidence; newer schemas are rejected.
 - The public CLI, JSON envelopes, Live Event shapes, Observation documents, Run deletion plans, and release manifest each carry their own explicit schema version.
 
+[0.2.0]: https://github.com/wangyuxinwhy/runlab/releases/tag/v0.2.0
 [0.1.1]: https://github.com/wangyuxinwhy/runlab/releases/tag/v0.1.1
 [0.1.0]: https://github.com/wangyuxinwhy/runlab/releases/tag/v0.1.0

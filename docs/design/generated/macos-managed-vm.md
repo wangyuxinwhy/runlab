@@ -33,9 +33,19 @@ Secret 来源在 macOS 请求构造层解析。Secret 值通过 mode 0600 的唯
 
 `run start` 的实时阶段和 Program 标准流遵循 [RunLab Run 实时观察与 CLI 输出](/design/generated/live-events)。Guest 产生的 stderr NDJSON 必须在到达 Host 时立即转发，不能缓存到 Guest 命令结束，也不能由 Host 重新解释或改写 Program payload；Host 自己观察到的连接问题作为传输诊断加入同一输出通道。
 
-OCI Runtime Configuration 中的宿主路径按照 Linux 虚拟机的宿主命名空间解释。macOS 本机路径不能原样在虚拟机中实施。RunLab 的请求构造层应当在调用 Run Engine 前发现并拒绝这类输入。引擎仍会验证自己实际收到的路径和能力。传输层不得把 macOS 路径改写成另一个虚拟机路径。
+## 只读 Host Share
 
-调用方如果要把 macOS 文件作为受控环境的一部分使用，应先把内容导入 OCI Image；如果要引用虚拟机中的外部路径，则必须明确提供虚拟机路径并自行保证其状态。
+Managed VM 配置可以声明零个或多个只读 Host Share。每个 Share 只由调用方给出的稳定名称和一个已解析的 macOS 绝对目录组成；RunLab 为它派生唯一的 Linux Guest 路径 `/mnt/runlab-shares/<name>`。底层共享机制、固定版本和能力验证属于 Managed VM 实现契约，不进入 Run Protocol。
+
+VM 配置拥有 macOS 路径到 Guest 路径的映射。OCI Runtime Configuration 只引用派生后的 Guest 路径，再按普通 OCI `bind mount` 把相应目录暴露给 Program。传输层不得把 Runtime Configuration 中的 macOS 路径猜测或改写成 Guest 路径，也不得为 `bind mount` 隐式打包、复制或解包 Host 目录。macOS 调用层只允许固定的 resolver scaffold 和已经声明的 Share 子树；其他显式宿主路径必须在 Run 接受前拒绝。
+
+Share 配置变更只允许在 VM 已停止时显式应用。配置操作不得替调用方停止或启动 VM，也不能无声终止正在执行的 Run。VM 兼容性检查必须逐项验证有效 Share 与声明完全一致，并拒绝额外、可写、路径冲突或实现不支持的 Host mount。
+
+Share 的设备级只读不能替代 OCI 配置中的 `ro`。调用方引用 Share 时仍必须显式声明只读 mount；缺少 `ro` 必须在 Program 启动前拒绝，不能依靠执行时文件系统错误表达策略。
+
+Host Share 是调用方管理的外部状态。其内容不进入 Program 的初始或最终环境，RunLab 不为 Share 内容计算 digest，也不因为路径相同而证明两次执行看到相同字节。只读只阻止 Guest 修改 Host 内容，不能阻止 macOS 调用方并发修改。文件名大小写、权限和其他文件系统行为继续由 Host 文件系统与共享机制决定；配置检查应当报告已知的语义差异。需要内容身份、可移植性或完整 Linux 文件系统语义时，调用方应把内容导入 OCI Image。
+
+同一份引用 Guest Share 路径的 OCI Runtime Configuration 在原生 Linux 上仍要求该机器自行准备相同路径。RunLab 不把外部路径引用描述成可移植执行输入。
 
 ## 执行所有权与取消
 
