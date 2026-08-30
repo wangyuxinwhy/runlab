@@ -43,7 +43,7 @@ run_engine 0.1.0
 runlab 0.1.0
 ```
 
-The first publication of each crate requires a short-lived crates.io API token because Trusted Publishing cannot be configured before a crate exists. Publish the bootstrap release from a verified checkout with `scripts/publish-crates.sh`, or place that narrowly scoped token in the GitHub `release` environment as `CARGO_REGISTRY_TOKEN` and manually dispatch `publish.yml` in `bootstrap-token` mode. After all three names exist, configure each crate's Trusted Publisher for repository `wangyuxinwhy/runlab`, workflow `publish.yml`, and environment `release`; remove the bootstrap token, and use `trusted-publisher` mode thereafter.
+The first publication of each crate requires a short-lived crates.io API token because Trusted Publishing cannot be configured before a crate exists. Publish the bootstrap release from a verified checkout with `scripts/publish-crates.sh`, or place that narrowly scoped token in the GitHub `release` environment as `CARGO_REGISTRY_TOKEN` and manually dispatch `publish.yml` in `bootstrap-token` mode. After all three names exist, configure each crate's Trusted Publisher for repository `wangyuxinwhy/runlab`, workflow `publish.yml`, and environment `release`. Dispatch `publish.yml` once with `trusted-publisher` and `verify-auth` to prove the OIDC token exchange without publishing, then remove the bootstrap token and use `trusted-publisher` with `publish` thereafter.
 
 Never move or reuse a published tag. A defective Cargo version is yanked and replaced by a new patch version; a defective GitHub asset is replaced only while the Release remains Draft.
 

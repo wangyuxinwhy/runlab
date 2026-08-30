@@ -15,6 +15,14 @@ on:
         options:
           - trusted-publisher
           - bootstrap-token
+      operation:
+        description: Publish the tag or only verify the Trusted Publisher token exchange
+        required: true
+        default: publish
+        type: choice
+        options:
+          - publish
+          - verify-auth
 
 permissions:
   contents: read
@@ -45,6 +53,7 @@ jobs:
         id: trusted-publisher
         uses: rust-lang/crates-io-auth-action@63a7064947ceca9989005e118db3a5fecdc9259f
       - name: Publish in dependency order
+        if: inputs.operation == 'publish'
         env:
           CARGO_REGISTRY_TOKEN: ${{ inputs.authentication == 'trusted-publisher' && steps.trusted-publisher.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -53,3 +62,17 @@ jobs:
             exit 1
           }
           scripts/publish-crates.sh
+      - name: Verify Trusted Publisher authentication
+        if: inputs.operation == 'verify-auth'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.trusted-publisher.outputs.token }}
+        run: |
+          test "${{ inputs.authentication }}" = trusted-publisher || {
+            echo "verify-auth requires trusted-publisher authentication" >&2
+            exit 1
+          }
+          test -n "$CARGO_REGISTRY_TOKEN" || {
+            echo "crates.io returned no Trusted Publishing token" >&2
+            exit 1
+          }
+          echo "crates.io Trusted Publisher token exchange succeeded"
