@@ -36,11 +36,11 @@ Inspect and install every Draft artifact before publishing Cargo packages.
 The packages are irreversible, ordered registry publications:
 
 ```text
-run_protocol 0.1.0
+run_protocol VERSION
         ↓ wait until crates.io resolves the exact version
-run_engine 0.1.0
+run_engine VERSION
         ↓ wait until crates.io resolves the exact version
-runlab 0.1.0
+runlab VERSION
 ```
 
 The first publication of each crate requires a short-lived crates.io API token because Trusted Publishing cannot be configured before a crate exists. Publish the bootstrap release from a verified checkout with `scripts/publish-crates.sh`, or place that narrowly scoped token in the GitHub `release` environment as `CARGO_REGISTRY_TOKEN` and manually dispatch `publish.yml` in `bootstrap-token` mode. After all three names exist, configure each crate's Trusted Publisher for repository `wangyuxinwhy/runlab`, workflow `publish.yml`, and environment `release`. Dispatch `publish.yml` once with `trusted-publisher` and `verify-auth` to prove the OIDC token exchange without publishing, then remove the bootstrap token and use `trusted-publisher` with `publish` thereafter.

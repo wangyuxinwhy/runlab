@@ -6,10 +6,10 @@ RunLab executes programs from OCI Images. `run start` preserves an execution as 
 
 ## Install
 
-On macOS, use the GitHub Release installer because the complete bundle includes the same-version Linux RunLab binary and `runc` required by the Managed VM. On Linux, the same installer provides a prebuilt binary; Rust users can also install from crates.io:
+On macOS, use the GitHub Release installer because the complete bundle includes the same-version Linux RunLab binary and `runc` required by the Managed VM. On Linux, the installer provides a prebuilt RunLab binary and its private, pinned `runlab-runc`; it does not replace the system `runc`. Rust users can also install from crates.io with Rust 1.95 or newer:
 
 ```bash
-cargo install runlab --version 0.1.0 --locked
+cargo install runlab --version 0.1.1 --locked
 ```
 
 See the [installation guide](https://wangyuxinwhy.github.io/runlab/how-to/install) for the verified installer, platform prerequisites, and Managed VM setup.
@@ -135,7 +135,7 @@ $runlab --state "$state" exec \
 
 stderr uses the same NDJSON Live Event shapes as `run start`, beginning with `{"kind":"run.stream","schema_version":1,"run_id":null}`. stdout contains the complete bounded `RunOutput` or `EngineError`, including retained stdout and stderr, because there is no later `run get`. The Final Environment field is explicitly `not_requested`.
 
-`run start` is Linux-only and requires `runc`. The caller supplies a canonical lowercase UUID v4 and an imported Image. When `--runtime-config` is omitted, RunLab uses the same bytes produced by `run config generate`:
+`run start` is Linux-only. An installed Release prefers its sibling `runlab-runc`; Cargo and source builds use a compatible `runc` from `PATH`. The caller supplies a canonical lowercase UUID v4 and an imported Image. On Debian and Ubuntu, `uuidgen` is provided by `uuid-runtime`; the version-matched Start Here guide includes a Linux fallback. When `--runtime-config` is omitted, RunLab uses the same bytes produced by `run config generate`:
 
 ```bash
 $runlab --state "$state" run start \

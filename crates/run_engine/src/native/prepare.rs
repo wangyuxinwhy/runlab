@@ -71,6 +71,9 @@ impl Preparation<'_> {
     fn prepare(self) -> Result<PreparedInvocation, EngineError> {
         self.check_budget()?;
         validate_input_capabilities(self.input)?;
+        let cgroup_base = current_cgroup_base().map_err(|error| {
+            EngineError::unsupported(InputPath::field("programs"), format!("{error:#}"))
+        })?;
         let egress = if self.input.controls().network() == Network::Egress {
             Some(EgressTools::preflight(
                 self.supervisor,
@@ -96,11 +99,6 @@ impl Preparation<'_> {
         )
         .map_err(|error| {
             EngineError::internal(format!("failed to pin the private runc root: {error}"))
-        })?;
-        let cgroup_base = current_cgroup_base().map_err(|error| {
-            EngineError::internal(format!(
-                "failed to establish the Engine-owned default cgroup base: {error:#}"
-            ))
         })?;
         let programs = self.prepare_programs(
             &invocation,
@@ -581,10 +579,19 @@ fn validate_runc(
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.lines().any(|line| line.trim() == "spec: 1.3.0") {
-        return Err(EngineError::internal(
-            "runc does not report exact OCI Runtime Specification 1.3.0 support",
-        ));
+    let reported_version = stdout.lines().next().unwrap_or("<missing version>").trim();
+    let reported_spec = stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("spec:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    if reported_spec != Some("1.3.0") {
+        return Err(EngineError::internal(format!(
+            "incompatible runc at {}: {reported_version}; reported OCI Runtime Specification {}, but RunLab requires exact 1.3.0 support; the tested runtime is runc 1.5.1",
+            canonical.display(),
+            reported_spec.unwrap_or("<missing>")
+        )));
     }
     let timeout = budget
         .remaining()
@@ -598,9 +605,10 @@ fn validate_runc(
     if !output.status.success()
         || !String::from_utf8_lossy(&output.stdout).contains("--pidfd-socket")
     {
-        return Err(EngineError::internal(
-            "runc does not expose the required create --pidfd-socket capability",
-        ));
+        return Err(EngineError::internal(format!(
+            "incompatible runc at {}: {reported_version}; runc create does not expose the required --pidfd-socket capability; the tested runtime is runc 1.5.1",
+            canonical.display()
+        )));
     }
     Ok(canonical)
 }

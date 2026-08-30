@@ -75,12 +75,19 @@ RUNLAB_DIST_BASE_URL="$base_url" sh "$dist_root/install.sh" \
 
 [[ "$("$bin_directory/runlab" --version)" == "runlab $version" ]] || fail "installed binary version mismatch"
 [[ -f "$doc_directory/LICENSE" ]] || fail "RunLab license was not installed"
+[[ -f "$doc_directory/RUNC-LICENSE" ]] || fail "runc license was not installed"
+[[ -f "$doc_directory/RUNC-NOTICE" ]] || fail "runc notice was not installed"
 [[ -f "$doc_directory/THIRD_PARTY_NOTICES.md" ]] || fail "third-party notices were not installed"
 if [[ -n "$bundle_architecture" ]]; then
     [[ -x "$bin_directory/runlab-linux-$bundle_architecture" ]] || fail "managed-VM RunLab binary was not installed"
     [[ -x "$bin_directory/runc-linux-$bundle_architecture" ]] || fail "managed-VM runc was not installed"
-    [[ -f "$doc_directory/RUNC-LICENSE" ]] || fail "runc license was not installed"
-    [[ -f "$doc_directory/RUNC-NOTICE" ]] || fail "runc notice was not installed"
+else
+    [[ -x "$bin_directory/runlab-runc" ]] || fail "private Linux runc was not installed"
+    runc_output="$("$bin_directory/runlab-runc" --version)"
+    [[ "${runc_output%%$'\n'*}" == "runc version 1.5.1" ]] ||
+        fail "private Linux runc version mismatch"
+    grep -Fx 'spec: 1.3.0' <<<"$runc_output" >/dev/null ||
+        fail "private Linux runc OCI specification mismatch"
 fi
 
 printf '%064d  %s\n' 0 "$archive_name" > "$serve_root/download/v$version/$archive_name.sha256"

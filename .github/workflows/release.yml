@@ -73,6 +73,8 @@ jobs:
         run: rustup target add "${{ matrix.target }}"
       - name: Build release binary
         run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Fetch pinned runc
+        run: scripts/fetch-runc.sh --architecture "${{ matrix.bundle_architecture }}" --output runc
       - name: Package Linux release and Managed VM guest
         run: |
           binary="target/${{ matrix.target }}/release/runlab"
@@ -80,7 +82,10 @@ jobs:
             --binary "$binary" \
             --target "${{ matrix.target }}" \
             --output-root dist \
-            --version "${{ needs.validate.outputs.version }}"
+            --version "${{ needs.validate.outputs.version }}" \
+            --runc-binary "runc/runc-linux-${{ matrix.bundle_architecture }}" \
+            --runc-license runc/RUNC-LICENSE \
+            --runc-notice runc/RUNC-NOTICE
           mkdir -p guest
           install -m 0755 "$binary" "guest/runlab-linux-${{ matrix.bundle_architecture }}"
           scripts/assemble-release.sh \

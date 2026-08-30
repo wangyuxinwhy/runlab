@@ -107,7 +107,7 @@ expected_name="$(awk 'NR == 1 {print $2}' "$checksum")"
 if [ -n "$bundle_architecture" ]; then
     expected_entries="$(printf '%s\n' LICENSE RUNC-LICENSE RUNC-NOTICE THIRD_PARTY_NOTICES.md runlab "runlab-linux-$bundle_architecture" "runc-linux-$bundle_architecture" | LC_ALL=C sort)"
 else
-    expected_entries="$(printf '%s\n' LICENSE THIRD_PARTY_NOTICES.md runlab | LC_ALL=C sort)"
+    expected_entries="$(printf '%s\n' LICENSE RUNC-LICENSE RUNC-NOTICE THIRD_PARTY_NOTICES.md runlab runlab-runc | LC_ALL=C sort)"
 fi
 actual_entries="$(tar -tzf "$archive" | LC_ALL=C sort)"
 [ "$actual_entries" = "$expected_entries" ] || fail "archive contains unexpected paths"
@@ -120,10 +120,13 @@ if [ -n "$bundle_architecture" ]; then
     mv -f "$bin_directory/.runlab-linux-$bundle_architecture.install.$$" "$bin_directory/runlab-linux-$bundle_architecture"
     install -m 0755 "$temporary_directory/runc-linux-$bundle_architecture" "$bin_directory/.runc-linux-$bundle_architecture.install.$$"
     mv -f "$bin_directory/.runc-linux-$bundle_architecture.install.$$" "$bin_directory/runc-linux-$bundle_architecture"
-    install -m 0644 "$temporary_directory/RUNC-LICENSE" "$doc_directory/RUNC-LICENSE"
-    install -m 0644 "$temporary_directory/RUNC-NOTICE" "$doc_directory/RUNC-NOTICE"
+else
+    install -m 0755 "$temporary_directory/runlab-runc" "$bin_directory/.runlab-runc.install.$$"
+    mv -f "$bin_directory/.runlab-runc.install.$$" "$bin_directory/runlab-runc"
 fi
 install -m 0644 "$temporary_directory/LICENSE" "$doc_directory/LICENSE"
+install -m 0644 "$temporary_directory/RUNC-LICENSE" "$doc_directory/RUNC-LICENSE"
+install -m 0644 "$temporary_directory/RUNC-NOTICE" "$doc_directory/RUNC-NOTICE"
 install -m 0644 "$temporary_directory/THIRD_PARTY_NOTICES.md" "$doc_directory/THIRD_PARTY_NOTICES.md"
 install -m 0755 "$temporary_directory/runlab" "$bin_directory/.runlab.install.$$"
 mv -f "$bin_directory/.runlab.install.$$" "$bin_directory/runlab"

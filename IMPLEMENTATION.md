@@ -212,4 +212,4 @@ Pi 0.84.3、Claude Code 2.1.250 与 Codex CLI 0.150.1 都安装在不可由 uid 
 
 `filesystem get --run` 已在同一 Linux VM 对真实 SWE-bench Run 验证。命令从最终 Image 取出 571-byte `/artifacts/solution.patch`，内容 digest 为 `sha256:adfa5771ae09b6ff1d91eb2a57943d20f0a899df777528a2233821e8f73fc20a`。最终代码的 release 构建首次观测为 27 ms，随后六次为 17–20 ms；debug 构建随后六次约为 179–180 ms。此前正序读取并重复校验全部 Layer 的实现稳定约为 30.8–31.0 s。
 
-`cargo package -p run_protocol --no-verify --locked --allow-dirty` 成功。完整 workspace packaging 当前不能成立：`run_engine` 打包时会从 crates.io 解析 `run_protocol 0.1.0`，而该版本尚未发布。没有为绕过这一发布顺序去修改 manifest 或评价路径。
+首次发布前，`cargo package -p run_protocol --no-verify --locked --allow-dirty` 成功，而完整 workspace packaging 因 `run_protocol 0.1.0` 尚未发布而不能成立。`0.1.0` 发布后，这个临时 registry 顺序限制已解除；当前发布流程仍按 `run_protocol -> run_engine -> runlab` 的依赖顺序发布并等待 crates.io 解析每个精确版本。
