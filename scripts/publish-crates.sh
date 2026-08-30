@@ -29,7 +29,7 @@ registry_status() {
         200)
             [[ "$(jq -r '.version.num' "$response")" == "$version" ]] || fail "crates.io returned a different $crate_name version"
             [[ "$(jq -r '.version.yanked' "$response")" == "false" ]] || fail "$crate_name $version is yanked"
-            [[ "$(jq -r '.crate.repository' "$response")" == "https://github.com/wangyuxinwhy/runlab" ]] ||
+            [[ "$(jq -r '.version.repository' "$response")" == "https://github.com/wangyuxinwhy/runlab" ]] ||
                 fail "$crate_name $version exists but belongs to another repository"
             return 0
             ;;
