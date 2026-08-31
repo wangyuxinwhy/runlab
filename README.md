@@ -6,7 +6,16 @@ RunLab executes programs from OCI Images. `run start` preserves an execution as 
 
 ## Install
 
-On macOS, use the GitHub Release installer because the complete bundle includes the same-version Linux RunLab binary and `runc` required by the Managed VM. On Linux, the installer provides a prebuilt RunLab binary and its private, pinned `runlab-runc`; it does not replace the system `runc`. Rust users can also install from crates.io with Rust 1.95 or newer:
+Install the latest GitHub Release on macOS or Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/wangyuxinwhy/runlab/releases/latest/download/install.sh \
+  -o install-runlab.sh
+sh install-runlab.sh
+```
+
+On macOS, the complete bundle includes the same-version Linux RunLab binary and `runc` required by the Managed VM. On Linux, the installer provides a prebuilt RunLab binary and its private, pinned `runlab-runc`; it does not replace the system `runc`. Rust users can also install from crates.io with Rust 1.95 or newer:
 
 ```bash
 cargo install runlab --version 0.2.0 --locked
