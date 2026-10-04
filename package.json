@@ -9,6 +9,6 @@
     "docs:check": "npm run docs:build && node scripts/check-docs-output.mjs"
   },
   "devDependencies": {
-    "@rspress/core": "2.0.21"
+    "@rspress/core": "2.0.23"
   }
 }
